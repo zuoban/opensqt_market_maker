@@ -30,6 +30,14 @@ type Config struct {
 		MarginLockDurationSec int     `yaml:"margin_lock_duration_seconds"` // 保证金锁定时间（秒，默认10）
 		PositionSafetyCheck   int     `yaml:"position_safety_check"`        // 持仓安全性检查（默认100，最少能向下持有多少仓）
 		// 注意：price_decimals 和 quantity_decimals 已废弃，现在从交易所自动获取
+
+		// 自动止盈配置
+		TakeProfit struct {
+			Enabled       bool    `yaml:"enabled"`        // 是否启用止盈
+			TargetProfit  float64 `yaml:"target_profit"`  // 止盈目标金额（USDT）
+			CheckInterval int     `yaml:"check_interval"` // 检查间隔（秒）
+			BalanceMode   string  `yaml:"balance_mode"`   // 余额模式：auto/precise
+		} `yaml:"take_profit"`
 	} `yaml:"trading"`
 
 	System struct {
@@ -193,11 +201,32 @@ func (c *Config) Validate() error {
 	// 验证恢复阈值配置
 	monitorCount := len(c.RiskControl.MonitorSymbols)
 	if c.RiskControl.RecoveryThreshold <= 0 {
-		c.RiskControl.RecoveryThreshold = 3 // 默认3个币种
+		c.RiskControl.RecoveryThreshold = 3 // 默认3个
 	} else if c.RiskControl.RecoveryThreshold < 1 {
 		c.RiskControl.RecoveryThreshold = 1 // 最小1个
 	} else if c.RiskControl.RecoveryThreshold > monitorCount {
 		c.RiskControl.RecoveryThreshold = monitorCount // 最大为监控币种数量
+	}
+
+	// 验证止盈配置
+	if c.Trading.TakeProfit.Enabled {
+		if c.Trading.TakeProfit.TargetProfit <= 0 {
+			return fmt.Errorf("止盈目标金额必须大于0")
+		}
+		if c.Trading.TakeProfit.CheckInterval < 10 || c.Trading.TakeProfit.CheckInterval > 300 {
+			return fmt.Errorf("止盈检查间隔必须在10-300秒之间")
+		}
+		if c.Trading.TakeProfit.BalanceMode != "auto" && c.Trading.TakeProfit.BalanceMode != "precise" {
+			return fmt.Errorf("止盈余额模式必须是 auto 或 precise")
+		}
+
+		// 设置默认值
+		if c.Trading.TakeProfit.CheckInterval <= 0 {
+			c.Trading.TakeProfit.CheckInterval = 30 // 默认30秒
+		}
+		if c.Trading.TakeProfit.BalanceMode == "" {
+			c.Trading.TakeProfit.BalanceMode = "auto" // 默认auto
+		}
 	}
 
 	return nil

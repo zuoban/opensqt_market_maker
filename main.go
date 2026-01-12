@@ -134,6 +134,9 @@ func main() {
 	// === 新增：初始化风控监视器 ===
 	riskMonitor := safety.NewRiskMonitor(cfg, ex)
 
+	// === 新增：创建止盈监控器 ===
+	takeProfitMonitor := safety.NewTakeProfitMonitor(cfg, ex)
+
 	// === 创建对账器（从仓位管理器剖离） ===
 	reconciler := safety.NewReconciler(cfg, exchangeAdapter, superPositionManager)
 	// 将风控状态注入到对账器，用于暂停对账日志
@@ -213,6 +216,14 @@ func main() {
 		logger.Fatalf("❌ 初始化超级仓位管理器失败: %v", err)
 	}
 
+	// === 新增：设置初始余额（第一笔交易前） ===
+	if cfg.Trading.TakeProfit.Enabled {
+		logger.Info("💰 [止盈初始化] 正在记录初始余额...")
+		if err := takeProfitMonitor.SetInitialBalance(ctx); err != nil {
+			logger.Fatalf("❌ 设置初始余额失败: %v", err)
+		}
+	}
+
 	// 启动持仓对账（使用独立的 Reconciler）
 	reconciler.Start(ctx)
 
@@ -235,6 +246,53 @@ func main() {
 
 	// 启动风控监控
 	go riskMonitor.Start(ctx)
+
+	// === 新增：启动止盈监控 ===
+	if cfg.Trading.TakeProfit.Enabled {
+		go takeProfitMonitor.Start(ctx, func() {
+			// 止盈触发回调（完整退出流程）
+			logger.Warn("🚨 [止盈触发] 检测到止盈信号，开始安全退出...")
+
+			// 1. 撤销所有订单
+			cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelTimeout()
+			if err := ex.CancelAllOrders(cancelCtx, cfg.Trading.Symbol); err != nil {
+				logger.Error("❌ [止盈退出] 撤销订单失败: %v", err)
+			} else {
+				logger.Info("✅ [止盈退出] 所有订单已撤销")
+			}
+
+			// 2. 市价平仓
+			if err := closeAllPositionsMarket(ex, cfg.Trading.Symbol); err != nil {
+				logger.Error("❌ [止盈退出] 平仓失败: %v", err)
+			} else {
+				logger.Info("✅ [止盈退出] 所有持仓已平仓")
+			}
+
+			// 3. 停止所有组件
+			cancel()
+			priceMonitor.Stop()
+			ex.StopOrderStream()
+			riskMonitor.Stop()
+
+			// 4. 打印最终状态
+			initialBalance, currentBalance, profit := takeProfitMonitor.GetCurrentProfit()
+			logger.Info("📊 [止盈统计] ===")
+			logger.Info("📊 [止盈统计] 初始余额: %.2f USDT", initialBalance)
+			logger.Info("📊 [止盈统计] 最终余额: %.2f USDT", currentBalance)
+			logger.Info("📊 [止盈统计] 总盈利: %.2f USDT", profit)
+			logger.Info("📊 [止盈统计] 盈利率: %.2f%%", (profit/initialBalance)*100)
+			logger.Info("📊 [止盈统计] ===")
+			superPositionManager.PrintPositions()
+
+			// 5. 关闭日志
+			logger.Close()
+			logger.Info("✅ [止盈退出] 系统已安全退出，请手动重启程序")
+
+			// 6. 退出程序
+			os.Exit(0)
+		})
+	}
 
 	// 10. 监听价格变化,调整订单窗口（实时调整，不打印价格变化日志）
 	go func() {
@@ -282,6 +340,15 @@ func main() {
 				// 风控触发时不打印状态
 				if !riskMonitor.IsTriggered() {
 					superPositionManager.PrintPositions()
+				}
+
+				// === 新增：打印止盈状态 ===
+				if cfg.Trading.TakeProfit.Enabled && !takeProfitMonitor.IsTriggered() {
+					initialBalance, currentBalance, profit := takeProfitMonitor.GetCurrentProfit()
+					if initialBalance > 0 {
+						logger.Info("📊 [止盈监控] 初始: %.2f USDT, 当前: %.2f USDT, 盈利: %.2f USDT (%.1f%%)",
+							initialBalance, currentBalance, profit, (profit/initialBalance)*100)
+					}
 				}
 			}
 		}
@@ -442,4 +509,39 @@ func (a *exchangeExecutorAdapter) BatchPlaceOrders(orders []*position.OrderReque
 
 func (a *exchangeExecutorAdapter) BatchCancelOrders(orderIDs []int64) error {
 	return a.executor.BatchCancelOrders(orderIDs)
+}
+
+// closeAllPositionsMarket 市价平仓所有持仓（止盈退出时使用）
+func closeAllPositionsMarket(ex exchange.IExchange, symbol string) error {
+	ctx := context.Background()
+	positions, err := ex.GetPositions(ctx, symbol)
+	if err != nil || len(positions) == 0 {
+		logger.Info("📊 [止盈平仓] 无持仓需要平仓")
+		return nil
+	}
+
+	logger.Info("📊 [止盈平仓] 开始市价平仓 %d 个持仓", len(positions))
+
+	for _, pos := range positions {
+		if pos.Size > 0 {
+			orderReq := &exchange.OrderRequest{
+				Symbol:      symbol,
+				Side:        exchange.SideSell,
+				Type:        exchange.OrderTypeMarket,
+				TimeInForce: exchange.TimeInForceIOC,
+				Quantity:    pos.Size,
+				ReduceOnly:  true,
+			}
+
+			order, err := ex.PlaceOrder(ctx, orderReq)
+			if err != nil {
+				logger.Error("❌ [止盈平仓] 平仓失败: %v", err)
+				continue
+			}
+			logger.Info("✅ [止盈平仓] 已下市价平仓单: ID=%d, 数量=%.4f", order.OrderID, order.Quantity)
+		}
+	}
+
+	time.Sleep(2 * time.Second)
+	return nil
 }

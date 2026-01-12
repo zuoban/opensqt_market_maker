@@ -82,6 +82,12 @@ trading:
   # 持仓安全性配置
   position_safety_check: 100        # 持仓安全性检查（默认100，最少能向下持有多少仓）
 
+  # 自动止盈配置
+  take_profit:
+    enabled: false             # 是否启用止盈（默认false）
+    target_profit: 1000.0     # 止盈目标金额（USDT，默认1000）
+    check_interval: 30         # 检查间隔（秒，默认30）
+    balance_mode: "auto"       # 余额模式：auto(智能选择，推荐) / precise(精确计算)
 
 # 时间间隔配置
 timing:
