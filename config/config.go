@@ -29,6 +29,7 @@ type Config struct {
 		CleanupBatchSize      int     `yaml:"cleanup_batch_size"`           // 清理批次大小（默认10）
 		MarginLockDurationSec int     `yaml:"margin_lock_duration_seconds"` // 保证金锁定时间（秒，默认10）
 		PositionSafetyCheck   int     `yaml:"position_safety_check"`        // 持仓安全性检查（默认100，最少能向下持有多少仓）
+		MaxLeverage           int     `yaml:"max_leverage"`                 // 最大允许杠杆倍数（默认10）
 		// 注意：price_decimals 和 quantity_decimals 已废弃，现在从交易所自动获取
 
 		// 自动止盈配置
@@ -147,6 +148,10 @@ func (c *Config) Validate() error {
 	// 注意：price_decimals 和 quantity_decimals 已从配置中移除，现在从交易所自动获取
 	if c.Trading.MinOrderValue <= 0 {
 		c.Trading.MinOrderValue = 20.0 // 默认6U (币安通常最小5U)
+	}
+
+	if c.Trading.MaxLeverage <= 0 {
+		c.Trading.MaxLeverage = 10 // 默认10倍
 	}
 
 	// 设置默认时间间隔

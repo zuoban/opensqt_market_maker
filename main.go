@@ -113,6 +113,7 @@ func main() {
 		feeRate,
 		requiredPositions,
 		priceDecimals,
+		cfg.Trading.MaxLeverage,
 	); err != nil {
 		logger.Fatalf("❌ %v", err)
 	}
@@ -343,12 +344,10 @@ func main() {
 				}
 
 				// === 新增：打印止盈状态 ===
-				if cfg.Trading.TakeProfit.Enabled && !takeProfitMonitor.IsTriggered() {
+				if cfg.Trading.TakeProfit.Enabled {
 					initialBalance, currentBalance, profit := takeProfitMonitor.GetCurrentProfit()
-					if initialBalance > 0 {
-						logger.Info("📊 [止盈监控] 初始: %.2f USDT, 当前: %.2f USDT, 盈利: %.2f USDT (%.1f%%)",
-							initialBalance, currentBalance, profit, (profit/initialBalance)*100)
-					}
+					logger.Info("📊 [止盈监控] 初始: %.2f USDT, 当前: %.2f USDT, 盈利: %.2f USDT (%.1f%%)",
+						initialBalance, currentBalance, profit, (profit/initialBalance)*100)
 				}
 			}
 		}

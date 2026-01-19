@@ -81,6 +81,7 @@ trading:
   
   # 持仓安全性配置
   position_safety_check: 100        # 持仓安全性检查（默认100，最少能向下持有多少仓）
+  max_leverage: 10                  # 最大允许杠杆倍数（默认10，建议不超过20倍）
 
   # 自动止盈配置
   take_profit:

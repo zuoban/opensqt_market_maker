@@ -103,7 +103,7 @@ func (t *TakeProfitMonitor) checkProfitAndTrigger() bool {
 	initialBalance := t.initialBalance.Load().(float64)
 	totalProfit := currentBalance - initialBalance
 
-	logger.Debug("📊 [止盈检查] 初始余额: %.2f USDT, 当前余额: %.2f USDT, 盈利: %.2f USDT, 目标: %.2f USDT",
+	logger.Info("📊 [止盈检查] 初始余额: %.2f USDT, 当前余额: %.2f USDT, 盈利: %.2f USDT, 目标: %.2f USDT",
 		initialBalance, currentBalance, totalProfit, t.cfg.Trading.TakeProfit.TargetProfit)
 
 	if totalProfit >= t.cfg.Trading.TakeProfit.TargetProfit {
