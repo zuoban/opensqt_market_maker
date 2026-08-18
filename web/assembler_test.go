@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"opensqt/config"
 )
@@ -51,5 +52,18 @@ func TestSafeAppViewOmitsSecrets(t *testing.T) {
 	body := string(full)
 	if strings.Contains(body, "SECRETKEY_ABC") || strings.Contains(body, "SUPERSECRET_XYZ") || strings.Contains(body, "PASSPHRASE_123") {
 		t.Fatalf("full snapshot leaked secrets: %s", body)
+	}
+}
+
+func TestSnapshotIncludesProgramStartAndUptime(t *testing.T) {
+	started := time.Now().Add(-95 * time.Second)
+	a := &assembler{version: "test", started: started}
+	snapshot := a.Build()
+
+	if !snapshot.StartedAt.Equal(started) {
+		t.Fatalf("startedAt = %v, want %v", snapshot.StartedAt, started)
+	}
+	if snapshot.UptimeSec < 94 || snapshot.UptimeSec > 96 {
+		t.Fatalf("uptimeSec = %f", snapshot.UptimeSec)
 	}
 }

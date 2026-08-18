@@ -27,33 +27,35 @@ type SlotSnapshot struct {
 
 // PositionSnapshot 仓位管理器只读快照
 type PositionSnapshot struct {
-	Initialized          bool           `json:"initialized"`
-	Symbol               string         `json:"symbol"`
-	BaseAsset            string         `json:"baseAsset"`
-	AnchorPrice          float64        `json:"anchorPrice"`
-	LastPrice            float64        `json:"lastPrice"`
-	GridPrice            float64        `json:"gridPrice"`
-	PriceDecimals        int            `json:"priceDecimals"`
-	QuantityDecimals     int            `json:"quantityDecimals"`
-	PriceInterval        float64        `json:"priceInterval"`
-	OrderQuantity        float64        `json:"orderQuantity"`
-	BuyWindowSize        int            `json:"buyWindowSize"`
-	SellWindowSize       int            `json:"sellWindowSize"`
-	BuyWindowPrices      []float64      `json:"buyWindowPrices"`
-	SellWindowPrices     []float64      `json:"sellWindowPrices"`
-	Slots                []SlotSnapshot `json:"slots"`
-	FilledSlotCount      int            `json:"filledSlotCount"`
-	PositionQty          float64        `json:"positionQty"`
-	ActiveBuyOrders      int            `json:"activeBuyOrders"`
-	ActiveSellOrders     int            `json:"activeSellOrders"`
-	TotalBuyQty          float64        `json:"totalBuyQty"`
-	TotalSellQty         float64        `json:"totalSellQty"`
-	EstimatedProfit      float64        `json:"estimatedProfit"`
-	RealizedPNL          float64        `json:"realizedPnl"`
-	ReconcileCount       int64          `json:"reconcileCount"`
-	LastReconcileTime    time.Time      `json:"lastReconcileTime"`
-	MarginLocked         bool           `json:"marginLocked"`
-	MarginLockRemainingS float64        `json:"marginLockRemainingSec"`
+	Initialized          bool                `json:"initialized"`
+	Symbol               string              `json:"symbol"`
+	BaseAsset            string              `json:"baseAsset"`
+	AnchorPrice          float64             `json:"anchorPrice"`
+	LastPrice            float64             `json:"lastPrice"`
+	GridPrice            float64             `json:"gridPrice"`
+	PriceDecimals        int                 `json:"priceDecimals"`
+	QuantityDecimals     int                 `json:"quantityDecimals"`
+	PriceInterval        float64             `json:"priceInterval"`
+	OrderQuantity        float64             `json:"orderQuantity"`
+	BuyWindowSize        int                 `json:"buyWindowSize"`
+	SellWindowSize       int                 `json:"sellWindowSize"`
+	BuyWindowPrices      []float64           `json:"buyWindowPrices"`
+	SellWindowPrices     []float64           `json:"sellWindowPrices"`
+	Slots                []SlotSnapshot      `json:"slots"`
+	FilledOrders         []FilledOrderRecord `json:"filledOrders"`
+	FilledOrderCount     int64               `json:"filledOrderCount"`
+	FilledSlotCount      int                 `json:"filledSlotCount"`
+	PositionQty          float64             `json:"positionQty"`
+	ActiveBuyOrders      int                 `json:"activeBuyOrders"`
+	ActiveSellOrders     int                 `json:"activeSellOrders"`
+	TotalBuyQty          float64             `json:"totalBuyQty"`
+	TotalSellQty         float64             `json:"totalSellQty"`
+	EstimatedProfit      float64             `json:"estimatedProfit"`
+	RealizedPNL          float64             `json:"realizedPnl"`
+	ReconcileCount       int64               `json:"reconcileCount"`
+	LastReconcileTime    time.Time           `json:"lastReconcileTime"`
+	MarginLocked         bool                `json:"marginLocked"`
+	MarginLockRemainingS float64             `json:"marginLockRemainingSec"`
 }
 
 func isActiveOrderStatus(status string) bool {
@@ -112,6 +114,14 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	if spm.exchange != nil {
 		snap.BaseAsset = spm.exchange.GetBaseAsset()
 	}
+
+	spm.filledOrdersMu.RLock()
+	snap.FilledOrders = make([]FilledOrderRecord, len(spm.filledOrders))
+	for i := range spm.filledOrders {
+		snap.FilledOrders[len(spm.filledOrders)-1-i] = spm.filledOrders[i]
+	}
+	snap.FilledOrderCount = spm.filledOrderCount
+	spm.filledOrdersMu.RUnlock()
 
 	lastPrice, _ := spm.lastMarketPrice.Load().(float64)
 	snap.LastPrice = lastPrice

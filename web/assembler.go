@@ -15,6 +15,7 @@ import (
 type Snapshot struct {
 	Time      time.Time                 `json:"time"`
 	Version   string                    `json:"version"`
+	StartedAt time.Time                 `json:"startedAt"`
 	UptimeSec float64                   `json:"uptimeSec"`
 	App       SafeAppConfig             `json:"app"`
 	Price     PriceView                 `json:"price"`
@@ -44,10 +45,15 @@ type assembler struct {
 
 func (a *assembler) Build() *Snapshot {
 	now := time.Now()
+	started := a.started
+	if started.IsZero() {
+		started = now
+	}
 	snap := &Snapshot{
 		Time:      now,
 		Version:   a.version,
-		UptimeSec: now.Sub(a.started).Seconds(),
+		StartedAt: started,
+		UptimeSec: now.Sub(started).Seconds(),
 		App:       safeAppView(a.cfg),
 		Logs:      logger.RecentLogs(80),
 	}

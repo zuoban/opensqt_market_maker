@@ -22,6 +22,7 @@ import (
 var Version = "v3.4.4"
 
 func main() {
+	programStartedAt := time.Now()
 	logger.Info("🚀 www.OpenSQT.com 做市商系统启动...")
 	logger.Info("📦 版本号: %s", Version)
 
@@ -251,12 +252,13 @@ func main() {
 	var dash *web.Server
 	if cfg.DashboardEnabled() {
 		dash = web.New(web.Options{
-			Cfg:      cfg,
-			Version:  Version,
-			Price:    priceMonitor,
-			Position: superPositionManager,
-			Risk:     riskMonitor,
-			Exchange: ex,
+			Cfg:       cfg,
+			Version:   Version,
+			StartedAt: programStartedAt,
+			Price:     priceMonitor,
+			Position:  superPositionManager,
+			Risk:      riskMonitor,
+			Exchange:  ex,
 		})
 		go func() {
 			if err := dash.Start(); err != nil {

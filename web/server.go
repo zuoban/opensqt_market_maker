@@ -7,7 +7,9 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -21,12 +23,13 @@ import (
 
 // Options 监控面板依赖（全部只读）
 type Options struct {
-	Cfg      *config.Config
-	Version  string
-	Price    *monitor.PriceMonitor
-	Position *position.SuperPositionManager
-	Risk     *safety.RiskMonitor
-	Exchange exchange.IExchange
+	Cfg       *config.Config
+	Version   string
+	StartedAt time.Time
+	Price     *monitor.PriceMonitor
+	Position  *position.SuperPositionManager
+	Risk      *safety.RiskMonitor
+	Exchange  exchange.IExchange
 }
 
 // Server 本地只读监控 HTTP/WS 服务
@@ -41,6 +44,7 @@ type Server struct {
 	cancel     context.CancelFunc
 	addr       string
 	started    time.Time
+	runtimeMu  sync.RWMutex
 }
 
 type wsEnvelope struct {
@@ -49,12 +53,30 @@ type wsEnvelope struct {
 }
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: dashboardOriginAllowed,
+}
+
+func dashboardOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // New 创建面板服务。调用方在独立 goroutine 里 Start，失败不得退出做市。
 func New(opt Options) *Server {
-	started := time.Now()
+	started := opt.StartedAt
+	if started.IsZero() {
+		started = time.Now()
+	}
 	interval := 10 * time.Second
 	listen := "127.0.0.1:8787"
 	if opt.Cfg != nil {
@@ -98,7 +120,10 @@ func (s *Server) Addr() string {
 	if s == nil {
 		return ""
 	}
-	return s.addr
+	s.runtimeMu.RLock()
+	addr := s.addr
+	s.runtimeMu.RUnlock()
+	return addr
 }
 
 // Start 阻塞监听。Listen 失败时返回错误，不 panic。
@@ -108,7 +133,9 @@ func (s *Server) Start() error {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	s.runtimeMu.Lock()
 	s.cancel = cancel
+	s.runtimeMu.Unlock()
 
 	go s.hub.run()
 	go s.account.Run(ctx)
@@ -130,14 +157,18 @@ func (s *Server) Start() error {
 		cancel()
 		return err
 	}
-	s.addr = ln.Addr().String()
+	addr := ln.Addr().String()
+	httpServer := &http.Server{Handler: mux}
+	s.runtimeMu.Lock()
+	s.addr = addr
+	s.httpServer = httpServer
+	s.runtimeMu.Unlock()
 	if isNonLocalListen(s.listen) {
 		logger.Warn("⚠️ 监控面板监听 %s，账户与仓位可被局域网访问。建议改回 127.0.0.1 或设置 dashboard.token", s.listen)
 	}
-	logger.Info("🖥️ 监控面板: http://%s", displayURL(s.addr))
+	logger.Info("🖥️ 监控面板: http://%s", displayURL(addr))
 
-	s.httpServer = &http.Server{Handler: mux}
-	err = s.httpServer.Serve(ln)
+	err = httpServer.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -149,15 +180,19 @@ func (s *Server) Shutdown(timeout time.Duration) {
 	if s == nil {
 		return
 	}
-	if s.cancel != nil {
-		s.cancel()
+	s.runtimeMu.RLock()
+	cancelRuntime := s.cancel
+	httpServer := s.httpServer
+	s.runtimeMu.RUnlock()
+	if cancelRuntime != nil {
+		cancelRuntime()
 	}
-	if s.httpServer == nil {
+	if httpServer == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_ = s.httpServer.Shutdown(ctx)
+	_ = httpServer.Shutdown(ctx)
 }
 
 func (s *Server) pushLoop(ctx context.Context) {
@@ -191,6 +226,10 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; script-src 'self'; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	_, _ = w.Write(data)
 }
 
@@ -198,6 +237,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":        true,
 		"version":   s.version,
+		"startedAt": s.started,
 		"uptimeSec": time.Since(s.started).Seconds(),
 	})
 }
@@ -252,6 +292,8 @@ func (s *Server) authorized(r *http.Request) bool {
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }

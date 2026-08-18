@@ -3,16 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
     <title>OpenSQT 做市监控</title>
     <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
-    <div class="grain"></div>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <div class="grain" aria-hidden="true"></div>
+
     <header class="mast">
         <div class="brand">
-            <span class="brand-mark">OSQ</span>
+            <span class="brand-mark" aria-hidden="true">OSQ</span>
             <div>
-                <div class="brand-name">OpenSQT</div>
+                <h1 class="brand-name">OpenSQT</h1>
                 <div class="brand-sub">MARKET DESK · 只读</div>
             </div>
         </div>
@@ -22,80 +25,113 @@
             <div class="price-meta" id="priceMeta">等待价格</div>
         </div>
         <div class="mast-right">
-            <div class="pill" id="wsPill"><i></i><span>未连接</span></div>
-            <div class="pill risk" id="riskPill">风控 —</div>
+            <div class="pill connecting" id="wsPill" role="status" aria-live="polite">
+                <i aria-hidden="true"></i><span>连接中</span>
+            </div>
+            <div class="pill risk" id="riskPill" role="status" aria-live="polite">风控 —</div>
             <div class="ver" id="version"></div>
         </div>
     </header>
 
-    <section class="kpis" id="kpis"></section>
+    <main id="main-content">
+        <section class="summary" aria-labelledby="summaryTitle">
+            <h2 class="sr-only" id="summaryTitle">核心交易指标</h2>
+            <div class="kpis is-loading" id="kpis" aria-busy="true">
+                <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+            </div>
 
-    <main class="board">
-        <section class="panel ladder-wrap">
-            <div class="panel-head">
-                <h2>网格阶梯</h2>
-                <label class="toggle">
-                    <input type="checkbox" id="showOutside">
-                    显示窗口外
-                </label>
-            </div>
-            <div class="ladder-legend">
-                <span class="lg buy">买单</span>
-                <span class="lg empty">窗口空槽</span>
-                <span class="lg mark">现价格</span>
-                <span class="lg pos">持仓</span>
-                <span class="lg sell">卖单</span>
-            </div>
-            <div id="ladderEmpty" class="empty">尚无槽位。系统初始化后将在此显示网格。</div>
-            <div class="ladder" id="ladder"></div>
+            <details class="strategy-panel">
+                <summary>
+                    <span>策略与运行参数</span>
+                    <span class="strategy-summary" id="strategySummary">等待数据</span>
+                </summary>
+                <div class="strategy-kpis" id="strategyKpis"></div>
+            </details>
         </section>
 
-        <aside class="side">
+        <section class="board" aria-label="网格、风控与日志">
+            <section class="panel ladder-wrap">
+                <div class="panel-head">
+                    <h2>网格阶梯</h2>
+                    <label class="toggle">
+                        <input type="checkbox" id="showOutside">
+                        <span>显示窗口外</span>
+                    </label>
+                </div>
+                <div class="ladder-legend" aria-label="网格状态图例">
+                    <span class="lg buy">买单</span>
+                    <span class="lg empty-slot">窗口空槽</span>
+                    <span class="lg mark">现价格</span>
+                    <span class="lg pos">持仓</span>
+                    <span class="lg sell">卖单</span>
+                </div>
+                <div class="ladder-cols" aria-hidden="true">
+                    <span>价格</span><span>仓位量</span><span>订单状态</span><span>数量</span><span>槽位</span>
+                </div>
+                <div id="ladderEmpty" class="empty">尚无槽位。系统初始化后将在此显示网格。</div>
+                <div class="ladder" id="ladder" aria-label="网格槽位列表"></div>
+            </section>
+
+            <aside class="side" aria-label="风险与运行状态">
+                <section class="panel">
+                    <div class="panel-head"><h2>主动风控</h2></div>
+                    <p class="risk-msg" id="riskMsg">等待风控读数</p>
+                    <div id="riskList" class="risk-list"></div>
+                </section>
+                <section class="panel log-panel">
+                    <div class="panel-head"><h2>最近日志</h2></div>
+                    <div class="logs" id="logs" role="log" aria-live="polite" aria-relevant="additions"></div>
+                </section>
+            </aside>
+        </section>
+
+        <section class="tables" aria-label="成交订单和活动订单">
+            <section class="panel filled-orders-panel">
+                <div class="panel-head">
+                    <h2>成交订单</h2>
+                    <span class="panel-meta" id="filledCount">本次运行 · 0 笔</span>
+                </div>
+                <div class="table-wrap">
+                    <table class="filled-orders-table">
+                        <caption class="sr-only">程序启动后的成交订单</caption>
+                        <thead>
+                            <tr><th scope="col">成交时间</th><th scope="col">方向</th><th scope="col">成交均价</th><th scope="col">成交数量</th><th scope="col">已实现盈亏</th><th scope="col">ID</th></tr>
+                        </thead>
+                        <tbody id="filledBody"></tbody>
+                    </table>
+                </div>
+            </section>
             <section class="panel">
-                <div class="panel-head"><h2>主动风控</h2></div>
-                <p class="risk-msg" id="riskMsg">—</p>
-                <div id="riskList" class="risk-list"></div>
+                <div class="panel-head"><h2>活动订单</h2></div>
+                <div class="table-wrap">
+                    <table>
+                        <caption class="sr-only">当前活动订单</caption>
+                        <thead>
+                            <tr><th scope="col">方向</th><th scope="col">价格</th><th scope="col">状态</th><th scope="col">ID</th></tr>
+                        </thead>
+                        <tbody id="ordBody"></tbody>
+                    </table>
+                </div>
             </section>
-            <section class="panel log-panel">
-                <div class="panel-head"><h2>最近日志</h2></div>
-                <div class="logs" id="logs"></div>
-            </section>
-        </aside>
+        </section>
     </main>
 
-    <section class="tables">
-        <section class="panel">
-            <div class="panel-head"><h2>持仓槽位</h2></div>
-            <div class="table-wrap">
-                <table>
-                    <thead>
-                        <tr><th>价格</th><th>数量</th><th>订单</th><th>槽位</th></tr>
-                    </thead>
-                    <tbody id="posBody"></tbody>
-                </table>
-            </div>
-        </section>
-        <section class="panel">
-            <div class="panel-head"><h2>活动订单</h2></div>
-            <div class="table-wrap">
-                <table>
-                    <thead>
-                        <tr><th>方向</th><th>价格</th><th>状态</th><th>ID</th></tr>
-                    </thead>
-                    <tbody id="ordBody"></tbody>
-                </table>
-            </div>
-        </section>
-    </section>
-
-    <div class="token-mask hidden" id="tokenMask">
-        <form class="token-box" id="tokenForm">
-            <h3>需要访问令牌</h3>
-            <p>配置了 <code>dashboard.token</code>。输入后仅保存在本机。</p>
-            <input type="password" id="tokenInput" placeholder="token" autocomplete="off">
-            <button type="submit">进入面板</button>
-            <p class="err" id="tokenErr"></p>
-        </form>
+    <div class="token-mask hidden" id="tokenMask" aria-hidden="true">
+        <div class="token-box" role="dialog" aria-modal="true" aria-labelledby="tokenTitle" aria-describedby="tokenHelp">
+            <form id="tokenForm">
+                <h2 id="tokenTitle">需要访问令牌</h2>
+                <p id="tokenHelp">此面板受保护。令牌只在当前浏览器会话中保存。</p>
+                <label for="tokenInput">访问令牌</label>
+                <input type="password" id="tokenInput" autocomplete="off" required>
+                <button type="submit" id="tokenSubmit">验证并进入</button>
+                <p class="err" id="tokenErr" role="alert" aria-live="assertive"></p>
+            </form>
+        </div>
     </div>
 
     <script src="/assets/app.js"></script>

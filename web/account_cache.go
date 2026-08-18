@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -17,17 +18,21 @@ type AccountSource interface {
 
 // AccountView 面板用的账户读数
 type AccountView struct {
-	Available     float64   `json:"available"`
-	Wallet        float64   `json:"wallet"`
-	Margin        float64   `json:"margin"`
-	Leverage      int       `json:"leverage"`
-	PositionSize  float64   `json:"positionSize"`
-	EntryPrice    float64   `json:"entryPrice"`
-	UnrealizedPNL float64   `json:"unrealizedPnl"`
-	QuoteAsset    string    `json:"quoteAsset"`
-	Stale         bool      `json:"stale"`
-	UpdatedAt     time.Time `json:"updatedAt"`
-	Error         string    `json:"error,omitempty"`
+	Available          float64   `json:"available"`
+	Wallet             float64   `json:"wallet"`
+	Margin             float64   `json:"margin"`
+	InitialMargin      float64   `json:"initialMargin"`
+	MarginChange       float64   `json:"marginChange"`
+	MarginChangePct    float64   `json:"marginChangePct"`
+	InitialMarginReady bool      `json:"initialMarginReady"`
+	Leverage           int       `json:"leverage"`
+	PositionSize       float64   `json:"positionSize"`
+	EntryPrice         float64   `json:"entryPrice"`
+	UnrealizedPNL      float64   `json:"unrealizedPnl"`
+	QuoteAsset         string    `json:"quoteAsset"`
+	Stale              bool      `json:"stale"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+	Error              string    `json:"error,omitempty"`
 }
 
 // AccountCache 限频拉取账户，失败时保留上一份并标 stale。
@@ -36,8 +41,10 @@ type AccountCache struct {
 	symbol   string
 	interval time.Duration
 
-	mu   sync.RWMutex
-	view AccountView
+	mu                 sync.RWMutex
+	view               AccountView
+	initialMargin      float64
+	initialMarginReady bool
 }
 
 func newAccountCache(src AccountSource, symbol string, interval time.Duration) *AccountCache {
@@ -91,6 +98,16 @@ func (c *AccountCache) refresh(parent context.Context) {
 		view.Available = acc.AvailableBalance
 		view.Wallet = acc.TotalWalletBalance
 		view.Margin = acc.TotalMarginBalance
+		if !c.initialMarginReady {
+			c.initialMargin = view.Margin
+			c.initialMarginReady = true
+		}
+		view.InitialMargin = c.initialMargin
+		view.InitialMarginReady = c.initialMarginReady
+		view.MarginChange = view.Margin - view.InitialMargin
+		if view.InitialMargin != 0 {
+			view.MarginChangePct = view.MarginChange / math.Abs(view.InitialMargin) * 100
+		}
 		view.Leverage = acc.AccountLeverage
 		for _, p := range acc.Positions {
 			if p != nil && (c.symbol == "" || p.Symbol == c.symbol) && p.Size != 0 {

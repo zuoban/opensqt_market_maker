@@ -33,6 +33,20 @@ type OrderUpdate struct {
 	RealizedPNLIncremental bool
 }
 
+const maxFilledOrderRecords = 200
+
+// FilledOrderRecord 本次程序运行期间完成成交的订单。
+type FilledOrderRecord struct {
+	OrderID       int64     `json:"orderId"`
+	ClientOrderID string    `json:"clientOrderId"`
+	Symbol        string    `json:"symbol"`
+	Side          string    `json:"side"`
+	Price         float64   `json:"price"`
+	Quantity      float64   `json:"quantity"`
+	FilledAt      time.Time `json:"filledAt"`
+	RealizedPNL   float64   `json:"realizedPnl"`
+}
+
 // OrderExecutorInterface 订单执行器接口（避免循环导入）
 type OrderExecutorInterface interface {
 	PlaceOrder(req *OrderRequest) (*Order, error)
@@ -113,6 +127,8 @@ type InventorySlot struct {
 
 	// 当前订单已计入的累计已实现盈亏（非增量推送用）
 	orderReportedPNL float64
+	// 当前订单从部分成交到完全成交累计的已实现盈亏（用于成交历史）。
+	orderAccumulatedPNL float64
 
 	mu sync.RWMutex // 槽位级别的锁（细粒度锁）
 }
@@ -166,6 +182,12 @@ type SuperPositionManager struct {
 	lastReconcileTime atomic.Value // time.Time - 最后对账时间
 	pnlMu             sync.Mutex   // 保护 realizedPNL 累加
 
+	// 本次运行期间的成交订单，按完成时间保留最近 maxFilledOrderRecords 笔。
+	filledOrdersMu   sync.RWMutex
+	filledOrders     []FilledOrderRecord
+	filledOrderKeys  map[string]struct{}
+	filledOrderCount int64
+
 	// 初始化标志
 	isInitialized atomic.Bool
 
@@ -187,6 +209,7 @@ func NewSuperPositionManager(cfg *config.Config, executor OrderExecutorInterface
 		marginLockDuration: time.Duration(marginLockSec) * time.Second,
 		priceDecimals:      priceDecimals,
 		quantityDecimals:   quantityDecimals,
+		filledOrderKeys:    make(map[string]struct{}),
 	}
 	spm.totalBuyQty.Store(0.0)
 	spm.totalSellQty.Store(0.0)
@@ -677,6 +700,12 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 
+	// 完成成交后槽位会清空订单字段；忽略重复 FILLED 推送，避免重复计数和重复展示。
+	if update.Status == OrderStatusFilled && spm.wasFilledOrderRecorded(update) {
+		logger.Debug("⏭️ [重复成交被忽略] ID=%d, ClientOID=%s", update.OrderID, update.ClientOrderID)
+		return
+	}
+
 	// 校验：确保这个更新属于当前的订单 (防止旧订单的延迟推送干扰新订单)
 	// 优先使用 ClientOrderID 匹配 (某些交易所如 Gate.io 的 OrderID 可能略有差异)
 	if slot.ClientOID != "" && slot.ClientOID != update.ClientOrderID {
@@ -706,6 +735,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		}
 
 	case "PARTIALLY_FILLED", "FILLED":
+		orderPrice := slot.OrderPrice
 		// 计算增量
 		deltaQty := update.ExecutedQty - slot.OrderFilledQty
 		if deltaQty < 0 {
@@ -762,7 +792,6 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 				slot.ClientOID = ""
 				slot.OrderSide = "" // 🔥 清除订单方向，避免误判
 				slot.OrderFilledQty = 0
-				slot.orderReportedPNL = 0
 
 				if slot.PositionQty < 0.000001 {
 					slot.PositionStatus = PositionStatusEmpty // 标记为空仓
@@ -776,6 +805,16 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 			} else {
 				slot.OrderStatus = OrderStatusPartiallyFilled
 			}
+		}
+
+		if update.Status == OrderStatusFilled {
+			realizedPNL := 0.0
+			if side == "SELL" {
+				realizedPNL = slot.orderAccumulatedPNL
+			}
+			spm.recordFilledOrder(update, side, orderPrice, price, realizedPNL)
+			slot.orderReportedPNL = 0
+			slot.orderAccumulatedPNL = 0
 		}
 
 	case "CANCELED", "EXPIRED", "REJECTED":
@@ -822,7 +861,97 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		slot.ClientOID = ""
 		slot.OrderFilledQty = 0
 		slot.orderReportedPNL = 0
+		slot.orderAccumulatedPNL = 0
 		// 保留 OrderSide 用于日志调试
+	}
+}
+
+func filledOrderKey(update OrderUpdate) string {
+	if update.ClientOrderID != "" {
+		return "client:" + update.ClientOrderID
+	}
+	if update.OrderID != 0 {
+		return fmt.Sprintf("order:%d", update.OrderID)
+	}
+	return ""
+}
+
+func (spm *SuperPositionManager) wasFilledOrderRecorded(update OrderUpdate) bool {
+	key := filledOrderKey(update)
+	if key == "" {
+		return false
+	}
+	spm.filledOrdersMu.RLock()
+	_, exists := spm.filledOrderKeys[key]
+	spm.filledOrdersMu.RUnlock()
+	return exists
+}
+
+func (spm *SuperPositionManager) recordFilledOrder(update OrderUpdate, side string, orderPrice, slotPrice, realizedPNL float64) {
+	key := filledOrderKey(update)
+	if key == "" {
+		return
+	}
+
+	price := update.AvgPrice
+	if price <= 0 {
+		price = update.Price
+	}
+	if price <= 0 {
+		price = orderPrice
+	}
+	if price <= 0 {
+		price = slotPrice
+	}
+
+	symbol := update.Symbol
+	if symbol == "" && spm.config != nil {
+		symbol = spm.config.Trading.Symbol
+	}
+	filledAt := time.Now()
+	if update.UpdateTime > 0 {
+		filledAt = timestampToTime(update.UpdateTime)
+	}
+
+	record := FilledOrderRecord{
+		OrderID:       update.OrderID,
+		ClientOrderID: update.ClientOrderID,
+		Symbol:        symbol,
+		Side:          side,
+		Price:         price,
+		Quantity:      update.ExecutedQty,
+		FilledAt:      filledAt,
+		RealizedPNL:   realizedPNL,
+	}
+
+	spm.filledOrdersMu.Lock()
+	defer spm.filledOrdersMu.Unlock()
+	if _, exists := spm.filledOrderKeys[key]; exists {
+		return
+	}
+	spm.filledOrderKeys[key] = struct{}{}
+	spm.filledOrders = append(spm.filledOrders, record)
+	spm.filledOrderCount++
+	if len(spm.filledOrders) > maxFilledOrderRecords {
+		oldest := spm.filledOrders[0]
+		delete(spm.filledOrderKeys, filledOrderKey(OrderUpdate{
+			OrderID:       oldest.OrderID,
+			ClientOrderID: oldest.ClientOrderID,
+		}))
+		spm.filledOrders = spm.filledOrders[1:]
+	}
+}
+
+func timestampToTime(timestamp int64) time.Time {
+	switch {
+	case timestamp >= 1_000_000_000_000_000_000:
+		return time.Unix(0, timestamp)
+	case timestamp >= 1_000_000_000_000_000:
+		return time.UnixMicro(timestamp)
+	case timestamp >= 1_000_000_000_000:
+		return time.UnixMilli(timestamp)
+	default:
+		return time.Unix(timestamp, 0)
 	}
 }
 
@@ -848,6 +977,7 @@ func (spm *SuperPositionManager) applySellRealizedPNL(slot *InventorySlot, updat
 			delta = deltaQty * (sellPx - slot.Price)
 		}
 	}
+	slot.orderAccumulatedPNL += delta
 	if delta == 0 {
 		return
 	}

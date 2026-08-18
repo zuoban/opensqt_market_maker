@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -76,6 +77,9 @@ func TestHealthAndSnapshotAndAuth(t *testing.T) {
 	if health["version"] != "test-ver" {
 		t.Fatalf("health = %v", health)
 	}
+	if health["startedAt"] == nil {
+		t.Fatalf("health missing startedAt: %v", health)
+	}
 
 	resp, err = http.Get(base + "/api/snapshot")
 	if err != nil {
@@ -132,6 +136,23 @@ func TestIsNonLocalListen(t *testing.T) {
 	}
 	if isNonLocalListen("127.0.0.1:8787") {
 		t.Fatal("127.0.0.1 should be local")
+	}
+}
+
+func TestDashboardOriginAllowed(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/ws", nil)
+	if !dashboardOriginAllowed(req) {
+		t.Fatal("clients without an Origin header should be allowed")
+	}
+
+	req.Header.Set("Origin", "http://127.0.0.1:8787")
+	if !dashboardOriginAllowed(req) {
+		t.Fatal("same-origin websocket should be allowed")
+	}
+
+	req.Header.Set("Origin", "https://attacker.example")
+	if dashboardOriginAllowed(req) {
+		t.Fatal("cross-origin websocket should be rejected")
 	}
 }
 
