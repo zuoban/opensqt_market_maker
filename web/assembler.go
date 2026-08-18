@@ -19,6 +19,7 @@ type Snapshot struct {
 	UptimeSec float64                   `json:"uptimeSec"`
 	App       SafeAppConfig             `json:"app"`
 	Price     PriceView                 `json:"price"`
+	Kline     KlineView                 `json:"kline"`
 	Position  position.PositionSnapshot `json:"position"`
 	Risk      safety.RiskSnapshot       `json:"risk"`
 	Account   AccountView               `json:"account"`
@@ -31,6 +32,26 @@ type PriceView struct {
 	LastText  string    `json:"lastText"`
 	UpdatedAt time.Time `json:"updatedAt"`
 	AgeMs     int64     `json:"ageMs"`
+}
+
+// KlineView 面板使用的真实 OHLC 序列。
+type KlineView struct {
+	Interval     string       `json:"interval"`
+	UpdatedAt    time.Time    `json:"updatedAt"`
+	HistoryReady bool         `json:"historyReady"`
+	Degraded     bool         `json:"degraded"`
+	Candles      []CandleView `json:"candles"`
+}
+
+// CandleView 单根蜡烛；Time 为 UTC 毫秒时间戳。
+type CandleView struct {
+	Time     int64   `json:"time"`
+	Open     float64 `json:"open"`
+	High     float64 `json:"high"`
+	Low      float64 `json:"low"`
+	Close    float64 `json:"close"`
+	Volume   float64 `json:"volume"`
+	IsClosed bool    `json:"isClosed"`
 }
 
 type assembler struct {
@@ -55,6 +76,7 @@ func (a *assembler) Build() *Snapshot {
 		StartedAt: started,
 		UptimeSec: now.Sub(started).Seconds(),
 		App:       safeAppView(a.cfg),
+		Kline:     KlineView{Candles: make([]CandleView, 0)},
 		Logs:      logger.RecentLogs(80),
 	}
 	if a.account != nil {
@@ -78,6 +100,23 @@ func (a *assembler) Build() *Snapshot {
 			age = now.Sub(updated).Milliseconds()
 		}
 		snap.Price = PriceView{Last: last, LastText: text, UpdatedAt: updated, AgeMs: age}
+		series := a.price.GetKlineSnapshot()
+		snap.Kline.Interval = series.Interval
+		snap.Kline.UpdatedAt = series.UpdatedAt
+		snap.Kline.HistoryReady = series.HistoryReady
+		snap.Kline.Degraded = series.HistoryError
+		snap.Kline.Candles = make([]CandleView, 0, len(series.Candles))
+		for _, candle := range series.Candles {
+			snap.Kline.Candles = append(snap.Kline.Candles, CandleView{
+				Time:     candle.Timestamp,
+				Open:     candle.Open,
+				High:     candle.High,
+				Low:      candle.Low,
+				Close:    candle.Close,
+				Volume:   candle.Volume,
+				IsClosed: candle.IsClosed,
+			})
+		}
 	} else if snap.Position.LastPrice > 0 {
 		snap.Price = PriceView{
 			Last:     snap.Position.LastPrice,

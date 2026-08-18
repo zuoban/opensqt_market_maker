@@ -140,6 +140,7 @@ func (s *Server) Start() error {
 	go s.hub.run()
 	go s.account.Run(ctx)
 	go s.pushLoop(ctx)
+	go s.loadKlines(ctx)
 
 	mux := http.NewServeMux()
 	staticRoot, err := fs.Sub(staticFS, "static")
@@ -173,6 +174,17 @@ func (s *Server) Start() error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) loadKlines(ctx context.Context) {
+	if s == nil || s.assembler == nil || s.assembler.price == nil {
+		return
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	if err := s.assembler.price.EnableKlines(loadCtx, "1m", 120); err != nil {
+		logger.Warn("⚠️ 监控面板历史 K 线加载失败，将从实时行情开始积累: %v", err)
+	}
 }
 
 // Shutdown 在 timeout 内关闭监听

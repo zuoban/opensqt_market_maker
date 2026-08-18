@@ -53,6 +53,7 @@ type PriceMonitor struct {
 
 	// 时间配置
 	priceSendInterval time.Duration
+	klineCache        candleCache
 }
 
 // NewPriceMonitor 创建价格监控器
@@ -116,7 +117,9 @@ func (pm *PriceMonitor) updatePrice(newPrice float64) {
 	// 存储新价格
 	pm.lastPrice.Store(newPrice)
 	pm.lastPriceStr.Store(fmt.Sprintf("%f", newPrice)) // 简单转换，精度由后续逻辑处理
-	pm.lastPriceTime.Store(time.Now())
+	now := time.Now()
+	pm.lastPriceTime.Store(now)
+	pm.recordCandlePrice(newPrice, now)
 
 	// 如果价格有变化，生成事件
 	if oldPrice > 0 && newPrice != oldPrice {
@@ -125,7 +128,7 @@ func (pm *PriceMonitor) updatePrice(newPrice float64) {
 			OldPrice:  oldPrice,
 			NewPrice:  newPrice,
 			Change:    change,
-			Timestamp: time.Now(),
+			Timestamp: now,
 		}
 		pm.latestPriceChange.Store(event)
 	}

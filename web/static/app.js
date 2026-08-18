@@ -1,4 +1,9 @@
 (function () {
+    if (typeof module !== "undefined" && module.exports) {
+        module.exports = { buildKlineGridModel };
+        return;
+    }
+
     const params = new URLSearchParams(location.search);
     const queryToken = params.get("token") || "";
     let token = queryToken || readSessionToken() || readLegacyToken() || "";
@@ -14,6 +19,12 @@
     let lastSnapshotAt = 0;
     let lastPriceAgeBase = null;
     let lastPriceAgeAt = 0;
+    let lastRenderedPrice = null;
+    let chartModel = null;
+    let chartGeometry = null;
+    let chartSelection = null;
+    let chartTooltipActive = false;
+    let chartResizeObserver = null;
     const renderKeys = Object.create(null);
 
     const $ = (id) => document.getElementById(id);
@@ -28,8 +39,10 @@
 
     $("showOutside").addEventListener("change", (event) => {
         showOutside = event.target.checked;
-        renderKeys.ladder = "";
-        if (latestSnapshot) renderLadder(latestSnapshot.position || {});
+        renderKeys["market-chart"] = "";
+        if (latestSnapshot) {
+            renderKlineChart(latestSnapshot.kline || {}, latestSnapshot.position || {});
+        }
     });
 
     $("tokenForm").addEventListener("submit", async (event) => {
@@ -228,7 +241,18 @@
         const quote = acc.quoteAsset || "USDT";
 
         setText($("pair"), (app.exchange || "—") + " · " + (app.symbol || pos.symbol || "—"));
-        setText($("lastPrice"), price.lastText || fmt(price.last, dec));
+        const priceNode = $("lastPrice");
+        const priceText = price.lastText || fmt(price.last, dec);
+        const currentPrice = Number(price.last);
+        setText(priceNode, priceText);
+        priceNode.setAttribute("aria-label", "最新价格 " + priceText);
+        if (Number.isFinite(currentPrice)) {
+            if (lastRenderedPrice !== null && currentPrice !== lastRenderedPrice) {
+                priceNode.classList.toggle("price-up", currentPrice > lastRenderedPrice);
+                priceNode.classList.toggle("price-down", currentPrice < lastRenderedPrice);
+            }
+            lastRenderedPrice = currentPrice;
+        }
         const uptimeText = formatDuration(snapshot.uptimeSec);
         setText(
             $("version"),
@@ -283,17 +307,18 @@
             " · 间距 " + fmt(pos.priceInterval, dec) +
             " · 每单 " + fmt(pos.orderQuantity || app.orderQuantity) + " " + quote;
 
-        updateSection("ladder", {
+        updateSection("market-chart", {
+            kline: snapshot.kline || {},
             slots: pos.slots || [],
             gridPrice: pos.gridPrice,
             priceDecimals: pos.priceDecimals,
             quantityDecimals: pos.quantityDecimals,
+            orderQuantity: pos.orderQuantity,
             showOutside
-        }, () => renderLadder(pos));
+        }, () => renderKlineChart(snapshot.kline || {}, pos));
         updateSection("risk", risk, () => renderRisk(risk));
         updateSection("logs", snapshot.logs || [], () => renderLogs(snapshot.logs || []));
         updateSection("tables", {
-            slots: pos.slots || [],
             filledOrders: pos.filledOrders || [],
             filledOrderCount: pos.filledOrderCount,
             priceDecimals: pos.priceDecimals,
@@ -315,6 +340,7 @@
     function renderMetrics(container, items) {
         const cards = items.map((item) => {
             const card = element("div", "kpi");
+            card.setAttribute("aria-label", item.label + "：" + item.value + (item.hint ? "；" + item.hint : ""));
             const label = element("div", "lab", item.label);
             const value = element("div", "val" + (item.className ? " " + item.className : ""), item.value);
             card.append(label, value);
@@ -332,60 +358,615 @@
         container.setAttribute("aria-busy", "false");
     }
 
-    function renderLadder(pos) {
-        const slots = pos.slots || [];
-        const empty = $("ladderEmpty");
-        const box = $("ladder");
-        if (!slots.length) {
+    function buildKlineGridModel(kline, pos, includeOutside) {
+        const candleMap = new Map();
+        (kline.candles || []).forEach((item) => {
+            let time = Number(item.time);
+            const open = Number(item.open);
+            const high = Number(item.high);
+            const low = Number(item.low);
+            const close = Number(item.close);
+            if (time > 0 && time < 100000000000) time *= 1000;
+            if (![time, open, high, low, close].every(Number.isFinite) ||
+                time <= 0 || open <= 0 || high <= 0 || low <= 0 || close <= 0) return;
+            candleMap.set(time, {
+                time,
+                open,
+                high: Math.max(high, open, close),
+                low: Math.min(low, open, close),
+                close,
+                volume: Number(item.volume || 0),
+                isClosed: Boolean(item.isClosed)
+            });
+        });
+        const candles = Array.from(candleMap.values())
+            .sort((a, b) => a.time - b.time)
+            .slice(-500);
+
+        const grid = Number(pos.gridPrice);
+        const orderValue = Number(pos.orderQuantity || 0);
+        const levels = [];
+        (pos.slots || []).forEach((slot) => {
+            const price = Number(slot.price);
+            if (!Number.isFinite(price) || price <= 0) return;
+            const isGrid = Number.isFinite(grid) && Math.abs(price - grid) <= 1e-12;
+            const inWindow = Boolean(slot.inBuyWindow || slot.inSellWindow);
+            if (!includeOutside && !inWindow && !isGrid) return;
+
+            const hasPosition = slot.positionStatus === "FILLED" && Number(slot.positionQty || 0) > 0;
+            const hasBuy = slot.orderSide === "BUY" && isActive(slot.orderStatus);
+            const hasSell = slot.orderSide === "SELL" && isActive(slot.orderStatus);
+            const markers = [];
+            if (isGrid) markers.push("G");
+            if (hasBuy) markers.push("B");
+            if (hasSell) markers.push("S");
+            if (hasPosition) markers.push("P");
+
+            let kind = "outside";
+            if (isGrid) kind = "grid";
+            else if (hasSell) kind = "sell";
+            else if (hasPosition) kind = "position";
+            else if (hasBuy) kind = "buy";
+            else if (inWindow) kind = "empty";
+
+            levels.push({
+                price,
+                priceText: slot.priceText || "",
+                kind,
+                markers,
+                isGrid,
+                hasBuy,
+                hasSell,
+                hasPosition,
+                inWindow,
+                orderQuantity: (hasBuy || hasSell) && orderValue > 0 ? orderValue / price : 0,
+                positionQuantity: Number(slot.positionQty || 0),
+                slot
+            });
+        });
+        levels.sort((a, b) => b.price - a.price);
+
+        const priceValues = [];
+        candles.forEach((candle) => priceValues.push(candle.low, candle.high));
+        levels.forEach((level) => priceValues.push(level.price));
+        let priceMin = priceValues.length ? Math.min(...priceValues) : 0;
+        let priceMax = priceValues.length ? Math.max(...priceValues) : 0;
+        if (priceMin > 0 && priceMax > 0) {
+            const span = Math.max(priceMax - priceMin, priceMax * 0.002);
+            priceMin -= span * 0.08;
+            priceMax += span * 0.08;
+        }
+
+        const first = candles[0];
+        const latest = candles[candles.length - 1];
+        const change = first && latest ? latest.close - first.open : 0;
+        const changePct = first && first.open ? change / first.open * 100 : 0;
+        const candleLow = candles.length ? Math.min(...candles.map((candle) => candle.low)) : 0;
+        const candleHigh = candles.length ? Math.max(...candles.map((candle) => candle.high)) : 0;
+        const execution = levels.reduce((result, level) => {
+            if (level.hasBuy) result.buy += 1;
+            if (level.hasSell) result.sell += 1;
+            if (level.hasPosition) result.position += 1;
+            return result;
+        }, { buy: 0, sell: 0, position: 0 });
+        return {
+            interval: kline.interval || "1m",
+            historyReady: Boolean(kline.historyReady),
+            degraded: Boolean(kline.degraded),
+            candles,
+            levels,
+            grid,
+            priceMin,
+            priceMax,
+            latest,
+            candleLow,
+            candleHigh,
+            change,
+            changePct,
+            execution
+        };
+    }
+
+    function renderKlineChart(kline, pos) {
+        chartModel = buildKlineGridModel(kline, pos, showOutside);
+        if (chartSelection !== null && chartSelection >= chartModel.candles.length) {
+            chartSelection = Math.max(0, chartModel.candles.length - 1);
+        }
+        const empty = $("klineEmpty");
+        const interval = chartModel.interval;
+        const intervalNode = $("klineInterval");
+        setText(intervalNode, interval + " · " + chartModel.candles.length + " 根");
+        intervalNode.classList.toggle("warn", chartModel.degraded);
+        setText($("klineCount"), chartModel.candles.length + " 根");
+
+        if (!chartModel.candles.length) {
             empty.hidden = false;
-            box.replaceChildren();
+            setText(empty, chartModel.degraded
+                ? "历史 K 线暂不可用，正在从实时行情积累"
+                : "正在加载真实 K 线数据");
+            setText($("klineSummary"), chartModel.degraded
+                ? "历史行情读取失败；当前价格流仍在记录新的真实蜡烛。"
+                : "正在加载真实 OHLC 行情…");
+            renderKlineStats(null, pos.priceDecimals ?? 2);
+            setText($("klineDetail"), "获得首根 K 线后即可查看开、高、低、收明细");
+            $("klineCanvas").setAttribute("aria-label", "K 线数据尚未就绪");
+            replaceChildren($("klineBody"), [emptyRow("K 线数据尚未就绪", 6)]);
+            drawKlineChart();
             return;
         }
 
         empty.hidden = true;
-        const grid = pos.gridPrice;
-        const rows = [];
-        slots.forEach((slot) => {
-            const inWindow = slot.inBuyWindow || slot.inSellWindow;
-            if (!inWindow && !showOutside && Math.abs(slot.price - grid) > 1e-12) return;
+        const decimals = pos.priceDecimals ?? 2;
+        const latest = chartModel.latest;
+        const direction = chartModel.change > 0 ? "上涨" : (chartModel.change < 0 ? "下跌" : "持平");
+        const degradedText = chartModel.degraded ? " · 历史读取降级" : "";
+        const summary = interval + " K 线 · " + chartModel.candles.length + " 根" +
+            " · 最新 " + fmt(latest.close, decimals) +
+            " · 显示区间 " + fmt(chartModel.priceMin, decimals) + "–" + fmt(chartModel.priceMax, decimals) +
+            " · " + direction + " " + fmtSigned(chartModel.changePct, 2) + "%" +
+            " · 网格层 " + chartModel.levels.length + degradedText;
+        setText($("klineSummary"), summary);
+        $("klineCanvas").setAttribute("aria-label", summary + "。可使用左右方向键逐根查看。");
+        renderKlineStats(chartModel, decimals);
+        if (chartTooltipActive && chartSelection !== null) updateSelectedCandle();
+        else setText($("klineDetail"), candleDetail(latest, decimals));
+        renderKlineTable(chartModel.candles, decimals);
+        drawKlineChart();
+    }
 
-            let stateClass = "is-out";
-            if (Math.abs(slot.price - grid) <= 1e-12) stateClass = "is-mark";
-            else if (slot.orderSide === "SELL" && isActive(slot.orderStatus)) stateClass = "is-sell";
-            else if (slot.positionStatus === "FILLED") stateClass = "is-pos";
-            else if (slot.orderSide === "BUY" && isActive(slot.orderStatus)) stateClass = "is-buy";
-            else if (slot.inBuyWindow) stateClass = "is-empty";
+    function renderKlineStats(model, decimals) {
+        const changeNode = $("klineChange");
+        changeNode.classList.remove("pos", "neg");
+        if (!model || !model.latest) {
+            setText($("klineLast"), "—");
+            setText(changeNode, "—");
+            setText($("klineRange"), "—");
+            setText($("klineExecution"), "等待行情");
+            return;
+        }
+        setText($("klineLast"), fmt(model.latest.close, decimals));
+        setText(changeNode, fmtSigned(model.changePct, 2) + "%");
+        changeNode.classList.add(model.changePct >= 0 ? "pos" : "neg");
+        setText($("klineRange"), fmt(model.candleLow, decimals) + " – " + fmt(model.candleHigh, decimals));
+        setText(
+            $("klineExecution"),
+            "B " + model.execution.buy + " · S " + model.execution.sell + " · P " + model.execution.position
+        );
+    }
 
-            const row = element("div", "row " + stateClass);
-            row.setAttribute("role", "listitem");
-            if (stateClass === "is-mark") row.setAttribute("aria-current", "true");
+    function renderKlineTable(candles, decimals) {
+        const rows = candles.slice().reverse().map((candle) => {
+            const row = document.createElement("tr");
+            const values = [
+                ["时间", formatCompactDateTime(candle.time)],
+                ["开", fmt(candle.open, decimals)],
+                ["高", fmt(candle.high, decimals)],
+                ["低", fmt(candle.low, decimals)],
+                ["收", fmt(candle.close, decimals)],
+                ["状态", candle.isClosed ? "已完结" : "进行中"]
+            ];
+            values.forEach(([label, value], index) => {
+                const cell = element("td", index === 0 ? "fill-time" : "", value);
+                cell.dataset.label = label;
+                row.appendChild(cell);
+            });
+            return row;
+        });
+        replaceChildren($("klineBody"), rows);
+    }
 
-            const price = element("span", "px", slot.priceText || fmt(slot.price, pos.priceDecimals));
-            const bar = element("span", "bar");
-            bar.setAttribute("aria-hidden", "true");
-            const fill = element("i");
-            const width = Math.min(100, Math.max(8, (slot.positionQty || 0.01) * 800));
-            const color = stateClass === "is-buy"
-                ? "var(--buy)"
-                : (stateClass === "is-sell" ? "var(--sell)" : "var(--brass)");
-            fill.style.setProperty("--w", width + "%");
-            fill.style.setProperty("--c", color);
-            bar.appendChild(fill);
+    function initKlineChart() {
+        const canvas = $("klineCanvas");
+        const stage = $("klineStage");
+        if (!canvas || !stage) return;
 
-            let orderLabel = ((slot.orderSide || "") + " " + (slot.orderStatus || "")).trim() || "—";
-            if (stateClass === "is-mark") orderLabel = "现价";
-            else if (stateClass === "is-empty") orderLabel = "空槽";
-            const order = element("span", "order-state", orderLabel);
-            const quantity = element("span", "", slot.positionQtyText || fmt(slot.positionQty, pos.quantityDecimals || 4));
-            const status = element("span", "", slot.slotStatus || "—");
-            row.append(price, bar, order, quantity, status);
-            rows.push(row);
+        const selectAt = (clientX) => {
+            if (!chartModel || !chartModel.candles.length || !chartGeometry) return;
+            const rect = canvas.getBoundingClientRect();
+            const localX = clientX - rect.left;
+            const slot = chartGeometry.plotWidth / chartModel.candles.length;
+            const index = Math.max(0, Math.min(
+                chartModel.candles.length - 1,
+                Math.floor((localX - chartGeometry.left) / slot)
+            ));
+            chartSelection = index;
+            chartTooltipActive = true;
+            updateSelectedCandle();
+            drawKlineChart();
+        };
+
+        canvas.addEventListener("pointermove", (event) => selectAt(event.clientX));
+        canvas.addEventListener("pointerdown", (event) => {
+            selectAt(event.clientX);
+            canvas.focus({ preventScroll: true });
+        });
+        canvas.addEventListener("pointerleave", () => {
+            if (document.activeElement !== canvas) {
+                chartTooltipActive = false;
+                hideChartTooltip();
+                drawKlineChart();
+            }
+        });
+        canvas.addEventListener("focus", () => {
+            if (chartModel && chartModel.candles.length) {
+                if (chartSelection === null) chartSelection = chartModel.candles.length - 1;
+                chartTooltipActive = true;
+                updateSelectedCandle();
+                drawKlineChart();
+            }
+        });
+        canvas.addEventListener("blur", () => {
+            chartTooltipActive = false;
+            hideChartTooltip();
+            drawKlineChart();
+        });
+        canvas.addEventListener("keydown", (event) => {
+            if (!chartModel || !chartModel.candles.length || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            if (chartSelection === null) chartSelection = chartModel.candles.length - 1;
+            if (event.key === "ArrowLeft") chartSelection = Math.max(0, chartSelection - 1);
+            if (event.key === "ArrowRight") chartSelection = Math.min(chartModel.candles.length - 1, chartSelection + 1);
+            if (event.key === "Home") chartSelection = 0;
+            if (event.key === "End") chartSelection = chartModel.candles.length - 1;
+            chartTooltipActive = true;
+            updateSelectedCandle();
+            drawKlineChart();
         });
 
-        const scrollTop = box.scrollTop;
-        box.setAttribute("role", "list");
-        replaceChildren(box, rows.length ? rows : [element("div", "empty", "窗口内暂无槽位")]);
-        box.scrollTop = scrollTop;
+        if (typeof ResizeObserver !== "undefined") {
+            chartResizeObserver = new ResizeObserver(() => drawKlineChart());
+            chartResizeObserver.observe(stage);
+        } else {
+            window.addEventListener("resize", drawKlineChart);
+        }
+    }
+
+    function drawKlineChart() {
+        if (typeof document === "undefined") return;
+        const canvas = $("klineCanvas");
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const width = Math.max(1, Math.floor(rect.width));
+        const height = Math.max(1, Math.floor(rect.height));
+        const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        const pixelWidth = Math.floor(width * pixelRatio);
+        const pixelHeight = Math.floor(height * pixelRatio);
+        if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+            canvas.width = pixelWidth;
+            canvas.height = pixelHeight;
+        }
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+        ctx.clearRect(0, 0, width, height);
+        if (!chartModel || !chartModel.candles.length || chartModel.priceMax <= chartModel.priceMin) {
+            hideChartTooltip();
+            return;
+        }
+
+        const style = getComputedStyle(document.documentElement);
+        const color = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+        const colors = {
+            ink: color("--ink", "#edf7f3"),
+            muted: color("--muted", "#91aaa3"),
+            mutedSoft: color("--muted-soft", "#718b84"),
+            line: color("--line", "rgba(143,190,177,.18)"),
+            lineStrong: color("--line-strong", "rgba(143,190,177,.34)"),
+            up: color("--positive", "#48dda3"),
+            down: color("--negative", "#ff7d77"),
+            buy: color("--buy", "#ff7d77"),
+            sell: color("--sell", "#48dda3"),
+            position: color("--cyan", "#5bc8ff"),
+            grid: color("--warn", "#ffc857"),
+            surface: color("--surface", "#0a1714")
+        };
+        const compact = width < 520;
+        const left = compact ? 9 : 14;
+        const axisWidth = compact ? 58 : 72;
+        const railWidth = compact ? 68 : 98;
+        const right = axisWidth + railWidth;
+        const top = 22;
+        const bottom = 30;
+        const plotWidth = Math.max(20, width - left - right);
+        const plotHeight = Math.max(20, height - top - bottom);
+        const plotRight = left + plotWidth;
+        const railLeft = plotRight + 6;
+        const railRight = width - axisWidth - 4;
+        const yForPrice = (price) => top + (chartModel.priceMax - price) /
+            (chartModel.priceMax - chartModel.priceMin) * plotHeight;
+        chartGeometry = { left, right, top, bottom, plotWidth, plotHeight, plotRight, railLeft, railRight, yForPrice };
+
+        ctx.font = (compact ? "9px " : "10px ") + style.getPropertyValue("--font-mono");
+        ctx.textBaseline = "middle";
+        ctx.lineWidth = 1;
+        const yTicks = compact ? 4 : 5;
+        for (let tick = 0; tick <= yTicks; tick++) {
+            const ratio = tick / yTicks;
+            const y = top + ratio * plotHeight;
+            const price = chartModel.priceMax - ratio * (chartModel.priceMax - chartModel.priceMin);
+            ctx.strokeStyle = colors.line;
+            ctx.setLineDash([]);
+            ctx.beginPath();
+            ctx.moveTo(left, Math.round(y) + 0.5);
+            ctx.lineTo(plotRight, Math.round(y) + 0.5);
+            ctx.stroke();
+            ctx.fillStyle = colors.muted;
+            ctx.textAlign = "left";
+            ctx.fillText(compactPrice(price), railRight + 7, y);
+        }
+        ctx.fillStyle = "rgba(2, 9, 7, 0.5)";
+        ctx.fillRect(plotRight + 1, top, Math.max(0, railRight - plotRight), plotHeight);
+        ctx.strokeStyle = colors.line;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(plotRight) + 0.5, top);
+        ctx.lineTo(Math.round(plotRight) + 0.5, top + plotHeight);
+        ctx.stroke();
+        ctx.fillStyle = colors.mutedSoft;
+        ctx.textAlign = "right";
+        ctx.fillText("PRICE", width - 7, 7);
+        ctx.textAlign = "left";
+        ctx.fillText("TIME · " + chartModel.interval, left, 7);
+        ctx.fillText(compact ? "ORD" : "EXECUTION", railLeft, 7);
+
+        drawExecutionBands(ctx, chartModel.levels, chartGeometry, colors);
+
+        drawGridLevels(ctx, chartModel.levels, chartGeometry, colors);
+
+        const candles = chartModel.candles;
+        const slotWidth = plotWidth / candles.length;
+        const bodyWidth = Math.max(2, Math.min(10, slotWidth * 0.62));
+        const timeTickCount = compact ? 3 : 5;
+        const timeIndices = Array.from(new Set(Array.from({ length: timeTickCount }, (_, index) =>
+            Math.round(index * (candles.length - 1) / Math.max(1, timeTickCount - 1))
+        )));
+        ctx.strokeStyle = colors.line;
+        ctx.globalAlpha = 0.62;
+        ctx.setLineDash([2, 5]);
+        timeIndices.forEach((index) => {
+            const x = left + slotWidth * (index + 0.5);
+            ctx.beginPath();
+            ctx.moveTo(Math.round(x) + 0.5, top);
+            ctx.lineTo(Math.round(x) + 0.5, top + plotHeight);
+            ctx.stroke();
+        });
+        ctx.globalAlpha = 1;
+        candles.forEach((candle, index) => {
+            const x = left + slotWidth * (index + 0.5);
+            const openY = yForPrice(candle.open);
+            const closeY = yForPrice(candle.close);
+            const highY = yForPrice(candle.high);
+            const lowY = yForPrice(candle.low);
+            const bullish = candle.close >= candle.open;
+            const candleColor = bullish ? colors.up : colors.down;
+            ctx.setLineDash([]);
+            ctx.strokeStyle = candleColor;
+            ctx.lineWidth = candle.isClosed ? 1 : 1.5;
+            ctx.beginPath();
+            ctx.moveTo(x, highY);
+            ctx.lineTo(x, lowY);
+            ctx.stroke();
+            const bodyTop = Math.min(openY, closeY);
+            const bodyHeight = Math.max(1.5, Math.abs(openY - closeY));
+            if (bullish) {
+                ctx.fillStyle = candleColor;
+                ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+            } else {
+                ctx.fillStyle = colors.surface;
+                ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+                ctx.strokeRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+            }
+            if (!candle.isClosed) {
+                ctx.strokeStyle = colors.position;
+                ctx.strokeRect(x - bodyWidth / 2 - 1, bodyTop - 1, bodyWidth + 2, bodyHeight + 2);
+            }
+        });
+
+        ctx.fillStyle = colors.muted;
+        timeIndices.forEach((index, order) => {
+            const x = left + slotWidth * (index + 0.5);
+            ctx.textAlign = order === 0 ? "left" : (order === timeIndices.length - 1 ? "right" : "center");
+            ctx.fillText(formatChartTime(candles[index].time, candles), x, top + plotHeight + 18);
+        });
+
+        const latestY = yForPrice(chartModel.latest.close);
+        ctx.strokeStyle = colors.position;
+        ctx.setLineDash([3, 4]);
+        ctx.beginPath();
+        ctx.moveTo(left, latestY);
+        ctx.lineTo(plotRight, latestY);
+        ctx.stroke();
+        drawAxisPriceTag(ctx, compactPrice(chartModel.latest.close), latestY, railRight + 4, colors.position, colors.surface, width - railRight - 5);
+
+        if (chartTooltipActive && chartSelection !== null && candles[chartSelection]) {
+            const selected = candles[chartSelection];
+            const x = left + slotWidth * (chartSelection + 0.5);
+            const y = yForPrice(selected.close);
+            ctx.strokeStyle = colors.ink;
+            ctx.globalAlpha = 0.55;
+            ctx.setLineDash([2, 4]);
+            ctx.beginPath();
+            ctx.moveTo(x, top);
+            ctx.lineTo(x, top + plotHeight);
+            ctx.moveTo(left, y);
+            ctx.lineTo(plotRight, y);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+            positionChartTooltip(x, y, width, height, selected);
+        } else {
+            hideChartTooltip();
+        }
+    }
+
+    function drawExecutionBands(ctx, levels, geometry, colors) {
+        const windowLevels = levels.filter((level) => level.inWindow || level.isGrid);
+        if (!windowLevels.length) return;
+        const gridLevel = levels.find((level) => level.isGrid);
+        const highest = Math.max(...windowLevels.map((level) => level.price));
+        const lowest = Math.min(...windowLevels.map((level) => level.price));
+        const topY = Math.max(geometry.top, geometry.yForPrice(highest));
+        const bottomY = Math.min(geometry.top + geometry.plotHeight, geometry.yForPrice(lowest));
+        if (bottomY <= topY) return;
+
+        ctx.save();
+        if (gridLevel) {
+            const gridY = Math.max(topY, Math.min(bottomY, geometry.yForPrice(gridLevel.price)));
+            ctx.fillStyle = colors.sell;
+            ctx.globalAlpha = 0.035;
+            ctx.fillRect(geometry.left, topY, geometry.plotWidth, Math.max(0, gridY - topY));
+            ctx.fillStyle = colors.buy;
+            ctx.fillRect(geometry.left, gridY, geometry.plotWidth, Math.max(0, bottomY - gridY));
+        } else {
+            ctx.fillStyle = colors.position;
+            ctx.globalAlpha = 0.025;
+            ctx.fillRect(geometry.left, topY, geometry.plotWidth, bottomY - topY);
+        }
+        ctx.restore();
+    }
+
+    function drawGridLevels(ctx, levels, geometry, colors) {
+        const activeLevels = [];
+        levels.forEach((level) => {
+            const y = geometry.yForPrice(level.price);
+            if (y < geometry.top - 1 || y > geometry.top + geometry.plotHeight + 1) return;
+            const settings = {
+                grid: [colors.grid, [], 1.5, 0.92],
+                sell: [colors.sell, [], 1, 0.68],
+                position: [colors.position, [2, 4], 1, 0.72],
+                buy: [colors.buy, [7, 5], 1, 0.68],
+                empty: [colors.mutedSoft, [2, 6], 1, 0.32],
+                outside: [colors.mutedSoft, [1, 7], 1, 0.18]
+            }[level.kind];
+            ctx.save();
+            ctx.strokeStyle = settings[0];
+            ctx.setLineDash(settings[1]);
+            ctx.lineWidth = settings[2];
+            ctx.globalAlpha = settings[3];
+            ctx.beginPath();
+            ctx.moveTo(geometry.left, Math.round(y) + 0.5);
+            ctx.lineTo(geometry.left + geometry.plotWidth, Math.round(y) + 0.5);
+            ctx.stroke();
+            ctx.restore();
+            if (level.markers.length) activeLevels.push({ level, y, color: settings[0] });
+        });
+
+        const labelItems = activeLevels.sort((a, b) => a.y - b.y).map((item) => ({
+            ...item,
+            labelY: item.y
+        }));
+        labelItems.forEach((item, index) => {
+            item.labelY = Math.max(
+                geometry.top + 9,
+                index ? Math.max(item.y, labelItems[index - 1].labelY + 19) : item.y
+            );
+        });
+        const overflow = labelItems.length
+            ? labelItems[labelItems.length - 1].labelY - (geometry.top + geometry.plotHeight - 9)
+            : 0;
+        if (overflow > 0) {
+            for (let index = labelItems.length - 1; index >= 0; index--) {
+                const nextY = index === labelItems.length - 1
+                    ? geometry.top + geometry.plotHeight - 9
+                    : labelItems[index + 1].labelY - 19;
+                labelItems[index].labelY = Math.min(labelItems[index].labelY - overflow, nextY);
+            }
+        }
+        labelItems.forEach((item) => {
+            const label = item.level.markers.join("·") + " " + compactPrice(item.level.price);
+            const labelWidth = Math.max(42, geometry.railRight - geometry.railLeft - 2);
+            const x = geometry.railLeft;
+            ctx.save();
+            ctx.strokeStyle = item.color;
+            ctx.globalAlpha = 0.52;
+            ctx.beginPath();
+            ctx.moveTo(geometry.plotRight, item.y);
+            ctx.lineTo(x - 2, item.labelY);
+            ctx.stroke();
+            ctx.restore();
+            ctx.fillStyle = "rgba(3, 9, 7, 0.88)";
+            ctx.strokeStyle = item.color;
+            ctx.setLineDash([]);
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.roundRect(x, item.labelY - 8, labelWidth, 16, 3);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = item.color;
+            ctx.textAlign = "center";
+            ctx.fillText(label, x + labelWidth / 2, item.labelY + 0.5, labelWidth - 6);
+        });
+    }
+
+    function drawAxisPriceTag(ctx, text, y, x, foreground, background, maxWidth) {
+        const width = Math.max(38, Math.min(maxWidth, ctx.measureText(text).width + 10));
+        ctx.fillStyle = foreground;
+        ctx.fillRect(x, y - 9, width, 18);
+        ctx.fillStyle = background;
+        ctx.textAlign = "center";
+        ctx.fillText(text, x + width / 2, y + 0.5, width - 5);
+    }
+
+    function updateSelectedCandle() {
+        if (!chartModel || chartSelection === null) return;
+        const candle = chartModel.candles[chartSelection];
+        if (!candle) return;
+        const decimals = latestSnapshot && latestSnapshot.position
+            ? (latestSnapshot.position.priceDecimals ?? 2)
+            : 2;
+        setText($("klineDetail"), candleDetail(candle, decimals));
+    }
+
+    function candleDetail(candle, decimals) {
+        if (!candle) return "暂无 K 线明细";
+        return formatCompactDateTime(candle.time) +
+            " · 开 " + fmt(candle.open, decimals) +
+            " · 高 " + fmt(candle.high, decimals) +
+            " · 低 " + fmt(candle.low, decimals) +
+            " · 收 " + fmt(candle.close, decimals) +
+            " · " + (candle.isClosed ? "已完结" : "进行中");
+    }
+
+    function positionChartTooltip(x, y, width, height, candle) {
+        const tooltip = $("klineTooltip");
+        if (!tooltip) return;
+        tooltip.hidden = false;
+        tooltip.setAttribute("aria-hidden", "false");
+        const decimals = latestSnapshot && latestSnapshot.position
+            ? (latestSnapshot.position.priceDecimals ?? 2)
+            : 2;
+        tooltip.textContent = formatCompactDateTime(candle.time) + "\n" +
+            "O " + fmt(candle.open, decimals) + "  H " + fmt(candle.high, decimals) + "\n" +
+            "L " + fmt(candle.low, decimals) + "  C " + fmt(candle.close, decimals);
+        const tooltipWidth = tooltip.offsetWidth || 178;
+        const tooltipHeight = tooltip.offsetHeight || 58;
+        const left = Math.max(8, Math.min(width - tooltipWidth - 8, x + 13));
+        const top = Math.max(8, Math.min(height - tooltipHeight - 8, y - tooltipHeight / 2));
+        tooltip.style.transform = "translate(" + left + "px," + top + "px)";
+    }
+
+    function hideChartTooltip() {
+        const tooltip = $("klineTooltip");
+        if (!tooltip) return;
+        tooltip.hidden = true;
+        tooltip.setAttribute("aria-hidden", "true");
+    }
+
+    function compactPrice(value) {
+        const number = Number(value);
+        if (!Number.isFinite(number)) return "—";
+        if (Math.abs(number) >= 1000) return number.toLocaleString(undefined, { maximumFractionDigits: 2 });
+        if (Math.abs(number) >= 1) return number.toLocaleString(undefined, { maximumFractionDigits: 4 });
+        return number.toLocaleString(undefined, { maximumSignificantDigits: 5 });
+    }
+
+    function formatChartTime(value, candles) {
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return "—";
+        const span = candles.length > 1 ? candles[candles.length - 1].time - candles[0].time : 0;
+        return date.toLocaleString("zh-CN", span >= 24 * 60 * 60 * 1000 ? {
+            month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false
+        } : {
+            hour: "2-digit", minute: "2-digit", hour12: false
+        });
     }
 
     function renderRisk(risk) {
@@ -444,9 +1025,7 @@
     }
 
     function renderTables(pos, quote) {
-        const slots = pos.slots || [];
         const filledOrders = pos.filledOrders || [];
-        const orders = slots.filter((slot) => isActive(slot.orderStatus));
 
         const filledOrderCount = pos.filledOrderCount ?? filledOrders.length;
         setText($("filledCount"), "本次运行 · " + filledOrderCount + " 笔");
@@ -471,16 +1050,6 @@
             $("filledBody"),
             filledRows.length ? filledRows : [emptyRow("程序启动后暂无成交订单", 6)]
         );
-
-        const orderRows = orders.map((slot) => {
-            const row = document.createElement("tr");
-            appendCell(row, "方向", slot.orderSide || "—");
-            appendCell(row, "价格", slot.priceText || fmt(slot.price, pos.priceDecimals));
-            appendCell(row, "状态", slot.orderStatus || "—");
-            row.appendChild(orderIDCell(String(slot.orderId || slot.clientOid || "—")));
-            return row;
-        });
-        replaceChildren($("ordBody"), orderRows.length ? orderRows : [emptyRow("无活动订单")]);
     }
 
     function appendCell(row, label, value, className) {
@@ -635,6 +1204,7 @@
         }, 2000);
     }
 
+    initKlineChart();
     pullRest();
     connect();
     restTimer = setInterval(() => {
@@ -646,6 +1216,7 @@
         clearTimeout(reconnectTimer);
         clearInterval(restTimer);
         clearInterval(freshnessTimer);
+        if (chartResizeObserver) chartResizeObserver.disconnect();
         if (ws) ws.close();
     });
 })();
