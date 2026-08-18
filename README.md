@@ -153,6 +153,25 @@ go build -o opensqt
 ./opensqt
 ```
 
+启动后默认打开本机监控面板（只读，不改单、不下单）：
+
+```text
+http://127.0.0.1:8787
+```
+
+可在 `config.yaml` 里调整：
+
+```yaml
+dashboard:
+  enabled: true
+  listen: "127.0.0.1:8787"
+  token: ""                  # 非空则 /api 与 /ws 需要 ?token=
+  push_interval_ms: 400
+  account_refresh_sec: 10
+```
+
+面板展示价格、K 线网格执行图、程序启动后的成交订单、持仓、主动风控和最近日志。默认只绑定本机；若改成 `0.0.0.0` 会对外暴露账户与仓位，请同时设置 `token`。
+
 ## 📦 版本发布 (Release)
 
 项目现在使用统一版本规范：以 [main.go](main.go#L21) 中的 `Version` 为准，Git Tag 与 GitHub Release 必须和它保持一致。

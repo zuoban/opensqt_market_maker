@@ -27,6 +27,24 @@ type OrderUpdate struct {
 	Side          string
 	Type          string
 	UpdateTime    int64
+	// RealizedPNL 交易所在成交推送里带回的已实现盈亏。
+	// Incremental=true 表示本笔成交利润（如币安 rp），否则为该订单累计值。
+	RealizedPNL            float64
+	RealizedPNLIncremental bool
+}
+
+const maxFilledOrderRecords = 200
+
+// FilledOrderRecord 本次程序运行期间完成成交的订单。
+type FilledOrderRecord struct {
+	OrderID       int64     `json:"orderId"`
+	ClientOrderID string    `json:"clientOrderId"`
+	Symbol        string    `json:"symbol"`
+	Side          string    `json:"side"`
+	Price         float64   `json:"price"`
+	Quantity      float64   `json:"quantity"`
+	FilledAt      time.Time `json:"filledAt"`
+	RealizedPNL   float64   `json:"realizedPnl"`
 }
 
 // OrderExecutorInterface 订单执行器接口（避免循环导入）
@@ -107,6 +125,11 @@ type InventorySlot struct {
 	// PostOnly失败计数（连续失败3次后降级为普通单）
 	PostOnlyFailCount int
 
+	// 当前订单已计入的累计已实现盈亏（非增量推送用）
+	orderReportedPNL float64
+	// 当前订单从部分成交到完全成交累计的已实现盈亏（用于成交历史）。
+	orderAccumulatedPNL float64
+
 	mu sync.RWMutex // 槽位级别的锁（细粒度锁）
 }
 
@@ -154,8 +177,16 @@ type SuperPositionManager struct {
 	// 统计（注意：以下字段被 safety.Reconciler 和 PrintPositions 使用，不可删除）
 	totalBuyQty       atomic.Value // float64 - 累计买入数量
 	totalSellQty      atomic.Value // float64 - 累计卖出数量
+	realizedPNL       atomic.Value // float64 - 卖单成交累计已实现盈亏
 	reconcileCount    atomic.Int64 // 对账次数
 	lastReconcileTime atomic.Value // time.Time - 最后对账时间
+	pnlMu             sync.Mutex   // 保护 realizedPNL 累加
+
+	// 本次运行期间的成交订单，按完成时间保留最近 maxFilledOrderRecords 笔。
+	filledOrdersMu   sync.RWMutex
+	filledOrders     []FilledOrderRecord
+	filledOrderKeys  map[string]struct{}
+	filledOrderCount int64
 
 	// 初始化标志
 	isInitialized atomic.Bool
@@ -178,9 +209,11 @@ func NewSuperPositionManager(cfg *config.Config, executor OrderExecutorInterface
 		marginLockDuration: time.Duration(marginLockSec) * time.Second,
 		priceDecimals:      priceDecimals,
 		quantityDecimals:   quantityDecimals,
+		filledOrderKeys:    make(map[string]struct{}),
 	}
 	spm.totalBuyQty.Store(0.0)
 	spm.totalSellQty.Store(0.0)
+	spm.realizedPNL.Store(0.0)
 	spm.lastReconcileTime.Store(time.Now())
 	spm.lastMarketPrice.Store(0.0)
 	return spm
@@ -667,6 +700,12 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 
+	// 完成成交后槽位会清空订单字段；忽略重复 FILLED 推送，避免重复计数和重复展示。
+	if update.Status == OrderStatusFilled && spm.wasFilledOrderRecorded(update) {
+		logger.Debug("⏭️ [重复成交被忽略] ID=%d, ClientOID=%s", update.OrderID, update.ClientOrderID)
+		return
+	}
+
 	// 校验：确保这个更新属于当前的订单 (防止旧订单的延迟推送干扰新订单)
 	// 优先使用 ClientOrderID 匹配 (某些交易所如 Gate.io 的 OrderID 可能略有差异)
 	if slot.ClientOID != "" && slot.ClientOID != update.ClientOrderID {
@@ -696,6 +735,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		}
 
 	case "PARTIALLY_FILLED", "FILLED":
+		orderPrice := slot.OrderPrice
 		// 计算增量
 		deltaQty := update.ExecutedQty - slot.OrderFilledQty
 		if deltaQty < 0 {
@@ -744,6 +784,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 				oldTotal := spm.totalSellQty.Load().(float64)
 				spm.totalSellQty.Store(oldTotal + deltaQty)
 			}
+			spm.applySellRealizedPNL(slot, update, deltaQty)
 
 			if update.Status == "FILLED" {
 				slot.OrderStatus = OrderStatusNotPlaced // 重置订单状态
@@ -764,6 +805,16 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 			} else {
 				slot.OrderStatus = OrderStatusPartiallyFilled
 			}
+		}
+
+		if update.Status == OrderStatusFilled {
+			realizedPNL := 0.0
+			if side == "SELL" {
+				realizedPNL = slot.orderAccumulatedPNL
+			}
+			spm.recordFilledOrder(update, side, orderPrice, price, realizedPNL)
+			slot.orderReportedPNL = 0
+			slot.orderAccumulatedPNL = 0
 		}
 
 	case "CANCELED", "EXPIRED", "REJECTED":
@@ -809,8 +860,149 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		slot.OrderID = 0
 		slot.ClientOID = ""
 		slot.OrderFilledQty = 0
+		slot.orderReportedPNL = 0
+		slot.orderAccumulatedPNL = 0
 		// 保留 OrderSide 用于日志调试
 	}
+}
+
+func filledOrderKey(update OrderUpdate) string {
+	if update.ClientOrderID != "" {
+		return "client:" + update.ClientOrderID
+	}
+	if update.OrderID != 0 {
+		return fmt.Sprintf("order:%d", update.OrderID)
+	}
+	return ""
+}
+
+func (spm *SuperPositionManager) wasFilledOrderRecorded(update OrderUpdate) bool {
+	key := filledOrderKey(update)
+	if key == "" {
+		return false
+	}
+	spm.filledOrdersMu.RLock()
+	_, exists := spm.filledOrderKeys[key]
+	spm.filledOrdersMu.RUnlock()
+	return exists
+}
+
+func (spm *SuperPositionManager) recordFilledOrder(update OrderUpdate, side string, orderPrice, slotPrice, realizedPNL float64) {
+	key := filledOrderKey(update)
+	if key == "" {
+		return
+	}
+
+	price := update.AvgPrice
+	if price <= 0 {
+		price = update.Price
+	}
+	if price <= 0 {
+		price = orderPrice
+	}
+	if price <= 0 {
+		price = slotPrice
+	}
+
+	symbol := update.Symbol
+	if symbol == "" && spm.config != nil {
+		symbol = spm.config.Trading.Symbol
+	}
+	filledAt := time.Now()
+	if update.UpdateTime > 0 {
+		filledAt = timestampToTime(update.UpdateTime)
+	}
+
+	record := FilledOrderRecord{
+		OrderID:       update.OrderID,
+		ClientOrderID: update.ClientOrderID,
+		Symbol:        symbol,
+		Side:          side,
+		Price:         price,
+		Quantity:      update.ExecutedQty,
+		FilledAt:      filledAt,
+		RealizedPNL:   realizedPNL,
+	}
+
+	spm.filledOrdersMu.Lock()
+	defer spm.filledOrdersMu.Unlock()
+	if _, exists := spm.filledOrderKeys[key]; exists {
+		return
+	}
+	spm.filledOrderKeys[key] = struct{}{}
+	spm.filledOrders = append(spm.filledOrders, record)
+	spm.filledOrderCount++
+	if len(spm.filledOrders) > maxFilledOrderRecords {
+		oldest := spm.filledOrders[0]
+		delete(spm.filledOrderKeys, filledOrderKey(OrderUpdate{
+			OrderID:       oldest.OrderID,
+			ClientOrderID: oldest.ClientOrderID,
+		}))
+		spm.filledOrders = spm.filledOrders[1:]
+	}
+}
+
+func timestampToTime(timestamp int64) time.Time {
+	switch {
+	case timestamp >= 1_000_000_000_000_000_000:
+		return time.Unix(0, timestamp)
+	case timestamp >= 1_000_000_000_000_000:
+		return time.UnixMicro(timestamp)
+	case timestamp >= 1_000_000_000_000:
+		return time.UnixMilli(timestamp)
+	default:
+		return time.Unix(timestamp, 0)
+	}
+}
+
+func (spm *SuperPositionManager) applySellRealizedPNL(slot *InventorySlot, update OrderUpdate, deltaQty float64) {
+	var delta float64
+	source := "成交价差"
+	if update.RealizedPNLIncremental {
+		delta = update.RealizedPNL
+		if delta != 0 {
+			source = "成交推送"
+		}
+	} else if update.RealizedPNL != 0 {
+		delta = update.RealizedPNL - slot.orderReportedPNL
+		slot.orderReportedPNL = update.RealizedPNL
+		source = "成交推送"
+	}
+	if delta == 0 && deltaQty > 0 {
+		sellPx := update.AvgPrice
+		if sellPx <= 0 {
+			sellPx = update.Price
+		}
+		if sellPx > 0 && slot.Price > 0 {
+			delta = deltaQty * (sellPx - slot.Price)
+		}
+	}
+	slot.orderAccumulatedPNL += delta
+	if delta == 0 {
+		return
+	}
+	total := spm.addRealizedPNL(delta)
+	logger.Info("💵 [已实现盈亏] 价格: %s, 本笔: %.6f, 累计: %.6f (%s)",
+		formatPrice(slot.Price, spm.priceDecimals), delta, total, source)
+}
+
+func (spm *SuperPositionManager) addRealizedPNL(delta float64) float64 {
+	spm.pnlMu.Lock()
+	defer spm.pnlMu.Unlock()
+	old, _ := spm.realizedPNL.Load().(float64)
+	next := old + delta
+	spm.realizedPNL.Store(next)
+	return next
+}
+
+// GetRealizedPNL 卖单成交累计的已实现盈亏
+func (spm *SuperPositionManager) GetRealizedPNL() float64 {
+	if v := spm.realizedPNL.Load(); v != nil {
+		if f, ok := v.(float64); ok {
+			return f
+		}
+	}
+	return 0
 }
 
 // getOrCreateSlot 获取或创建槽位
@@ -1297,8 +1489,8 @@ func (spm *SuperPositionManager) PrintPositions() {
 	totalSellQty := spm.totalSellQty.Load().(float64)
 	// 预计盈利 = 累计卖出数量 × 价格间距（每笔盈利 = 价格间距 × 数量）
 	estimatedProfit := totalSellQty * spm.config.Trading.PriceInterval
-	logger.Info("累计买入: %.2f, 累计卖出: %.2f, 预计盈利: %.2f U",
-		totalBuyQty, totalSellQty, estimatedProfit)
+	logger.Info("累计买入: %.2f, 累计卖出: %.2f, 预计盈利: %.2f U, 已实现盈亏: %.4f U",
+		totalBuyQty, totalSellQty, estimatedProfit, spm.GetRealizedPNL())
 
 	// === 新增：打印买单窗口详细信息 ===
 	logger.Info("🔍 ===== 买单窗口状态 =====")

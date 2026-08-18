@@ -408,155 +408,45 @@ func (r *RiskMonitor) reportStatus() {
 func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 	logger.Info("📊 [移动平均线监测] 当前各币种数据:")
 
-	// 检查K线数据是否过期
 	hasStaleData := false
-
 	for _, symbol := range r.cfg.RiskControl.MonitorSymbols {
-		r.mu.RLock()
-		symbolData, exists := r.symbolDataMap[symbol]
-		r.mu.RUnlock()
-
-		if !exists {
-			logger.Info("  %s: 无数据", symbol)
+		m := r.metricsForSymbol(symbol, inRiskControl)
+		if !m.Ready {
+			logger.Info("  %s: %s", symbol, m.SkipReason)
 			continue
-		}
-
-		symbolData.mu.RLock()
-		candles := symbolData.candles
-		candleCount := len(candles)
-		symbolData.mu.RUnlock()
-
-		if candleCount < r.cfg.RiskControl.AverageWindow+1 {
-			logger.Info("  %s: 数据不足 (当前%d根, 需要%d根)", symbol, candleCount, r.cfg.RiskControl.AverageWindow+1)
-			continue
-		}
-
-		var currentCandle *exchange.Candle
-		var currentPrice float64
-		var currentVol float64
-
-		// 根据是否在风控中，选择不同的K线
-		if inRiskControl {
-			// 风控中：使用最新的完结K线（与恢复判断逻辑一致）
-			for i := candleCount - 1; i >= 0; i-- {
-				if candles[i].IsClosed {
-					currentCandle = candles[i]
-					currentPrice = currentCandle.Close
-					currentVol = currentCandle.Volume
-					break
-				}
-			}
-			if currentCandle == nil {
-				logger.Info("  %s: 无完结K线", symbol)
-				continue
-			}
-		} else {
-			// 非风控状态：使用最新K线（包括未完结的）
-			currentCandle = candles[candleCount-1]
-			currentPrice = currentCandle.Close
-			currentVol = currentCandle.Volume
-		}
-
-		// 计算移动平均价格和移动平均成交量（只使用完结的K线，排除当前用于判断的K线）
-		var totalPrice float64
-		var totalVol float64
-		var validCount int
-		window := r.cfg.RiskControl.AverageWindow
-
-		for i := candleCount - 1; i >= 0 && validCount < window; i-- {
-			if candles[i].IsClosed && candles[i] != currentCandle {
-				totalPrice += candles[i].Close
-				totalVol += candles[i].Volume
-				validCount++
-			}
-		}
-
-		if validCount < window {
-			logger.Info("  %s: 完结K线不足 (当前%d根, 需要%d根)", symbol, validCount, window)
-			continue
-		}
-
-		avgPrice := totalPrice / float64(validCount)
-		avgVol := totalVol / float64(validCount)
-
-		// 计算偏离度
-		priceDeviation := (currentPrice - avgPrice) / avgPrice * 100
-		volRatio := currentVol / avgVol
-
-		// 判断各项指标状态
-		priceAboveMA := currentPrice > avgPrice
-		volNormal := currentVol < avgVol*r.cfg.RiskControl.VolumeMultiplier
-
-		// 根据是否在风控中，显示不同的状态信息
-		klineStatus := "完结"
-		if !currentCandle.IsClosed {
-			klineStatus = "未完结"
-		}
-
-		// 计算K线时间距离现在的时间差（帮助调试）
-		// 自动判断时间戳单位：毫秒(>10000000000) 或 秒
-		var klineTime time.Time
-		if currentCandle.Timestamp > 10000000000 {
-			// 毫秒时间戳（币安、Bitget）
-			klineTime = time.Unix(currentCandle.Timestamp/1000, 0)
-		} else {
-			// 秒级时间戳（Gate.io）
-			klineTime = time.Unix(currentCandle.Timestamp, 0)
-		}
-
-		klineAge := time.Since(klineTime)
-		klineAgeStr := fmt.Sprintf("%.0f秒前", klineAge.Seconds())
-		if klineAge > time.Minute {
-			klineAgeStr = fmt.Sprintf("%.0f分前", klineAge.Minutes())
 		}
 
 		var statusMsg string
 		if inRiskControl {
-			// 风控中，显示详细的异常/恢复状态
-			if priceAboveMA && volNormal {
+			if m.PriceAboveMA && m.VolumeNormal {
 				statusMsg = fmt.Sprintf("正常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), 现价在均价上方已恢复, 当前量=%.0f, 均量=%.0f (倍数×%.2f) 成交量已恢复",
-					klineStatus, klineAgeStr, currentPrice, avgPrice, priceDeviation, currentVol, avgVol, volRatio)
+					m.KlineStatus, m.KlineAgeStr, m.CurrentPrice, m.AvgPrice, m.PriceDeviation, m.CurrentVolume, m.AvgVolume, m.VolumeRatio)
 			} else {
-				// 异常状态，说明未恢复的原因
-				var priceStatus, volStatus string
-				if priceAboveMA {
+				priceStatus := "现价在均价下方未恢复"
+				if m.PriceAboveMA {
 					priceStatus = "现价在均价上方已恢复"
-				} else {
-					priceStatus = "现价在均价下方未恢复"
 				}
-				if volNormal {
+				volStatus := "成交量未恢复"
+				if m.VolumeNormal {
 					volStatus = "成交量已恢复"
-				} else {
-					volStatus = "成交量未恢复"
 				}
 				statusMsg = fmt.Sprintf("异常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), %s, 当前量=%.0f, 均量=%.0f (倍数×%.2f) %s",
-					klineStatus, klineAgeStr, currentPrice, avgPrice, priceDeviation, priceStatus, currentVol, avgVol, volRatio, volStatus)
+					m.KlineStatus, m.KlineAgeStr, m.CurrentPrice, m.AvgPrice, m.PriceDeviation, priceStatus, m.CurrentVolume, m.AvgVolume, m.VolumeRatio, volStatus)
 			}
+		} else if m.Abnormal {
+			statusMsg = fmt.Sprintf("🚨异常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), 当前量=%.0f, 均量=%.0f (倍数×%.2f)",
+				m.KlineStatus, m.KlineAgeStr, m.CurrentPrice, m.AvgPrice, m.PriceDeviation, m.CurrentVolume, m.AvgVolume, m.VolumeRatio)
 		} else {
-			// 非风控状态，判断异常需要同时满足两个条件：价格低于均价 且 成交量超过配置倍数
-			isPriceBelow := !priceAboveMA
-			isVolHigh := !volNormal
-
-			if isPriceBelow && isVolHigh {
-				// 同时满足两个条件才是真正的异常
-				statusMsg = fmt.Sprintf("🚨异常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), 当前量=%.0f, 均量=%.0f (倍数×%.2f)",
-					klineStatus, klineAgeStr, currentPrice, avgPrice, priceDeviation, currentVol, avgVol, volRatio)
-			} else {
-				// 否则显示正常（添加K线时间信息）
-				statusMsg = fmt.Sprintf("✅正常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), 当前量=%.0f, 均量=%.0f (倍数×%.2f)",
-					klineStatus, klineAgeStr, currentPrice, avgPrice, priceDeviation, currentVol, avgVol, volRatio)
-			}
+			statusMsg = fmt.Sprintf("✅正常[%s|%s]: 当前价=%.4f, 均价=%.4f (偏离%.2f%%), 当前量=%.0f, 均量=%.0f (倍数×%.2f)",
+				m.KlineStatus, m.KlineAgeStr, m.CurrentPrice, m.AvgPrice, m.PriceDeviation, m.CurrentVolume, m.AvgVolume, m.VolumeRatio)
 		}
 
 		logger.Info("  %s %s", symbol, statusMsg)
-
-		// 检查数据是否过期（超过2分钟）
-		if klineAge > 2*time.Minute {
+		if m.CandleAge > 2*time.Minute {
 			hasStaleData = true
 		}
 	}
 
-	// 如果有过期数据，发出警告
 	if hasStaleData {
 		logger.Warn("⚠️ [K线数据] 部分币种的K线数据超过2分钟未更新，可能K线流断开或重连中")
 	}

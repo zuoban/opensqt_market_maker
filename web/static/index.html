@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <title>OpenSQT 做市监控</title>
+    <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <div class="app-shell">
+        <header class="mast" aria-label="市场总览">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true"><i></i><b>OS</b></span>
+                <div>
+                    <div class="brand-kicker">AUTOMATED LIQUIDITY</div>
+                    <h1 class="brand-name">OpenSQT</h1>
+                    <div class="brand-sub">MARKET DESK · 只读监控</div>
+                </div>
+            </div>
+            <div class="mast-mid">
+                <div class="market-label">
+                    <span>MARKET FEED</span>
+                    <div class="pair" id="pair">—</div>
+                </div>
+                <div class="price" id="lastPrice">—.——</div>
+                <div class="price-meta" id="priceMeta">等待价格</div>
+            </div>
+            <div class="mast-right">
+                <div class="status-label">SYSTEM STATUS</div>
+                <div class="status-cluster">
+                    <div class="pill connecting" id="wsPill" role="status" aria-live="polite">
+                        <i aria-hidden="true"></i><span>连接中</span>
+                    </div>
+                    <div class="pill risk" id="riskPill" role="status" aria-live="polite">风控 —</div>
+                </div>
+                <div class="ver" id="version"></div>
+            </div>
+        </header>
+
+        <main id="main-content">
+            <section class="summary" aria-labelledby="summaryTitle">
+                <div class="section-heading">
+                    <div>
+                        <span class="eyebrow">ACCOUNT PULSE / 账户脉搏</span>
+                        <h2 id="summaryTitle">资金与仓位</h2>
+                    </div>
+                    <p>聚焦余额、收益与当前订单敞口</p>
+                </div>
+                <div class="kpis is-loading" id="kpis" aria-busy="true">
+                    <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                    <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                    <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                    <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                    <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                    <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
+                </div>
+
+                <details class="strategy-panel">
+                    <summary>
+                        <span class="strategy-title"><i aria-hidden="true"></i>策略与运行参数</span>
+                        <span class="strategy-summary" id="strategySummary">等待数据</span>
+                    </summary>
+                    <div class="strategy-kpis" id="strategyKpis"></div>
+                </details>
+            </section>
+
+            <section class="board" aria-label="网格、风控与日志">
+                <section class="panel ladder-wrap market-chart-panel">
+                    <div class="panel-head">
+                        <div class="panel-title">
+                            <span>01 / MARKET MAP</span>
+                            <h2>K 线网格执行图</h2>
+                        </div>
+                        <div class="chart-head-actions">
+                            <span class="panel-meta chart-feed" id="klineInterval">1m · 等待行情</span>
+                            <label class="toggle">
+                                <input type="checkbox" id="showOutside">
+                                <span>显示窗口外</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="chart-stats" aria-label="K 线关键读数">
+                        <div class="chart-stat">
+                            <span>最新价</span>
+                            <strong id="klineLast">—</strong>
+                        </div>
+                        <div class="chart-stat">
+                            <span>区间涨跌</span>
+                            <strong id="klineChange">—</strong>
+                        </div>
+                        <div class="chart-stat">
+                            <span>价格区间</span>
+                            <strong id="klineRange">—</strong>
+                        </div>
+                        <div class="chart-stat">
+                            <span>执行状态</span>
+                            <strong id="klineExecution">等待行情</strong>
+                        </div>
+                    </div>
+                    <div class="ladder-legend" aria-label="K 线和网格状态图例">
+                        <span class="lg candle-up">上涨 · 实心</span>
+                        <span class="lg candle-down">下跌 · 空心</span>
+                        <span class="lg buy">B 买单 · 虚线</span>
+                        <span class="lg sell">S 卖单 · 实线</span>
+                        <span class="lg pos">P 持仓 · 点线</span>
+                        <span class="lg empty-slot">空网格 · 细点线</span>
+                        <span class="lg mark">G 网格基准</span>
+                    </div>
+                    <p class="chart-summary sr-only" id="klineSummary" role="status" aria-live="polite">
+                        正在加载真实 OHLC 行情…
+                    </p>
+                    <div class="kline-stage" id="klineStage">
+                        <canvas id="klineCanvas" tabindex="0" role="img"
+                            aria-label="K 线网格执行图"
+                            aria-keyshortcuts="ArrowLeft ArrowRight Home End"
+                            aria-describedby="klineSummary klineDetail">
+                            当前浏览器不支持 K 线画布，请使用下方数据表查看行情。
+                        </canvas>
+                        <div class="chart-tooltip" id="klineTooltip" role="tooltip" aria-hidden="true"></div>
+                        <div id="klineEmpty" class="chart-empty">正在加载真实 K 线数据</div>
+                    </div>
+                    <div class="ladder-detail" id="klineDetail" role="status" aria-live="polite">
+                        移动指针、轻触图表或使用左右方向键查看单根 K 线
+                    </div>
+                    <details class="kline-data">
+                        <summary>OHLC 数据表 <span id="klineCount">0 根</span></summary>
+                        <div class="table-wrap">
+                            <table>
+                                <caption class="sr-only">图表中的真实 K 线开高低收数据</caption>
+                                <thead>
+                                    <tr><th scope="col">时间</th><th scope="col">开</th><th scope="col">高</th><th scope="col">低</th><th scope="col">收</th><th scope="col">状态</th></tr>
+                                </thead>
+                                <tbody id="klineBody"></tbody>
+                            </table>
+                        </div>
+                    </details>
+                </section>
+
+                <aside class="side" aria-label="风险与运行状态">
+                    <section class="panel risk-panel">
+                        <div class="panel-head">
+                            <div class="panel-title">
+                                <span>02 / RISK SENTINEL</span>
+                                <h2>主动风控</h2>
+                            </div>
+                        </div>
+                        <p class="risk-msg" id="riskMsg">等待风控读数</p>
+                        <div id="riskList" class="risk-list"></div>
+                    </section>
+                    <section class="panel log-panel">
+                        <div class="panel-head">
+                            <div class="panel-title">
+                                <span>03 / EVENT STREAM</span>
+                                <h2>最近日志</h2>
+                            </div>
+                        </div>
+                        <div class="logs" id="logs" role="log" aria-live="polite" aria-relevant="additions"></div>
+                    </section>
+                </aside>
+            </section>
+
+            <section class="tables" aria-label="成交订单">
+                <section class="panel filled-orders-panel">
+                    <div class="panel-head">
+                        <div class="panel-title">
+                            <span>04 / EXECUTION TAPE</span>
+                            <h2>成交订单</h2>
+                        </div>
+                        <span class="panel-meta" id="filledCount">本次运行 · 0 笔</span>
+                    </div>
+                    <div class="table-wrap">
+                        <table class="filled-orders-table">
+                            <caption class="sr-only">程序启动后的成交订单</caption>
+                            <thead>
+                                <tr><th scope="col">成交时间</th><th scope="col">方向</th><th scope="col">成交均价</th><th scope="col">成交数量</th><th scope="col">已实现盈亏</th><th scope="col">ID</th></tr>
+                            </thead>
+                            <tbody id="filledBody"></tbody>
+                        </table>
+                    </div>
+                </section>
+            </section>
+        </main>
+
+        <footer class="desk-footer">
+            <span>READ-ONLY OBSERVABILITY SURFACE</span>
+            <span>订单操作已隔离 · 数据由本地实例提供</span>
+        </footer>
+    </div>
+
+    <div class="token-mask hidden" id="tokenMask" aria-hidden="true">
+        <div class="token-box" role="dialog" aria-modal="true" aria-labelledby="tokenTitle" aria-describedby="tokenHelp">
+            <form id="tokenForm">
+                <span class="dialog-kicker">SECURE CONSOLE</span>
+                <h2 id="tokenTitle">需要访问令牌</h2>
+                <p id="tokenHelp">此面板受保护。令牌只在当前浏览器会话中保存。</p>
+                <label for="tokenInput">访问令牌</label>
+                <input type="password" id="tokenInput" autocomplete="off" required>
+                <button type="submit" id="tokenSubmit">验证并进入</button>
+                <p class="err" id="tokenErr" role="alert" aria-live="assertive"></p>
+            </form>
+        </div>
+    </div>
+
+    <script src="/assets/app.js"></script>
+</body>
+</html>

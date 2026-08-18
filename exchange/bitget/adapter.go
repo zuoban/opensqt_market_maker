@@ -85,17 +85,19 @@ type Account struct {
 }
 
 type OrderUpdate struct {
-	OrderID       int64
-	ClientOrderID string
-	Symbol        string
-	Side          Side
-	Type          OrderType
-	Status        OrderStatus
-	Price         float64
-	Quantity      float64
-	ExecutedQty   float64
-	AvgPrice      float64
-	UpdateTime    int64
+	OrderID                int64
+	ClientOrderID          string
+	Symbol                 string
+	Side                   Side
+	Type                   OrderType
+	Status                 OrderStatus
+	Price                  float64
+	Quantity               float64
+	ExecutedQty            float64
+	AvgPrice               float64
+	UpdateTime             int64
+	RealizedPNL            float64
+	RealizedPNLIncremental bool
 }
 
 type OrderUpdateCallback func(update OrderUpdate)
@@ -865,29 +867,33 @@ func (b *BitgetAdapter) StartOrderStream(ctx context.Context, callback func(inte
 			logger.Debug("🔍 [Bitget Adapter] 订单更新回调触发: ID=%d, ClientOID=%s, Status=%s",
 				localUpdate.OrderID, localUpdate.ClientOrderID, string(localUpdate.Status))
 			genericUpdate := struct {
-				OrderID       int64
-				ClientOrderID string
-				Symbol        string
-				Side          string
-				Type          string
-				Status        string
-				Price         float64
-				Quantity      float64
-				ExecutedQty   float64
-				AvgPrice      float64
-				UpdateTime    int64
+				OrderID                int64
+				ClientOrderID          string
+				Symbol                 string
+				Side                   string
+				Type                   string
+				Status                 string
+				Price                  float64
+				Quantity               float64
+				ExecutedQty            float64
+				AvgPrice               float64
+				UpdateTime             int64
+				RealizedPNL            float64
+				RealizedPNLIncremental bool
 			}{
-				OrderID:       localUpdate.OrderID,
-				ClientOrderID: localUpdate.ClientOrderID, // 🔥 关键：传递 ClientOrderID
-				Symbol:        localUpdate.Symbol,
-				Side:          string(localUpdate.Side),
-				Type:          string(localUpdate.Type),
-				Status:        string(localUpdate.Status),
-				Price:         localUpdate.Price,
-				Quantity:      localUpdate.Quantity,
-				ExecutedQty:   localUpdate.ExecutedQty,
-				AvgPrice:      localUpdate.AvgPrice,
-				UpdateTime:    localUpdate.UpdateTime,
+				OrderID:                localUpdate.OrderID,
+				ClientOrderID:          localUpdate.ClientOrderID, // 🔥 关键：传递 ClientOrderID
+				Symbol:                 localUpdate.Symbol,
+				Side:                   string(localUpdate.Side),
+				Type:                   string(localUpdate.Type),
+				Status:                 string(localUpdate.Status),
+				Price:                  localUpdate.Price,
+				Quantity:               localUpdate.Quantity,
+				ExecutedQty:            localUpdate.ExecutedQty,
+				AvgPrice:               localUpdate.AvgPrice,
+				UpdateTime:             localUpdate.UpdateTime,
+				RealizedPNL:            localUpdate.RealizedPNL,
+				RealizedPNLIncremental: localUpdate.RealizedPNLIncremental,
 			}
 			callback(genericUpdate)
 		} else {

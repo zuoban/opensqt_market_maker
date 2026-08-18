@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -66,6 +67,19 @@ type Config struct {
 		StatusPrintInterval  int `yaml:"status_print_interval"`  // 定期打印状态的间隔（分钟，默认1）
 		OrderCleanupInterval int `yaml:"order_cleanup_interval"` // 订单清理检查间隔（秒，默认60）
 	} `yaml:"timing"`
+
+	// 监控面板（只读，嵌在主进程）
+	Dashboard DashboardConfig `yaml:"dashboard"`
+}
+
+// DashboardConfig 本地监控面板配置
+type DashboardConfig struct {
+	// Enabled 缺省视为开启。显式写 false 可关闭。
+	Enabled           *bool  `yaml:"enabled"`
+	Listen            string `yaml:"listen"`              // 默认 127.0.0.1:8787
+	Token             string `yaml:"token"`               // 非空则 /api 与 /ws 需要 token
+	PushIntervalMS    int    `yaml:"push_interval_ms"`    // WebSocket 推送间隔，默认400，最小200
+	AccountRefreshSec int    `yaml:"account_refresh_sec"` // 账户缓存刷新秒数，默认10
 }
 
 // ExchangeConfig 交易所配置
@@ -200,5 +214,35 @@ func (c *Config) Validate() error {
 		c.RiskControl.RecoveryThreshold = monitorCount // 最大为监控币种数量
 	}
 
+	if err := c.applyDashboardDefaults(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// DashboardEnabled 面板是否启用。配置缺省时默认开启。
+func (c *Config) DashboardEnabled() bool {
+	if c.Dashboard.Enabled == nil {
+		return true
+	}
+	return *c.Dashboard.Enabled
+}
+
+func (c *Config) applyDashboardDefaults() error {
+	if c.Dashboard.Listen == "" {
+		c.Dashboard.Listen = "127.0.0.1:8787"
+	}
+	if _, _, err := net.SplitHostPort(c.Dashboard.Listen); err != nil {
+		return fmt.Errorf("dashboard.listen 格式无效，应为 host:port: %v", err)
+	}
+	if c.Dashboard.PushIntervalMS <= 0 {
+		c.Dashboard.PushIntervalMS = 400
+	} else if c.Dashboard.PushIntervalMS < 200 {
+		c.Dashboard.PushIntervalMS = 200
+	}
+	if c.Dashboard.AccountRefreshSec <= 0 {
+		c.Dashboard.AccountRefreshSec = 10
+	}
 	return nil
 }

@@ -255,6 +255,7 @@ func (w *WebSocketManager) handleOrderMessage(message []byte) {
 			ExecutedQty           string `json:"z"`
 			ExecutedQuoteQuantity string `json:"Z"`
 			FillPrice             string `json:"L"`
+			RealizedPNL           string `json:"rp"`
 		} `json:"data"`
 	}
 
@@ -286,17 +287,19 @@ func (w *WebSocketManager) handleOrderMessage(message []byte) {
 	}
 
 	update := OrderUpdate{
-		OrderID:       parseInt64(payload.Data.OrderID),
-		ClientOrderID: clientOrderID,
-		Symbol:        w.displaySymbol,
-		Side:          mapSideFromBackpack(payload.Data.Side),
-		Type:          mapOrderTypeFromBackpack(payload.Data.Type),
-		Status:        mapStatusFromBackpack(payload.Data.Status),
-		Price:         price,
-		Quantity:      parseFloat(payload.Data.Quantity),
-		ExecutedQty:   executedQty,
-		AvgPrice:      avgPrice,
-		UpdateTime:    normalizeTimestamp(payload.Data.EngineTime),
+		OrderID:                parseInt64(payload.Data.OrderID),
+		ClientOrderID:          clientOrderID,
+		Symbol:                 w.displaySymbol,
+		Side:                   mapSideFromBackpack(payload.Data.Side),
+		Type:                   mapOrderTypeFromBackpack(payload.Data.Type),
+		Status:                 mapStatusFromBackpack(payload.Data.Status),
+		Price:                  price,
+		Quantity:               parseFloat(payload.Data.Quantity),
+		ExecutedQty:            executedQty,
+		AvgPrice:               avgPrice,
+		UpdateTime:             normalizeTimestamp(payload.Data.EngineTime),
+		RealizedPNL:            parseFloat(payload.Data.RealizedPNL),
+		RealizedPNLIncremental: payload.Data.RealizedPNL != "",
 	}
 
 	w.mu.RLock()

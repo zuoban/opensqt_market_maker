@@ -265,6 +265,7 @@ func (w *WebSocketManager) handleOrderMessage(message []byte) {
 			CumExecQty  string `json:"cumExecQty"`
 			AvgPrice    string `json:"avgPrice"`
 			UpdatedTime string `json:"updatedTime"`
+			ClosedPnl   string `json:"closedPnl"`
 		} `json:"data"`
 	}
 
@@ -292,6 +293,7 @@ func (w *WebSocketManager) handleOrderMessage(message []byte) {
 			ExecutedQty:   parseFloat(item.CumExecQty),
 			AvgPrice:      parseFloat(item.AvgPrice),
 			UpdateTime:    parseInt64(item.UpdatedTime),
+			RealizedPNL:   parseFloat(item.ClosedPnl),
 		}
 
 		w.mu.RLock()

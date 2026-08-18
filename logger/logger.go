@@ -24,14 +24,27 @@ const (
 var (
 	globalLevel LogLevel = INFO
 	mu          sync.RWMutex
-	
+
 	// 文件日志相关
-	fileLogger   *log.Logger
-	logFile      *os.File
-	currentDate  string
-	fileMu       sync.Mutex
-	logDir       = "log" // 日志文件夹
+	fileLogger  *log.Logger
+	logFile     *os.File
+	currentDate string
+	fileMu      sync.Mutex
+	logDir      = "log" // 日志文件夹
+
+	ringCap  = 200
+	ringMu   sync.Mutex
+	ringBuf  [200]LogEntry
+	ringNext int
+	ringSize int
 )
+
+// LogEntry 环缓冲中的一条日志
+type LogEntry struct {
+	Time    time.Time `json:"time"`
+	Level   string    `json:"level"`
+	Message string    `json:"message"`
+}
 
 // String 返回日志级别的字符串表示
 func (l LogLevel) String() string {
@@ -75,7 +88,7 @@ func SetLevel(level LogLevel) {
 	mu.Lock()
 	defer mu.Unlock()
 	globalLevel = level
-	
+
 	// 如果设置为DEBUG级别，启用文件日志
 	if level == DEBUG {
 		initFileLogger()
@@ -88,26 +101,26 @@ func SetLevel(level LogLevel) {
 func initFileLogger() {
 	fileMu.Lock()
 	defer fileMu.Unlock()
-	
+
 	// 如果已经初始化且日期相同，不需要重新初始化
 	today := time.Now().Format("2006-01-02")
 	if fileLogger != nil && currentDate == today {
 		return
 	}
-	
+
 	// 关闭旧文件
 	if logFile != nil {
 		logFile.Close()
 		logFile = nil
 	}
-	
+
 	// 创建log文件夹
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		// 如果创建失败，只输出到控制台
 		log.Printf("[WARN] 创建日志文件夹失败: %v，将只输出到控制台", err)
 		return
 	}
-	
+
 	// 创建日志文件（按日期命名）
 	logFileName := filepath.Join(logDir, fmt.Sprintf("opensqt-%s.log", today))
 	file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -116,12 +129,12 @@ func initFileLogger() {
 		log.Printf("[WARN] 打开日志文件失败: %v，将只输出到控制台", err)
 		return
 	}
-	
+
 	logFile = file
 	currentDate = today
 	// 创建文件日志器（不包含时间戳，因为标准log已经包含）
 	fileLogger = log.New(file, "", 0)
-	
+
 	log.Printf("[INFO] 文件日志已启用，日志文件: %s", logFileName)
 }
 
@@ -129,7 +142,7 @@ func initFileLogger() {
 func closeFileLogger() {
 	fileMu.Lock()
 	defer fileMu.Unlock()
-	
+
 	if logFile != nil {
 		logFile.Close()
 		logFile = nil
@@ -149,19 +162,19 @@ func checkAndRotateLog() {
 			logFile.Close()
 			logFile = nil
 		}
-		
+
 		// 创建log文件夹
 		if err := os.MkdirAll(logDir, 0755); err != nil {
 			return
 		}
-		
+
 		// 创建新的日志文件
 		logFileName := filepath.Join(logDir, fmt.Sprintf("opensqt-%s.log", today))
 		file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			return
 		}
-		
+
 		logFile = file
 		currentDate = today
 		fileLogger = log.New(file, "", 0)
@@ -171,6 +184,41 @@ func checkAndRotateLog() {
 // Close 关闭文件日志（程序退出时调用）
 func Close() {
 	closeFileLogger()
+}
+
+func recordLog(level LogLevel, msg string) {
+	ringMu.Lock()
+	ringBuf[ringNext] = LogEntry{
+		Time:    time.Now(),
+		Level:   level.String(),
+		Message: msg,
+	}
+	ringNext = (ringNext + 1) % ringCap
+	if ringSize < ringCap {
+		ringSize++
+	}
+	ringMu.Unlock()
+}
+
+// RecentLogs 返回最近 n 条日志（旧→新）。n<=0 时返回全部。
+func RecentLogs(n int) []LogEntry {
+	ringMu.Lock()
+	defer ringMu.Unlock()
+	if ringSize == 0 {
+		return nil
+	}
+	if n <= 0 || n > ringSize {
+		n = ringSize
+	}
+	out := make([]LogEntry, n)
+	start := ringNext - n
+	if start < 0 {
+		start += ringCap
+	}
+	for i := 0; i < n; i++ {
+		out[i] = ringBuf[(start+i)%ringCap]
+	}
+	return out
 }
 
 // GetLevel 获取全局日志级别
@@ -192,10 +240,11 @@ func logf(level LogLevel, format string, args ...interface{}) {
 	}
 	prefix := fmt.Sprintf("[%s] ", level.String())
 	message := fmt.Sprintf(prefix+format, args...)
-	
+	recordLog(level, fmt.Sprintf(format, args...))
+
 	// 输出到控制台（标准输出）
 	log.Printf(prefix+format, args...)
-	
+
 	// 如果日志级别为DEBUG，同时写入文件
 	if globalLevel == DEBUG {
 		fileMu.Lock()
@@ -216,10 +265,11 @@ func logln(level LogLevel, args ...interface{}) {
 	}
 	prefix := fmt.Sprintf("[%s] ", level.String())
 	message := fmt.Sprintln(append([]interface{}{prefix}, args...)...)
-	
+	recordLog(level, strings.TrimSpace(fmt.Sprintln(args...)))
+
 	// 输出到控制台（标准输出）
 	log.Println(append([]interface{}{prefix}, args...)...)
-	
+
 	// 如果日志级别为DEBUG，同时写入文件
 	if globalLevel == DEBUG {
 		fileMu.Lock()
@@ -289,4 +339,3 @@ func Fatalln(args ...interface{}) {
 func Fatalf(format string, args ...interface{}) {
 	Fatal(format, args...)
 }
-

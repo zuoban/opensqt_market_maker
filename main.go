@@ -15,12 +15,14 @@ import (
 	"opensqt/order"
 	"opensqt/position"
 	"opensqt/safety"
+	"opensqt/web"
 )
 
 // Version 版本号
 var Version = "v3.4.4"
 
 func main() {
+	programStartedAt := time.Now()
 	logger.Info("🚀 www.OpenSQT.com 做市商系统启动...")
 	logger.Info("📦 版本号: %s", Version)
 
@@ -184,18 +186,28 @@ func main() {
 			return 0.0
 		}
 
+		getBoolField := func(name string) bool {
+			field := v.FieldByName(name)
+			if field.IsValid() && field.Kind() == reflect.Bool {
+				return field.Bool()
+			}
+			return false
+		}
+
 		// 提取所有字段
 		posUpdate := position.OrderUpdate{
-			OrderID:       getInt64Field("OrderID"),
-			ClientOrderID: getStringField("ClientOrderID"), // 🔥 关键：传递 ClientOrderID
-			Symbol:        getStringField("Symbol"),
-			Status:        getStringField("Status"),
-			ExecutedQty:   getFloat64Field("ExecutedQty"),
-			Price:         getFloat64Field("Price"),
-			AvgPrice:      getFloat64Field("AvgPrice"),
-			Side:          getStringField("Side"),
-			Type:          getStringField("Type"),
-			UpdateTime:    getInt64Field("UpdateTime"),
+			OrderID:                getInt64Field("OrderID"),
+			ClientOrderID:          getStringField("ClientOrderID"), // 🔥 关键：传递 ClientOrderID
+			Symbol:                 getStringField("Symbol"),
+			Status:                 getStringField("Status"),
+			ExecutedQty:            getFloat64Field("ExecutedQty"),
+			Price:                  getFloat64Field("Price"),
+			AvgPrice:               getFloat64Field("AvgPrice"),
+			Side:                   getStringField("Side"),
+			Type:                   getStringField("Type"),
+			UpdateTime:             getInt64Field("UpdateTime"),
+			RealizedPNL:            getFloat64Field("RealizedPNL"),
+			RealizedPNLIncremental: getBoolField("RealizedPNLIncremental"),
 		}
 
 		logger.Debug("🔍 [main.go] 收到订单更新回调: ID=%d, ClientOID=%s, Price=%.2f, Status=%s",
@@ -235,6 +247,25 @@ func main() {
 
 	// 启动风控监控
 	go riskMonitor.Start(ctx)
+
+	// 启动只读监控面板（失败不影响交易）
+	var dash *web.Server
+	if cfg.DashboardEnabled() {
+		dash = web.New(web.Options{
+			Cfg:       cfg,
+			Version:   Version,
+			StartedAt: programStartedAt,
+			Price:     priceMonitor,
+			Position:  superPositionManager,
+			Risk:      riskMonitor,
+			Exchange:  ex,
+		})
+		go func() {
+			if err := dash.Start(); err != nil {
+				logger.Error("❌ 监控面板启动失败: %v（交易继续运行）", err)
+			}
+		}()
+	}
 
 	// 10. 监听价格变化,调整订单窗口（实时调整，不打印价格变化日志）
 	go func() {
@@ -321,6 +352,11 @@ func main() {
 
 	logger.Info("⏹️ 正在停止风控监视器...")
 	riskMonitor.Stop()
+
+	if dash != nil {
+		logger.Info("⏹️ 正在停止监控面板...")
+		dash.Shutdown(2 * time.Second)
+	}
 
 	// 等待一小段时间，让协程完成清理（避免强制退出导致日志丢失）
 	time.Sleep(500 * time.Millisecond)

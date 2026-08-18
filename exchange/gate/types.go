@@ -76,17 +76,19 @@ type Account struct {
 }
 
 type OrderUpdate struct {
-	OrderID       int64
-	ClientOrderID string
-	Symbol        string
-	Side          Side
-	Type          OrderType
-	Status        OrderStatus
-	Price         float64
-	Quantity      float64
-	ExecutedQty   float64
-	AvgPrice      float64
-	UpdateTime    int64
+	OrderID                int64
+	ClientOrderID          string
+	Symbol                 string
+	Side                   Side
+	Type                   OrderType
+	Status                 OrderStatus
+	Price                  float64
+	Quantity               float64
+	ExecutedQty            float64
+	AvgPrice               float64
+	UpdateTime             int64
+	RealizedPNL            float64
+	RealizedPNLIncremental bool
 }
 
 // Candle K线数据
