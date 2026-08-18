@@ -697,6 +697,10 @@ func (w *WebSocketManager) parseOrderUpdate(data map[string]interface{}) *OrderU
 	updateTimeStr, _ := data["uTime"].(string)
 	tradeSideStr, _ := data["tradeSide"].(string)
 	posSideStr, _ := data["posSide"].(string)
+	realizedPNL := parseFlexibleFloat(data["totalProfits"])
+	if realizedPNL == 0 {
+		realizedPNL = parseFlexibleFloat(data["pnl"])
+	}
 
 	// 🔍 调试：打印关键字段的原始值
 	logger.Debug("🔍 [parseOrderUpdate] accBaseVolume=%v (type=%T), priceAvg=%v (type=%T)",
@@ -759,6 +763,22 @@ func (w *WebSocketManager) parseOrderUpdate(data map[string]interface{}) *OrderU
 		ExecutedQty:   executedQty,
 		AvgPrice:      avgPrice,
 		UpdateTime:    updateTime,
+		RealizedPNL:   realizedPNL, // Bitget totalProfits 为该订单累计已实现盈亏
+	}
+}
+
+func parseFlexibleFloat(v interface{}) float64 {
+	switch t := v.(type) {
+	case string:
+		f, _ := strconv.ParseFloat(t, 64)
+		return f
+	case float64:
+		return t
+	case json.Number:
+		f, _ := t.Float64()
+		return f
+	default:
+		return 0
 	}
 }
 

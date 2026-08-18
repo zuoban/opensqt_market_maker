@@ -131,3 +131,11 @@ risk_control:
   
   # 触发条件：当前价格 < 移动均价 且 成交量 > 均值×倍数
   # 解除条件：至少 recovery_threshold 个币种满足（当前价格 > 移动均价 且 成交量 < 均值×倍数）
+
+# 本地只读监控面板（嵌在主进程，不改交易逻辑）
+dashboard:
+  enabled: true
+  listen: "127.0.0.1:8787"   # 默认只绑本机。写成 0.0.0.0 会对外暴露账户与仓位
+  token: ""                  # 非空则访问 /api/snapshot 和 /ws 需要 ?token=
+  push_interval_ms: 400      # WebSocket 推送间隔（最小200）
+  account_refresh_sec: 10    # 账户余额刷新间隔

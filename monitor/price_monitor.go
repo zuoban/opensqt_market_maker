@@ -189,6 +189,16 @@ func (pm *PriceMonitor) GetLastPriceString() string {
 	return ""
 }
 
+// GetLastPriceTime 最近一次收到价格推送的时间
+func (pm *PriceMonitor) GetLastPriceTime() time.Time {
+	if val := pm.lastPriceTime.Load(); val != nil {
+		if t, ok := val.(time.Time); ok {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 // Subscribe 订阅价格变化
 func (pm *PriceMonitor) Subscribe() <-chan PriceChange {
 	outCh := make(chan PriceChange, 10)

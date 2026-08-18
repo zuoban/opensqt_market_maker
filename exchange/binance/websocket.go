@@ -284,18 +284,21 @@ func (w *WebSocketManager) handleUserDataEvent(event *futures.WsUserDataEvent) {
 	executedQty, _ := strconv.ParseFloat(order.AccumulatedFilledQty, 64)
 	price, _ := strconv.ParseFloat(order.OriginalPrice, 64)
 	avgPrice, _ := strconv.ParseFloat(order.AveragePrice, 64)
+	realizedPNL, _ := strconv.ParseFloat(order.RealizedPnL, 64)
 
 	update := OrderUpdate{
-		OrderID:       order.ID,
-		ClientOrderID: order.ClientOrderID, // 🔥 添加 ClientOrderID
-		Symbol:        order.Symbol,
-		Status:        OrderStatus(order.Status),
-		ExecutedQty:   executedQty,
-		Price:         price,
-		AvgPrice:      avgPrice,
-		Side:          Side(order.Side),
-		Type:          OrderType(order.Type),
-		UpdateTime:    order.TradeTime,
+		OrderID:                order.ID,
+		ClientOrderID:          order.ClientOrderID, // 🔥 添加 ClientOrderID
+		Symbol:                 order.Symbol,
+		Status:                 OrderStatus(order.Status),
+		ExecutedQty:            executedQty,
+		Price:                  price,
+		AvgPrice:               avgPrice,
+		Side:                   Side(order.Side),
+		Type:                   OrderType(order.Type),
+		UpdateTime:             order.TradeTime,
+		RealizedPNL:            realizedPNL,
+		RealizedPNLIncremental: true, // 币安 rp 是本笔成交利润
 	}
 
 	// 🔍 调试日志：记录收到的订单更新

@@ -90,17 +90,19 @@ type Account struct {
 }
 
 type OrderUpdate struct {
-	OrderID       int64
-	ClientOrderID string
-	Symbol        string
-	Side          Side
-	Type          OrderType
-	Status        OrderStatus
-	Price         float64
-	Quantity      float64
-	ExecutedQty   float64
-	AvgPrice      float64
-	UpdateTime    int64
+	OrderID                int64
+	ClientOrderID          string
+	Symbol                 string
+	Side                   Side
+	Type                   OrderType
+	Status                 OrderStatus
+	Price                  float64
+	Quantity               float64
+	ExecutedQty            float64
+	AvgPrice               float64
+	UpdateTime             int64
+	RealizedPNL            float64
+	RealizedPNLIncremental bool
 }
 
 type OrderUpdateCallback func(update OrderUpdate)
@@ -501,29 +503,33 @@ func (b *BinanceAdapter) StartOrderStream(ctx context.Context, callback func(int
 	localCallback := func(update OrderUpdate) {
 		// 构造通用的 OrderUpdate 结构（避免导入 exchange 包）
 		genericUpdate := struct {
-			OrderID       int64
-			ClientOrderID string
-			Symbol        string
-			Side          string
-			Type          string
-			Status        string
-			Price         float64
-			Quantity      float64
-			ExecutedQty   float64
-			AvgPrice      float64
-			UpdateTime    int64
+			OrderID                int64
+			ClientOrderID          string
+			Symbol                 string
+			Side                   string
+			Type                   string
+			Status                 string
+			Price                  float64
+			Quantity               float64
+			ExecutedQty            float64
+			AvgPrice               float64
+			UpdateTime             int64
+			RealizedPNL            float64
+			RealizedPNLIncremental bool
 		}{
-			OrderID:       update.OrderID,
-			ClientOrderID: update.ClientOrderID, // 🔥 关键：传递 ClientOrderID
-			Symbol:        update.Symbol,
-			Side:          string(update.Side),
-			Type:          string(update.Type),
-			Status:        string(update.Status),
-			Price:         update.Price,
-			Quantity:      update.Quantity,
-			ExecutedQty:   update.ExecutedQty,
-			AvgPrice:      update.AvgPrice,
-			UpdateTime:    update.UpdateTime,
+			OrderID:                update.OrderID,
+			ClientOrderID:          update.ClientOrderID, // 🔥 关键：传递 ClientOrderID
+			Symbol:                 update.Symbol,
+			Side:                   string(update.Side),
+			Type:                   string(update.Type),
+			Status:                 string(update.Status),
+			Price:                  update.Price,
+			Quantity:               update.Quantity,
+			ExecutedQty:            update.ExecutedQty,
+			AvgPrice:               update.AvgPrice,
+			UpdateTime:             update.UpdateTime,
+			RealizedPNL:            update.RealizedPNL,
+			RealizedPNLIncremental: update.RealizedPNLIncremental,
 		}
 		callback(genericUpdate)
 	}

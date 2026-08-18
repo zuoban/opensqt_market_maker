@@ -429,6 +429,7 @@ func (w *WebSocketManager) handleOrderUpdate(msg map[string]interface{}) {
 		fillPrice, _ := parseFloat(orderData["fill_price"])
 		text, _ := orderData["text"].(string)
 		finishTime, _ := orderData["finish_time"].(float64)
+		realizedPNL, _ := parseFloat(orderData["pnl"])
 
 		// 使用统一的 utils 包去掉 Gate.io 的 t- 前缀
 		clientOrderID := utils.RemoveBrokerPrefix("gate", text)
@@ -451,6 +452,7 @@ func (w *WebSocketManager) handleOrderUpdate(msg map[string]interface{}) {
 			ExecutedQty:   executedQty, // 成交数量 = size - left
 			AvgPrice:      fillPrice,
 			UpdateTime:    int64(finishTime * 1000), // 转换为毫秒
+			RealizedPNL:   realizedPNL,
 		}
 
 		w.mu.RLock()

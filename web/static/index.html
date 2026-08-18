@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenSQT 做市监控</title>
+    <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+    <div class="grain"></div>
+    <header class="mast">
+        <div class="brand">
+            <span class="brand-mark">OSQ</span>
+            <div>
+                <div class="brand-name">OpenSQT</div>
+                <div class="brand-sub">MARKET DESK · 只读</div>
+            </div>
+        </div>
+        <div class="mast-mid">
+            <div class="pair" id="pair">—</div>
+            <div class="price" id="lastPrice">—.——</div>
+            <div class="price-meta" id="priceMeta">等待价格</div>
+        </div>
+        <div class="mast-right">
+            <div class="pill" id="wsPill"><i></i><span>未连接</span></div>
+            <div class="pill risk" id="riskPill">风控 —</div>
+            <div class="ver" id="version"></div>
+        </div>
+    </header>
+
+    <section class="kpis" id="kpis"></section>
+
+    <main class="board">
+        <section class="panel ladder-wrap">
+            <div class="panel-head">
+                <h2>网格阶梯</h2>
+                <label class="toggle">
+                    <input type="checkbox" id="showOutside">
+                    显示窗口外
+                </label>
+            </div>
+            <div class="ladder-legend">
+                <span class="lg buy">买单</span>
+                <span class="lg empty">窗口空槽</span>
+                <span class="lg mark">现价格</span>
+                <span class="lg pos">持仓</span>
+                <span class="lg sell">卖单</span>
+            </div>
+            <div id="ladderEmpty" class="empty">尚无槽位。系统初始化后将在此显示网格。</div>
+            <div class="ladder" id="ladder"></div>
+        </section>
+
+        <aside class="side">
+            <section class="panel">
+                <div class="panel-head"><h2>主动风控</h2></div>
+                <p class="risk-msg" id="riskMsg">—</p>
+                <div id="riskList" class="risk-list"></div>
+            </section>
+            <section class="panel log-panel">
+                <div class="panel-head"><h2>最近日志</h2></div>
+                <div class="logs" id="logs"></div>
+            </section>
+        </aside>
+    </main>
+
+    <section class="tables">
+        <section class="panel">
+            <div class="panel-head"><h2>持仓槽位</h2></div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr><th>价格</th><th>数量</th><th>订单</th><th>槽位</th></tr>
+                    </thead>
+                    <tbody id="posBody"></tbody>
+                </table>
+            </div>
+        </section>
+        <section class="panel">
+            <div class="panel-head"><h2>活动订单</h2></div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr><th>方向</th><th>价格</th><th>状态</th><th>ID</th></tr>
+                    </thead>
+                    <tbody id="ordBody"></tbody>
+                </table>
+            </div>
+        </section>
+    </section>
+
+    <div class="token-mask hidden" id="tokenMask">
+        <form class="token-box" id="tokenForm">
+            <h3>需要访问令牌</h3>
+            <p>配置了 <code>dashboard.token</code>。输入后仅保存在本机。</p>
+            <input type="password" id="tokenInput" placeholder="token" autocomplete="off">
+            <button type="submit">进入面板</button>
+            <p class="err" id="tokenErr"></p>
+        </form>
+    </div>
+
+    <script src="/assets/app.js"></script>
+</body>
+</html>
