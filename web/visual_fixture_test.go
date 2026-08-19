@@ -83,6 +83,7 @@ func visualFixtureSnapshot() map[string]interface{} {
 	}
 
 	latest := candles[len(candles)-1]["close"]
+	filledOrders := visualFilledOrders()
 	return map[string]interface{}{
 		"time":      time.Now(),
 		"version":   "visual-fixture",
@@ -103,19 +104,67 @@ func visualFixtureSnapshot() map[string]interface{} {
 			"orderQuantity": 30, "buyWindowSize": 2, "sellWindowSize": 2, "slots": slots,
 			"filledSlotCount": 2, "positionQty": 0.025, "activeBuyOrders": 1, "activeSellOrders": 2,
 			"totalBuyQty": 1.26, "totalSellQty": 1.19, "estimatedProfit": 7.14, "realizedPnl": 6.82,
-			"filledOrders": []interface{}{}, "filledOrderCount": 0,
+			"filledOrders":     filledOrders,
+			"filledOrderCount": int64(len(filledOrders)),
 		},
 		"risk": map[string]interface{}{
-			"enabled": true, "triggered": false, "lastMsg": "监控正常", "symbols": []interface{}{},
+			"enabled": true, "triggered": false, "lastMsg": "监控正常 · 量价均在阈值内",
+			"symbols": []interface{}{
+				map[string]interface{}{
+					"symbol": "ETHUSDT", "status": "正常", "abnormal": false,
+					"currentPrice": 4222.02, "avgPrice": 4216.4, "priceDeviation": 0.13, "volumeRatio": 1.08,
+				},
+				map[string]interface{}{
+					"symbol": "BTCUSDT", "status": "关注", "abnormal": false,
+					"currentPrice": 67420.5, "avgPrice": 67110.0, "priceDeviation": 0.46, "volumeRatio": 1.62,
+				},
+			},
 		},
 		"account": map[string]interface{}{
 			"quoteAsset": "USDT", "available": 1864.22, "margin": 2018.47, "initialMarginReady": true,
 			"initialMargin": 2000.0, "marginChange": 18.47, "marginChangePct": 0.92, "unrealizedPnl": 11.65,
 		},
 		"logs": []map[string]interface{}{
-			{"time": time.Now(), "level": "INFO", "message": "K 线与网格执行图已连接实时行情"},
+			{"time": time.Now().Add(-18 * time.Minute), "level": "INFO", "message": "账户缓存已同步 · 可用 1,864.22 USDT"},
+			{"time": time.Now().Add(-9 * time.Minute), "level": "INFO", "message": "K 线与网格执行图已连接实时行情"},
+			{"time": time.Now().Add(-4 * time.Minute), "level": "WARN", "message": "BTCUSDT 量比升至 1.62 · 继续观察"},
+			{"time": time.Now(), "level": "INFO", "message": "ETHUSDT 买单已确认 · 4,214.00 × 0.0071"},
 		},
 	}
+}
+
+func visualFilledOrders() []interface{} {
+	buyPattern := []int{2, 1, 3, 0, 2, 4, 1, 2, 1}
+	sellPattern := []int{1, 2, 1, 2, 3, 1, 2, 0, 2}
+	orders := make([]interface{}, 0, 32)
+	seq := 1
+	now := time.Now()
+	for i, hoursAgo := 0, 8; i < 9; i, hoursAgo = i+1, hoursAgo-1 {
+		base := now.Add(-time.Duration(hoursAgo) * time.Hour)
+		for n := 0; n < buyPattern[i]; n++ {
+			orders = append(orders, map[string]interface{}{
+				"filledAt":    base.Add(time.Duration(6+n*5) * time.Minute),
+				"side":        "BUY",
+				"price":       4210.0 + float64(hoursAgo),
+				"quantity":    0.0071,
+				"realizedPnl": 0,
+				"orderId":     seq,
+			})
+			seq++
+		}
+		for n := 0; n < sellPattern[i]; n++ {
+			orders = append(orders, map[string]interface{}{
+				"filledAt":    base.Add(time.Duration(18+n*4) * time.Minute),
+				"side":        "SELL",
+				"price":       4230.0 + float64(hoursAgo),
+				"quantity":    0.0068,
+				"realizedPnl": 0.12 + float64(n)*0.03,
+				"orderId":     seq,
+			})
+			seq++
+		}
+	}
+	return orders
 }
 
 func TestVisualFixtureSnapshotJSON(t *testing.T) {

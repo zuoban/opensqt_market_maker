@@ -1,6 +1,6 @@
 (function () {
     if (typeof module !== "undefined" && module.exports) {
-        module.exports = { buildKlineGridModel };
+        module.exports = { buildKlineGridModel, buildHourlyFillModel };
         return;
     }
 
@@ -261,7 +261,7 @@
 
         const triggered = Boolean(risk.triggered);
         const riskPill = $("riskPill");
-        setText(riskPill, !risk.enabled
+        setText(riskPill.querySelector("span") || riskPill, !risk.enabled
             ? "风控关闭"
             : (triggered ? "风控已触发 · 暂停买单" : "风控正常"));
         riskPill.classList.toggle("hot", triggered);
@@ -426,23 +426,18 @@
         });
         levels.sort((a, b) => b.price - a.price);
 
-        const priceValues = [];
-        candles.forEach((candle) => priceValues.push(candle.low, candle.high));
-        levels.forEach((level) => priceValues.push(level.price));
-        let priceMin = priceValues.length ? Math.min(...priceValues) : 0;
-        let priceMax = priceValues.length ? Math.max(...priceValues) : 0;
-        if (priceMin > 0 && priceMax > 0) {
-            const span = Math.max(priceMax - priceMin, priceMax * 0.002);
-            priceMin -= span * 0.08;
-            priceMax += span * 0.08;
-        }
-
         const first = candles[0];
         const latest = candles[candles.length - 1];
         const change = first && latest ? latest.close - first.open : 0;
         const changePct = first && first.open ? change / first.open * 100 : 0;
         const candleLow = candles.length ? Math.min(...candles.map((candle) => candle.low)) : 0;
         const candleHigh = candles.length ? Math.max(...candles.map((candle) => candle.high)) : 0;
+        const focused = focusKlinePriceRange(candleLow, candleHigh, levels, Number(pos.priceInterval));
+        const uniqueLevels = mergeLevelsByPrice(levels);
+        const split = splitLevelsByRange(uniqueLevels, focused.priceMin, focused.priceMax);
+        const lastPrice = latest ? latest.close : 0;
+        const keyLevels = selectKeyLevels(split.visible, lastPrice);
+        const folded = foldEdgeLevels(split.visible, keyLevels, focused.priceMin, focused.priceMax);
         const execution = levels.reduce((result, level) => {
             if (level.hasBuy) result.buy += 1;
             if (level.hasSell) result.sell += 1;
@@ -455,9 +450,13 @@
             degraded: Boolean(kline.degraded),
             candles,
             levels,
+            visibleLevels: folded.keep,
+            railLabels: keyLevels.filter((level) => folded.keep.indexOf(level) >= 0),
+            overflowAbove: split.above.concat(folded.above),
+            overflowBelow: split.below.concat(folded.below),
             grid,
-            priceMin,
-            priceMax,
+            priceMin: focused.priceMin,
+            priceMax: focused.priceMax,
             latest,
             candleLow,
             candleHigh,
@@ -465,6 +464,113 @@
             changePct,
             execution
         };
+    }
+
+    function focusKlinePriceRange(candleLow, candleHigh, levels, interval) {
+        const prices = [];
+        if (candleLow > 0) prices.push(candleLow);
+        if (candleHigh > 0) prices.push(candleHigh);
+        if (!prices.length) {
+            (levels || []).forEach((level) => prices.push(level.price));
+            if (!prices.length) return { priceMin: 0, priceMax: 0 };
+            const min = Math.min(...prices);
+            const max = Math.max(...prices);
+            const span = Math.max(max - min, max * 0.002);
+            return { priceMin: min - span * 0.08, priceMax: max + span * 0.08 };
+        }
+        const lo = Math.min(candleLow, candleHigh);
+        const hi = Math.max(candleLow, candleHigh);
+        const step = Number.isFinite(interval) && interval > 0 ? interval : 0;
+        const span = Math.max(hi - lo, hi * 0.002, step);
+        const pad = Math.max(span * 0.18, step * 0.55, hi * 0.0006);
+        let priceMin = lo - pad;
+        let priceMax = hi + pad;
+        if (priceMax <= priceMin) priceMax = priceMin + span;
+        return { priceMin, priceMax };
+    }
+
+    function selectKeyLevels(levels, lastPrice) {
+        const keys = [];
+        const add = (level) => {
+            if (level && keys.indexOf(level) < 0) keys.push(level);
+        };
+        add((levels || []).find((level) => level.isGrid));
+        let nearestBuy = null;
+        let nearestSell = null;
+        (levels || []).forEach((level) => {
+            if (level.hasBuy && (!nearestBuy || Math.abs(level.price - lastPrice) < Math.abs(nearestBuy.price - lastPrice))) {
+                nearestBuy = level;
+            }
+            if (level.hasSell && (!nearestSell || Math.abs(level.price - lastPrice) < Math.abs(nearestSell.price - lastPrice))) {
+                nearestSell = level;
+            }
+        });
+        add(nearestBuy);
+        add(nearestSell);
+        return keys;
+    }
+
+    function foldEdgeLevels(visible, keyLevels, priceMin, priceMax) {
+        const span = Math.max(priceMax - priceMin, 1e-9);
+        const edge = span * 0.12;
+        const keySet = new Set(keyLevels || []);
+        const keep = [];
+        const above = [];
+        const below = [];
+        (visible || []).forEach((level) => {
+            if (keySet.has(level)) {
+                keep.push(level);
+                return;
+            }
+            if (priceMax - level.price <= edge) {
+                above.push(level);
+                return;
+            }
+            if (level.price - priceMin <= edge) {
+                below.push(level);
+                return;
+            }
+            keep.push(level);
+        });
+        return { keep, above, below };
+    }
+
+    function mergeLevelsByPrice(levels) {
+        const merged = new Map();
+        (levels || []).forEach((level) => {
+            const key = Number(level.price).toFixed(8);
+            const current = merged.get(key);
+            if (!current) {
+                merged.set(key, {
+                    ...level,
+                    markers: (level.markers || []).slice()
+                });
+                return;
+            }
+            current.markers = Array.from(new Set(current.markers.concat(level.markers || [])));
+            current.hasBuy = current.hasBuy || level.hasBuy;
+            current.hasSell = current.hasSell || level.hasSell;
+            current.hasPosition = current.hasPosition || level.hasPosition;
+            current.isGrid = current.isGrid || level.isGrid;
+            current.inWindow = current.inWindow || level.inWindow;
+            if (current.isGrid) current.kind = "grid";
+            else if (current.hasSell) current.kind = "sell";
+            else if (current.hasPosition) current.kind = "position";
+            else if (current.hasBuy) current.kind = "buy";
+        });
+        return Array.from(merged.values());
+    }
+
+    function splitLevelsByRange(levels, priceMin, priceMax) {
+        const visible = [];
+        const above = [];
+        const below = [];
+        (levels || []).forEach((level) => {
+            if (level.price > priceMax) above.push(level);
+            else if (level.price < priceMin) below.push(level);
+            else visible.push(level);
+        });
+        return { visible, above, below };
     }
 
     function renderKlineChart(kline, pos) {
@@ -647,23 +753,25 @@
         const style = getComputedStyle(document.documentElement);
         const color = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
         const colors = {
-            ink: color("--ink", "#edf7f3"),
-            muted: color("--muted", "#91aaa3"),
-            mutedSoft: color("--muted-soft", "#718b84"),
-            line: color("--line", "rgba(143,190,177,.18)"),
-            lineStrong: color("--line-strong", "rgba(143,190,177,.34)"),
-            up: color("--positive", "#48dda3"),
-            down: color("--negative", "#ff7d77"),
-            buy: color("--buy", "#ff7d77"),
-            sell: color("--sell", "#48dda3"),
-            position: color("--cyan", "#5bc8ff"),
-            grid: color("--warn", "#ffc857"),
-            surface: color("--surface", "#0a1714")
+            ink: color("--ink", "#eef4f1"),
+            muted: color("--muted", "#9aaba4"),
+            mutedSoft: color("--muted-soft", "#7e9089"),
+            line: color("--line", "rgba(154,186,176,.14)"),
+            lineStrong: color("--line-strong", "rgba(154,186,176,.28)"),
+            up: color("--positive", "#3ee0a4"),
+            down: color("--negative", "#ff7a73"),
+            buy: color("--buy", "#ff7a73"),
+            sell: color("--sell", "#3ee0a4"),
+            position: color("--cyan", "#5ec6ff"),
+            grid: color("--warn", "#f0c15a"),
+            surface: color("--surface", "#0d1214"),
+            rail: color("--plot-rail", "rgba(8,12,14,.55)"),
+            labelBg: color("--plot-label", "rgba(8,12,14,.9)")
         };
         const compact = width < 520;
         const left = compact ? 9 : 14;
         const axisWidth = compact ? 58 : 72;
-        const railWidth = compact ? 68 : 98;
+        const railWidth = compact ? 78 : 98;
         const right = axisWidth + railWidth;
         const top = 22;
         const bottom = 30;
@@ -694,7 +802,7 @@
             ctx.textAlign = "left";
             ctx.fillText(compactPrice(price), railRight + 7, y);
         }
-        ctx.fillStyle = "rgba(2, 9, 7, 0.5)";
+        ctx.fillStyle = colors.rail;
         ctx.fillRect(plotRight + 1, top, Math.max(0, railRight - plotRight), plotHeight);
         ctx.strokeStyle = colors.line;
         ctx.beginPath();
@@ -709,12 +817,16 @@
         ctx.fillText(compact ? "ORD" : "EXECUTION", railLeft, 7);
 
         drawExecutionBands(ctx, chartModel.levels, chartGeometry, colors);
-
-        drawGridLevels(ctx, chartModel.levels, chartGeometry, colors);
+        drawGridLevels(ctx, chartModel.visibleLevels || chartModel.levels, chartGeometry, colors, {
+            above: chartModel.overflowAbove || [],
+            below: chartModel.overflowBelow || [],
+            labelLevels: chartModel.railLabels
+        });
+        drawOverflowChips(ctx, chartModel.overflowAbove || [], chartModel.overflowBelow || [], chartGeometry, colors, compact);
 
         const candles = chartModel.candles;
         const slotWidth = plotWidth / candles.length;
-        const bodyWidth = Math.max(2, Math.min(10, slotWidth * 0.62));
+        const bodyWidth = Math.max(2.5, Math.min(14, slotWidth * 0.76));
         const timeTickCount = compact ? 3 : 5;
         const timeIndices = Array.from(new Set(Array.from({ length: timeTickCount }, (_, index) =>
             Math.round(index * (candles.length - 1) / Math.max(1, timeTickCount - 1))
@@ -730,6 +842,10 @@
             ctx.stroke();
         });
         ctx.globalAlpha = 1;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(left, top, plotWidth, plotHeight);
+        ctx.clip();
         candles.forEach((candle, index) => {
             const x = left + slotWidth * (index + 0.5);
             const openY = yForPrice(candle.open);
@@ -738,28 +854,32 @@
             const lowY = yForPrice(candle.low);
             const bullish = candle.close >= candle.open;
             const candleColor = bullish ? colors.up : colors.down;
+            const live = !candle.isClosed;
             ctx.setLineDash([]);
             ctx.strokeStyle = candleColor;
-            ctx.lineWidth = candle.isClosed ? 1 : 1.5;
+            ctx.lineWidth = live ? 1.6 : 1.15;
             ctx.beginPath();
             ctx.moveTo(x, highY);
             ctx.lineTo(x, lowY);
             ctx.stroke();
             const bodyTop = Math.min(openY, closeY);
-            const bodyHeight = Math.max(1.5, Math.abs(openY - closeY));
+            const bodyHeight = Math.max(2, Math.abs(openY - closeY));
+            const bodyX = x - bodyWidth / 2;
             if (bullish) {
                 ctx.fillStyle = candleColor;
-                ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+                ctx.fillRect(bodyX, bodyTop, bodyWidth, bodyHeight);
             } else {
                 ctx.fillStyle = colors.surface;
-                ctx.fillRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
-                ctx.strokeRect(x - bodyWidth / 2, bodyTop, bodyWidth, bodyHeight);
+                ctx.fillRect(bodyX, bodyTop, bodyWidth, bodyHeight);
+                ctx.strokeRect(bodyX, bodyTop, bodyWidth, bodyHeight);
             }
-            if (!candle.isClosed) {
+            if (live) {
                 ctx.strokeStyle = colors.position;
-                ctx.strokeRect(x - bodyWidth / 2 - 1, bodyTop - 1, bodyWidth + 2, bodyHeight + 2);
+                ctx.lineWidth = 1.2;
+                ctx.strokeRect(bodyX - 1, bodyTop - 1, bodyWidth + 2, bodyHeight + 2);
             }
         });
+        ctx.restore();
 
         ctx.fillStyle = colors.muted;
         timeIndices.forEach((index, order) => {
@@ -823,8 +943,10 @@
         ctx.restore();
     }
 
-    function drawGridLevels(ctx, levels, geometry, colors) {
+    function drawGridLevels(ctx, levels, geometry, colors, overflow) {
         const activeLevels = [];
+        const railPadTop = overflow && overflow.above && overflow.above.length ? 22 : 9;
+        const railPadBottom = overflow && overflow.below && overflow.below.length ? 22 : 9;
         levels.forEach((level) => {
             const y = geometry.yForPrice(level.price);
             if (y < geometry.top - 1 || y > geometry.top + geometry.plotHeight + 1) return;
@@ -846,28 +968,32 @@
             ctx.lineTo(geometry.left + geometry.plotWidth, Math.round(y) + 0.5);
             ctx.stroke();
             ctx.restore();
-            if (level.markers.length) activeLevels.push({ level, y, color: settings[0] });
+            const labelLevels = overflow && overflow.labelLevels;
+            const labeled = !labelLevels || labelLevels.indexOf(level) >= 0;
+            if (level.markers.length && labeled) activeLevels.push({ level, y, color: settings[0] });
         });
 
         const labelItems = activeLevels.sort((a, b) => a.y - b.y).map((item) => ({
             ...item,
             labelY: item.y
         }));
+        const railTop = geometry.top + railPadTop;
+        const railBottom = geometry.top + geometry.plotHeight - railPadBottom;
         labelItems.forEach((item, index) => {
             item.labelY = Math.max(
-                geometry.top + 9,
+                railTop,
                 index ? Math.max(item.y, labelItems[index - 1].labelY + 19) : item.y
             );
         });
-        const overflow = labelItems.length
-            ? labelItems[labelItems.length - 1].labelY - (geometry.top + geometry.plotHeight - 9)
+        const packedOverflow = labelItems.length
+            ? labelItems[labelItems.length - 1].labelY - railBottom
             : 0;
-        if (overflow > 0) {
+        if (packedOverflow > 0) {
             for (let index = labelItems.length - 1; index >= 0; index--) {
                 const nextY = index === labelItems.length - 1
-                    ? geometry.top + geometry.plotHeight - 9
+                    ? railBottom
                     : labelItems[index + 1].labelY - 19;
-                labelItems[index].labelY = Math.min(labelItems[index].labelY - overflow, nextY);
+                labelItems[index].labelY = Math.min(labelItems[index].labelY - packedOverflow, nextY);
             }
         }
         labelItems.forEach((item) => {
@@ -882,7 +1008,7 @@
             ctx.lineTo(x - 2, item.labelY);
             ctx.stroke();
             ctx.restore();
-            ctx.fillStyle = "rgba(3, 9, 7, 0.88)";
+            ctx.fillStyle = colors.labelBg;
             ctx.strokeStyle = item.color;
             ctx.setLineDash([]);
             ctx.lineWidth = 1;
@@ -893,6 +1019,76 @@
             ctx.fillStyle = item.color;
             ctx.textAlign = "center";
             ctx.fillText(label, x + labelWidth / 2, item.labelY + 0.5, labelWidth - 6);
+        });
+    }
+
+    function overflowChipText(levels, atTop, compact) {
+        const counts = { B: 0, S: 0, P: 0, G: 0 };
+        levels.forEach((level) => {
+            (level.markers || []).forEach((marker) => {
+                if (counts[marker] != null) counts[marker] += 1;
+            });
+        });
+        const parts = [];
+        if (compact) {
+            if (counts.S) parts.push("S" + counts.S);
+            else if (counts.P) parts.push("P" + counts.P);
+            if (counts.B) parts.push("B" + counts.B);
+        } else if (counts.S && counts.S === counts.P && !counts.B) {
+            parts.push("S·P" + counts.S);
+        } else {
+            if (counts.S) parts.push("S" + counts.S);
+            if (counts.P && counts.P !== counts.S) parts.push("P" + counts.P);
+            if (counts.B) parts.push("B" + counts.B);
+        }
+        if (counts.G) parts.push("G");
+        return (atTop ? "上 " : "下 ") + (parts.join("·") || String(levels.length));
+    }
+
+    function overflowChipColor(levels, colors) {
+        if (levels.some((level) => level.hasSell)) return colors.sell;
+        if (levels.some((level) => level.hasBuy)) return colors.buy;
+        if (levels.some((level) => level.hasPosition)) return colors.position;
+        if (levels.some((level) => level.isGrid)) return colors.grid;
+        return colors.muted;
+    }
+
+    function drawOverflowChips(ctx, above, below, geometry, colors, compact) {
+        const chips = [];
+        if (above.length) chips.push({
+            text: overflowChipText(above, true, compact),
+            color: overflowChipColor(above, colors),
+            y: geometry.top + 9
+        });
+        if (below.length) chips.push({
+            text: overflowChipText(below, false, compact),
+            color: overflowChipColor(below, colors),
+            y: geometry.top + geometry.plotHeight - 9
+        });
+        const labelWidth = Math.max(42, geometry.railRight - geometry.railLeft - 2);
+        const x = geometry.railLeft;
+        chips.forEach((chip) => {
+            ctx.save();
+            ctx.fillStyle = colors.labelBg;
+            ctx.strokeStyle = chip.color;
+            ctx.setLineDash([]);
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.roundRect(x, chip.y - 8, labelWidth, 16, 3);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = chip.color;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(chip.text, x + labelWidth / 2, chip.y + 0.5, labelWidth - 6);
+            ctx.beginPath();
+            ctx.strokeStyle = chip.color;
+            ctx.globalAlpha = 0.45;
+            ctx.setLineDash([2, 3]);
+            ctx.moveTo(geometry.plotRight, chip.y);
+            ctx.lineTo(x - 2, chip.y);
+            ctx.stroke();
+            ctx.restore();
         });
     }
 
@@ -938,7 +1134,10 @@
             "L " + fmt(candle.low, decimals) + "  C " + fmt(candle.close, decimals);
         const tooltipWidth = tooltip.offsetWidth || 178;
         const tooltipHeight = tooltip.offsetHeight || 58;
-        const left = Math.max(8, Math.min(width - tooltipWidth - 8, x + 13));
+        const preferLeft = x > width * 0.58;
+        const left = preferLeft
+            ? Math.max(8, x - tooltipWidth - 12)
+            : Math.max(8, Math.min(width - tooltipWidth - 8, x + 13));
         const top = Math.max(8, Math.min(height - tooltipHeight - 8, y - tooltipHeight / 2));
         tooltip.style.transform = "translate(" + left + "px," + top + "px)";
     }
@@ -985,7 +1184,8 @@
 
         const items = symbols.map((item) => {
             const bad = Boolean(item.abnormal || (risk.triggered && item.priceBelowMA));
-            const card = element("div", "risk-item " + (bad ? "bad" : "ok"));
+            const warn = !bad && Boolean(item.status) && item.status !== "正常";
+            const card = element("div", "risk-item " + (bad ? "bad" : (warn ? "warn" : "ok")));
             const top = element("div", "top");
             top.append(
                 element("strong", "", item.symbol || "—"),
@@ -1015,13 +1215,135 @@
         const items = logs.slice().reverse().map((item) => {
             const level = allowedLevels.has(item.level) ? item.level : "";
             const time = item.time ? formatTime(item.time) : "";
-            return element(
-                "div",
-                "log" + (level ? " " + level : ""),
-                "[" + time + (level ? " " + level : "") + "] " + (item.message || "")
+            const row = element("div", "log" + (level ? " " + level : ""));
+            row.append(
+                element("time", "log-time", time || "—"),
+                element("span", "log-level", level || "LOG"),
+                element("span", "log-msg", item.message || "")
             );
+            return row;
         });
         replaceChildren(box, items);
+    }
+
+    function pad2(value) {
+        return String(value).padStart(2, "0");
+    }
+
+    function parseFilledAt(value) {
+        if (!value) return null;
+        const date = value instanceof Date ? value : new Date(value);
+        return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    function startOfHour(date) {
+        return new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours(), 0, 0, 0);
+    }
+
+    function buildHourlyFillModel(orders, now, options) {
+        const current = now instanceof Date ? now : new Date(now || Date.now());
+        const maxHours = Math.max(1, Number(options && options.maxHours) || 24);
+        const parsed = [];
+        (orders || []).forEach((order) => {
+            const filledAt = parseFilledAt(order && order.filledAt);
+            const side = order && order.side === "BUY" ? "BUY" : (order && order.side === "SELL" ? "SELL" : "");
+            if (!filledAt || !side) return;
+            parsed.push({
+                filledAt,
+                side,
+                quantity: Number(order.quantity) || 0,
+                realizedPnl: Number(order.realizedPnl) || 0
+            });
+        });
+
+        const stats = {
+            total: parsed.length,
+            windowTotal: 0,
+            buyCount: 0,
+            sellCount: 0,
+            buyQty: 0,
+            sellQty: 0,
+            realizedPnl: 0,
+            peakHour: "",
+            peakCount: 0,
+            hours: 0,
+            activeHours: 0,
+            avgPerHour: 0,
+            windowLabel: ""
+        };
+        if (!parsed.length) {
+            return { buckets: [], stats, maxCount: 0 };
+        }
+
+        const latest = parsed.reduce((max, item) => item.filledAt > max ? item.filledAt : max, parsed[0].filledAt);
+        const earliest = parsed.reduce((min, item) => item.filledAt < min ? item.filledAt : min, parsed[0].filledAt);
+        const end = startOfHour(latest > current ? latest : current);
+        let start = startOfHour(earliest);
+        const oldestAllowed = new Date(end.getTime() - (maxHours - 1) * 3600000);
+        if (start < oldestAllowed) start = oldestAllowed;
+
+        const buckets = [];
+        const index = new Map();
+        for (let time = start.getTime(); time <= end.getTime(); time += 3600000) {
+            const hour = new Date(time);
+            const bucket = {
+                key: hour.getTime(),
+                hour,
+                label: pad2(hour.getHours()) + ":00",
+                dayLabel: pad2(hour.getMonth() + 1) + "/" + pad2(hour.getDate()),
+                buy: 0,
+                sell: 0,
+                buyQty: 0,
+                sellQty: 0,
+                pnl: 0
+            };
+            index.set(bucket.key, bucket);
+            buckets.push(bucket);
+        }
+
+        parsed.forEach((item) => {
+            const bucket = index.get(startOfHour(item.filledAt).getTime());
+            if (!bucket) return;
+            if (item.side === "BUY") {
+                bucket.buy += 1;
+                bucket.buyQty += item.quantity;
+            } else {
+                bucket.sell += 1;
+                bucket.sellQty += item.quantity;
+                bucket.pnl += item.realizedPnl;
+            }
+        });
+
+        let maxCount = 0;
+        let peakKey = -1;
+        const spansDays = buckets.length > 1 &&
+            buckets[0].dayLabel !== buckets[buckets.length - 1].dayLabel;
+        buckets.forEach((bucket) => {
+            const count = bucket.buy + bucket.sell;
+            stats.windowTotal += count;
+            stats.buyCount += bucket.buy;
+            stats.sellCount += bucket.sell;
+            stats.buyQty += bucket.buyQty;
+            stats.sellQty += bucket.sellQty;
+            stats.realizedPnl += bucket.pnl;
+            if (count > 0) stats.activeHours += 1;
+            if (bucket.buy > maxCount) maxCount = bucket.buy;
+            if (bucket.sell > maxCount) maxCount = bucket.sell;
+            if (count > stats.peakCount || (count === stats.peakCount && count > 0 && bucket.key > peakKey)) {
+                stats.peakCount = count;
+                stats.peakHour = bucket.label;
+                peakKey = bucket.key;
+            }
+            if (spansDays && bucket.hour.getHours() === 0) {
+                bucket.label = bucket.dayLabel + " " + bucket.label;
+            }
+        });
+        stats.hours = buckets.length;
+        stats.avgPerHour = stats.hours ? stats.windowTotal / stats.hours : 0;
+        stats.windowLabel = buckets.length
+            ? buckets[0].label + "–" + buckets[buckets.length - 1].label
+            : "";
+        return { buckets, stats, maxCount };
     }
 
     function renderTables(pos, quote) {
@@ -1029,6 +1351,7 @@
 
         const filledOrderCount = pos.filledOrderCount ?? filledOrders.length;
         setText($("filledCount"), "本次运行 · " + filledOrderCount + " 笔");
+        renderHourlyFills(filledOrders, pos, quote);
         const filledRows = filledOrders.map((order) => {
             const row = document.createElement("tr");
             const side = order.side === "BUY" ? "BUY" : (order.side === "SELL" ? "SELL" : "—");
@@ -1050,6 +1373,85 @@
             $("filledBody"),
             filledRows.length ? filledRows : [emptyRow("程序启动后暂无成交订单", 6)]
         );
+    }
+
+    function renderHourlyFills(orders, pos, quote) {
+        const qtyDecimals = pos.quantityDecimals || 4;
+        const model = buildHourlyFillModel(orders, Date.now());
+        const stats = model.stats;
+        const buyNode = $("fillBuyCount");
+        const sellNode = $("fillSellCount");
+        const pnlNode = $("fillPnl");
+        setText(buyNode, stats.buyCount + " 笔");
+        buyNode.classList.toggle("buy", stats.buyCount > 0);
+        setText(sellNode, stats.sellCount + " 笔");
+        sellNode.classList.toggle("sell", stats.sellCount > 0);
+        setText($("fillQty"), fmt(stats.buyQty, qtyDecimals) + " / " + fmt(stats.sellQty, qtyDecimals));
+        setText($("fillPeak"), stats.peakCount
+            ? stats.peakHour + " · " + stats.peakCount + " 笔"
+            : "—");
+        setText(pnlNode, stats.windowTotal ? fmtSigned(stats.realizedPnl, 6) + " " + quote : "—");
+        pnlNode.classList.remove("pos", "neg");
+        if (stats.windowTotal && stats.realizedPnl > 0) pnlNode.classList.add("pos");
+        if (stats.windowTotal && stats.realizedPnl < 0) pnlNode.classList.add("neg");
+        setText($("fillAvg"), stats.hours
+            ? fmt(stats.avgPerHour, 1) + " 笔/时"
+            : "—");
+        setText(
+            $("fillWindow"),
+            stats.hours
+                ? "本地时区 · " + stats.windowLabel + " · " + stats.activeHours + "/" + stats.hours + " 小时有成交"
+                : "等待成交"
+        );
+        setText($("fillAxisMax"), String(model.maxCount || 0));
+        setText($("fillAxisMid"), String(Math.ceil((model.maxCount || 0) / 2)));
+
+        const chart = $("fillHourlyChart");
+        const empty = $("fillHourlyEmpty");
+        const hasData = model.buckets.some((bucket) => bucket.buy + bucket.sell > 0);
+        empty.hidden = hasData;
+        chart.hidden = !hasData;
+        if (!hasData) {
+            setText($("fillHourlySummary"), "程序启动后暂无成交订单");
+            replaceChildren(chart, []);
+            return;
+        }
+
+        const columns = model.buckets.map((bucket) => {
+            const total = bucket.buy + bucket.sell;
+            const col = element("div", "hour-col" + (total ? "" : " is-empty"));
+            col.tabIndex = 0;
+            col.setAttribute(
+                "aria-label",
+                bucket.label + " 买单 " + bucket.buy + " 笔，卖单 " + bucket.sell + " 笔"
+            );
+            col.title = bucket.label + "  买 " + bucket.buy + " / 卖 " + bucket.sell;
+            const bars = element("div", "hour-bars");
+            bars.style.setProperty("--max", String(Math.max(model.maxCount, 1)));
+            bars.append(hourBar("buy", bucket.buy, "买"), hourBar("sell", bucket.sell, "卖"));
+            col.append(bars, element("div", "hour-label", bucket.label));
+            return col;
+        });
+        replaceChildren(chart, columns);
+        setText(
+            $("fillHourlySummary"),
+            "近 " + stats.hours + " 小时成交 " + stats.windowTotal + " 笔，买单 " +
+                stats.buyCount + "，卖单 " + stats.sellCount +
+                (stats.peakCount ? "，峰值在 " + stats.peakHour + " 共 " + stats.peakCount + " 笔" : "")
+        );
+    }
+
+    function hourBar(side, count, label) {
+        const wrap = element("div", "hour-bar-wrap");
+        const value = element("span", "hour-n", count ? String(count) : "");
+        value.setAttribute("aria-hidden", "true");
+        const track = element("div", "hour-track");
+        const bar = element("div", "hour-bar " + side + (count ? " is-on" : ""));
+        bar.style.setProperty("--n", String(count));
+        bar.setAttribute("title", label + " " + count);
+        track.appendChild(bar);
+        wrap.append(value, track);
+        return wrap;
     }
 
     function appendCell(row, label, value, className) {

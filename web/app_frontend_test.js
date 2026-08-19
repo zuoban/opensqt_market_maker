@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { buildKlineGridModel } = require("./static/app.js");
+const { buildKlineGridModel, buildHourlyFillModel } = require("./static/app.js");
 
 function fixture() {
     return {
@@ -85,6 +85,71 @@ test("outside grid levels are opt-in", () => {
     assert.deepEqual(outside.markers, []);
 });
 
+test("price scale follows candles instead of far grid slots", () => {
+    const data = fixture();
+    data.position.priceInterval = 1;
+    data.position.slots.push(
+        {
+            price: 70,
+            priceText: "70.00",
+            orderSide: "BUY",
+            orderStatus: "PLACED",
+            inBuyWindow: true
+        },
+        {
+            price: 130,
+            priceText: "130.00",
+            orderSide: "SELL",
+            orderStatus: "PLACED",
+            inSellWindow: true
+        }
+    );
+    const model = buildKlineGridModel(data.kline, data.position, false);
+
+    assert.ok(model.levels.some((item) => item.price === 70));
+    assert.ok(model.levels.some((item) => item.price === 130));
+    assert.ok(model.priceMin > 85, "far buy slot should not stretch the Y axis");
+    assert.ok(model.priceMax < 120, "far sell slot should not stretch the Y axis");
+    assert.ok(model.priceMin < 98);
+    assert.ok(model.priceMax > 104);
+    assert.equal(model.overflowBelow.some((item) => item.price === 70), true);
+    assert.equal(model.overflowAbove.some((item) => item.price === 130), true);
+    assert.equal(model.visibleLevels.some((item) => item.price === 99), true);
+    assert.ok(model.railLabels.some((item) => item.isGrid));
+    assert.ok(model.railLabels.some((item) => item.hasBuy));
+    assert.ok(model.railLabels.some((item) => item.hasSell));
+});
+
+test("edge grid slots fold into overflow while nearest orders stay labeled", () => {
+    const data = fixture();
+    data.position.priceInterval = 1;
+    data.position.slots.push(
+        {
+            price: 96.5,
+            priceText: "96.50",
+            orderSide: "BUY",
+            orderStatus: "PLACED",
+            inBuyWindow: true
+        },
+        {
+            price: 105.6,
+            priceText: "105.60",
+            orderSide: "SELL",
+            orderStatus: "PLACED",
+            inSellWindow: true
+        }
+    );
+    const model = buildKlineGridModel(data.kline, data.position, false);
+    const last = model.latest.close;
+
+    assert.ok(model.overflowBelow.some((item) => item.price === 96.5));
+    assert.ok(model.overflowAbove.some((item) => item.price === 105.6));
+    assert.equal(model.railLabels.some((item) => item.price === 96.5), false);
+    assert.equal(model.railLabels.some((item) => item.price === 105.6), false);
+    assert.ok(model.railLabels.some((item) => item.hasBuy && Math.abs(item.price - last) <= Math.abs(99 - last)));
+    assert.ok(model.railLabels.some((item) => item.hasSell));
+});
+
 test("visible candle count is capped for real-time canvas performance", () => {
     const candles = Array.from({ length: 520 }, (_, index) => ({
         time: 1_700_000_000_000 + index * 60_000,
@@ -97,4 +162,52 @@ test("visible candle count is capped for real-time canvas performance", () => {
 
     assert.equal(model.candles.length, 500);
     assert.equal(model.candles[0].time, candles[20].time);
+});
+
+test("hourly fill model groups buy and sell counts and stats", () => {
+    const now = new Date(2026, 7, 19, 15, 30, 0);
+    const model = buildHourlyFillModel([
+        { side: "BUY", filledAt: new Date(2026, 7, 19, 13, 10, 0), quantity: 0.01, realizedPnl: 0 },
+        { side: "BUY", filledAt: new Date(2026, 7, 19, 13, 40, 0), quantity: 0.02, realizedPnl: 0 },
+        { side: "SELL", filledAt: new Date(2026, 7, 19, 14, 5, 0), quantity: 0.01, realizedPnl: 0.12 },
+        { side: "SKIP", filledAt: new Date(2026, 7, 19, 14, 20, 0), quantity: 1, realizedPnl: 9 },
+        { side: "BUY", filledAt: "not-a-date", quantity: 1, realizedPnl: 0 }
+    ], now);
+
+    assert.equal(model.buckets.length, 3);
+    assert.equal(model.buckets[0].buy, 2);
+    assert.equal(model.buckets[0].sell, 0);
+    assert.equal(model.buckets[1].buy, 0);
+    assert.equal(model.buckets[1].sell, 1);
+    assert.equal(model.buckets[2].buy, 0);
+    assert.equal(model.stats.buyCount, 2);
+    assert.equal(model.stats.sellCount, 1);
+    assert.equal(model.stats.windowTotal, 3);
+    assert.equal(model.stats.peakCount, 2);
+    assert.equal(model.stats.peakHour, "13:00");
+    assert.ok(Math.abs(model.stats.buyQty - 0.03) < 1e-12);
+    assert.ok(Math.abs(model.stats.realizedPnl - 0.12) < 1e-12);
+    assert.equal(model.maxCount, 2);
+    assert.equal(model.buckets[0].label, "13:00");
+});
+
+test("hourly fill model is empty without valid fills", () => {
+    const model = buildHourlyFillModel([], new Date(2026, 7, 19, 12, 0, 0));
+    assert.deepEqual(model.buckets, []);
+    assert.equal(model.stats.total, 0);
+    assert.equal(model.maxCount, 0);
+});
+
+test("hourly fill model keeps the most recent 24 hours", () => {
+    const now = new Date(2026, 7, 20, 10, 15, 0);
+    const model = buildHourlyFillModel([
+        { side: "BUY", filledAt: new Date(2026, 7, 19, 8, 0, 0), quantity: 1 },
+        { side: "SELL", filledAt: new Date(2026, 7, 20, 9, 20, 0), quantity: 1, realizedPnl: 0.4 }
+    ], now, { maxHours: 24 });
+
+    assert.equal(model.buckets.length, 24);
+    assert.equal(model.stats.buyCount, 0);
+    assert.equal(model.stats.sellCount, 1);
+    assert.equal(model.stats.windowTotal, 1);
+    assert.equal(model.stats.peakHour, "09:00");
 });
