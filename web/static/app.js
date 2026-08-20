@@ -1245,13 +1245,18 @@
     }
 
     function renderRisk(risk) {
-        $("riskMsg").textContent = risk.lastMsg || (risk.enabled ? "等待风控读数" : "主动风控未启用");
-        const list = $("riskList");
-        if (!risk.enabled) {
-            replaceChildren(list, [element("div", "empty", "风控关闭")]);
-            return;
+        const panel = $("riskPanel");
+        const side = document.querySelector(".side");
+        const enabled = Boolean(risk.enabled);
+        if (panel) {
+            panel.hidden = !enabled;
+            panel.setAttribute("aria-hidden", enabled ? "false" : "true");
         }
+        if (side) side.classList.toggle("risk-off", !enabled);
+        if (!enabled) return;
 
+        $("riskMsg").textContent = risk.lastMsg || "等待风控读数";
+        const list = $("riskList");
         const symbols = risk.symbols || [];
         if (!symbols.length) {
             replaceChildren(list, [element("div", "empty", "暂无监控币种数据")]);

@@ -1026,6 +1026,7 @@ main { display: block; }
 }
 
 .side .panel { flex: 1 1 auto; }
+.risk-panel[hidden] { display: none; }
 .risk-panel::before { background: var(--warn); }
 .log-panel::before { background: var(--cyan); }
 
@@ -1705,6 +1706,7 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .board,
     .tables { grid-template-columns: 1fr; }
     .side { display: grid; grid-template-columns: 1fr 1fr; align-items: start; }
+    .side.risk-off { grid-template-columns: 1fr; }
     .logs { max-height: 240px; }
 }
 
