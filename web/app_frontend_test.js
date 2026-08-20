@@ -164,6 +164,10 @@ test("visible candle count is capped for real-time canvas performance", () => {
     assert.equal(model.candles[0].time, candles[20].time);
 });
 
+function hourBucket(model, date) {
+    return model.buckets.find((item) => item.hour.getTime() === date.getTime());
+}
+
 test("hourly fill model groups buy and sell counts and stats", () => {
     const now = new Date(2026, 7, 19, 15, 30, 0);
     const model = buildHourlyFillModel([
@@ -174,12 +178,15 @@ test("hourly fill model groups buy and sell counts and stats", () => {
         { side: "BUY", filledAt: "not-a-date", quantity: 1, realizedPnl: 0 }
     ], now);
 
-    assert.equal(model.buckets.length, 3);
-    assert.equal(model.buckets[0].buy, 2);
-    assert.equal(model.buckets[0].sell, 0);
-    assert.equal(model.buckets[1].buy, 0);
-    assert.equal(model.buckets[1].sell, 1);
-    assert.equal(model.buckets[2].buy, 0);
+    assert.equal(model.buckets.length, 24);
+    const thirteen = hourBucket(model, new Date(2026, 7, 19, 13, 0, 0));
+    const fourteen = hourBucket(model, new Date(2026, 7, 19, 14, 0, 0));
+    const fifteen = hourBucket(model, new Date(2026, 7, 19, 15, 0, 0));
+    assert.equal(thirteen.buy, 2);
+    assert.equal(thirteen.sell, 0);
+    assert.equal(fourteen.buy, 0);
+    assert.equal(fourteen.sell, 1);
+    assert.equal(fifteen.buy, 0);
     assert.equal(model.stats.buyCount, 2);
     assert.equal(model.stats.sellCount, 1);
     assert.equal(model.stats.windowTotal, 3);
@@ -188,14 +195,18 @@ test("hourly fill model groups buy and sell counts and stats", () => {
     assert.ok(Math.abs(model.stats.buyQty - 0.03) < 1e-12);
     assert.ok(Math.abs(model.stats.realizedPnl - 0.12) < 1e-12);
     assert.equal(model.maxCount, 2);
-    assert.equal(model.buckets[0].label, "13:00");
+    assert.equal(thirteen.label, "13:00");
 });
 
-test("hourly fill model is empty without valid fills", () => {
-    const model = buildHourlyFillModel([], new Date(2026, 7, 19, 12, 0, 0));
-    assert.deepEqual(model.buckets, []);
+test("hourly fill model always renders 24 empty hours without valid fills", () => {
+    const now = new Date(2026, 7, 19, 12, 0, 0);
+    const model = buildHourlyFillModel([], now);
+    assert.equal(model.buckets.length, 24);
     assert.equal(model.stats.total, 0);
+    assert.equal(model.stats.windowTotal, 0);
     assert.equal(model.maxCount, 0);
+    assert.equal(model.buckets[0].hour.getTime(), new Date(2026, 7, 18, 13, 0, 0).getTime());
+    assert.equal(model.buckets[23].hour.getTime(), now.getTime());
 });
 
 test("hourly fill model keeps the most recent 24 hours", () => {
@@ -210,4 +221,26 @@ test("hourly fill model keeps the most recent 24 hours", () => {
     assert.equal(model.stats.sellCount, 1);
     assert.equal(model.stats.windowTotal, 1);
     assert.equal(model.stats.peakHour, "09:00");
+    assert.equal(model.buckets[0].hour.getTime(), new Date(2026, 7, 19, 11, 0, 0).getTime());
+    assert.equal(model.buckets[23].hour.getTime(), new Date(2026, 7, 20, 10, 0, 0).getTime());
+});
+
+test("hourly fill model prefers snapshot 24h buckets over recent order list", () => {
+    const now = new Date(2026, 7, 20, 10, 15, 0);
+    const model = buildHourlyFillModel([
+        { side: "BUY", filledAt: new Date(2026, 7, 20, 10, 5, 0), quantity: 0.01 }
+    ], now, {
+        buckets: [
+            { hour: new Date(2026, 7, 19, 12, 0, 0), buy: 4, sell: 1, buyQty: 0.04, sellQty: 0.01, pnl: 0.2 },
+            { hour: new Date(2026, 7, 20, 9, 0, 0), buy: 0, sell: 3, buyQty: 0, sellQty: 0.03, pnl: 0.5 }
+        ]
+    });
+
+    assert.equal(model.buckets.length, 24);
+    assert.equal(model.stats.buyCount, 4);
+    assert.equal(model.stats.sellCount, 4);
+    assert.equal(model.stats.windowTotal, 8);
+    assert.equal(hourBucket(model, new Date(2026, 7, 19, 12, 0, 0)).buy, 4);
+    assert.equal(hourBucket(model, new Date(2026, 7, 20, 9, 0, 0)).sell, 3);
+    assert.equal(hourBucket(model, new Date(2026, 7, 20, 10, 0, 0)).buy, 0);
 });

@@ -33,7 +33,10 @@ type OrderUpdate struct {
 	RealizedPNLIncremental bool
 }
 
-const maxFilledOrderRecords = 200
+const (
+	maxRecentFilledOrders = 20
+	hourlyFillHours       = 24
+)
 
 // FilledOrderRecord 本次程序运行期间完成成交的订单。
 type FilledOrderRecord struct {
@@ -45,6 +48,24 @@ type FilledOrderRecord struct {
 	Quantity      float64   `json:"quantity"`
 	FilledAt      time.Time `json:"filledAt"`
 	RealizedPNL   float64   `json:"realizedPnl"`
+}
+
+// HourlyFillBucket 本地时区下一小时的成交汇总，供订单汇总图使用。
+type HourlyFillBucket struct {
+	Hour    time.Time `json:"hour"`
+	Buy     int       `json:"buy"`
+	Sell    int       `json:"sell"`
+	BuyQty  float64   `json:"buyQty"`
+	SellQty float64   `json:"sellQty"`
+	Pnl     float64   `json:"pnl"`
+}
+
+type hourlyFillAcc struct {
+	buy     int
+	sell    int
+	buyQty  float64
+	sellQty float64
+	pnl     float64
 }
 
 // OrderExecutorInterface 订单执行器接口（避免循环导入）
@@ -182,10 +203,12 @@ type SuperPositionManager struct {
 	lastReconcileTime atomic.Value // time.Time - 最后对账时间
 	pnlMu             sync.Mutex   // 保护 realizedPNL 累加
 
-	// 本次运行期间的成交订单，按完成时间保留最近 maxFilledOrderRecords 笔。
+	// 本次运行期间的成交订单：列表面板只保留最近 maxRecentFilledOrders 笔，
+	// 小时汇总单独累计近 hourlyFillHours 小时，避免列表截断影响图表。
 	filledOrdersMu   sync.RWMutex
 	filledOrders     []FilledOrderRecord
 	filledOrderKeys  map[string]struct{}
+	filledHourly     map[int64]*hourlyFillAcc
 	filledOrderCount int64
 
 	// 初始化标志
@@ -210,6 +233,7 @@ func NewSuperPositionManager(cfg *config.Config, executor OrderExecutorInterface
 		priceDecimals:      priceDecimals,
 		quantityDecimals:   quantityDecimals,
 		filledOrderKeys:    make(map[string]struct{}),
+		filledHourly:       make(map[int64]*hourlyFillAcc),
 	}
 	spm.totalBuyQty.Store(0.0)
 	spm.totalSellQty.Store(0.0)
@@ -932,14 +956,70 @@ func (spm *SuperPositionManager) recordFilledOrder(update OrderUpdate, side stri
 	spm.filledOrderKeys[key] = struct{}{}
 	spm.filledOrders = append(spm.filledOrders, record)
 	spm.filledOrderCount++
-	if len(spm.filledOrders) > maxFilledOrderRecords {
-		oldest := spm.filledOrders[0]
-		delete(spm.filledOrderKeys, filledOrderKey(OrderUpdate{
-			OrderID:       oldest.OrderID,
-			ClientOrderID: oldest.ClientOrderID,
-		}))
-		spm.filledOrders = spm.filledOrders[1:]
+	if len(spm.filledOrders) > maxRecentFilledOrders {
+		spm.filledOrders = append([]FilledOrderRecord(nil), spm.filledOrders[len(spm.filledOrders)-maxRecentFilledOrders:]...)
 	}
+	spm.addHourlyFillLocked(record, time.Now())
+}
+
+func startOfLocalHour(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Time{}
+	}
+	local := t.In(time.Local)
+	return time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), 0, 0, 0, local.Location())
+}
+
+func (spm *SuperPositionManager) addHourlyFillLocked(record FilledOrderRecord, now time.Time) {
+	if spm.filledHourly == nil {
+		spm.filledHourly = make(map[int64]*hourlyFillAcc)
+	}
+	hour := startOfLocalHour(record.FilledAt)
+	if hour.IsZero() {
+		hour = startOfLocalHour(now)
+	}
+	key := hour.Unix()
+	acc := spm.filledHourly[key]
+	if acc == nil {
+		acc = &hourlyFillAcc{}
+		spm.filledHourly[key] = acc
+	}
+	if record.Side == "SELL" {
+		acc.sell++
+		acc.sellQty += record.Quantity
+		acc.pnl += record.RealizedPNL
+	} else {
+		acc.buy++
+		acc.buyQty += record.Quantity
+	}
+	spm.pruneHourlyFillsLocked(now)
+}
+
+func (spm *SuperPositionManager) pruneHourlyFillsLocked(now time.Time) {
+	oldest := startOfLocalHour(now).Add(-time.Duration(hourlyFillHours-1) * time.Hour).Unix()
+	for hour := range spm.filledHourly {
+		if hour < oldest {
+			delete(spm.filledHourly, hour)
+		}
+	}
+}
+
+func (spm *SuperPositionManager) hourlyFillSnapshotLocked(now time.Time) []HourlyFillBucket {
+	end := startOfLocalHour(now)
+	start := end.Add(-time.Duration(hourlyFillHours-1) * time.Hour)
+	buckets := make([]HourlyFillBucket, 0, hourlyFillHours)
+	for hour := start; !hour.After(end); hour = hour.Add(time.Hour) {
+		bucket := HourlyFillBucket{Hour: hour}
+		if acc := spm.filledHourly[hour.Unix()]; acc != nil {
+			bucket.Buy = acc.buy
+			bucket.Sell = acc.sell
+			bucket.BuyQty = acc.buyQty
+			bucket.SellQty = acc.sellQty
+			bucket.Pnl = acc.pnl
+		}
+		buckets = append(buckets, bucket)
+	}
+	return buckets
 }
 
 func timestampToTime(timestamp int64) time.Time {

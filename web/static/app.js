@@ -320,6 +320,7 @@
         updateSection("logs", snapshot.logs || [], () => renderLogs(snapshot.logs || []));
         updateSection("tables", {
             filledOrders: pos.filledOrders || [],
+            filledHourly: pos.filledHourly || [],
             filledOrderCount: pos.filledOrderCount,
             priceDecimals: pos.priceDecimals,
             quantityDecimals: pos.quantityDecimals,
@@ -1243,6 +1244,7 @@
     function buildHourlyFillModel(orders, now, options) {
         const current = now instanceof Date ? now : new Date(now || Date.now());
         const maxHours = Math.max(1, Number(options && options.maxHours) || 24);
+        const snapshotBuckets = options && options.buckets;
         const parsed = [];
         (orders || []).forEach((order) => {
             const filledAt = parseFilledAt(order && order.filledAt);
@@ -1271,17 +1273,9 @@
             avgPerHour: 0,
             windowLabel: ""
         };
-        if (!parsed.length) {
-            return { buckets: [], stats, maxCount: 0 };
-        }
 
-        const latest = parsed.reduce((max, item) => item.filledAt > max ? item.filledAt : max, parsed[0].filledAt);
-        const earliest = parsed.reduce((min, item) => item.filledAt < min ? item.filledAt : min, parsed[0].filledAt);
-        const end = startOfHour(latest > current ? latest : current);
-        let start = startOfHour(earliest);
-        const oldestAllowed = new Date(end.getTime() - (maxHours - 1) * 3600000);
-        if (start < oldestAllowed) start = oldestAllowed;
-
+        const end = startOfHour(current);
+        const start = new Date(end.getTime() - (maxHours - 1) * 3600000);
         const buckets = [];
         const index = new Map();
         for (let time = start.getTime(); time <= end.getTime(); time += 3600000) {
@@ -1301,18 +1295,31 @@
             buckets.push(bucket);
         }
 
-        parsed.forEach((item) => {
-            const bucket = index.get(startOfHour(item.filledAt).getTime());
-            if (!bucket) return;
-            if (item.side === "BUY") {
-                bucket.buy += 1;
-                bucket.buyQty += item.quantity;
-            } else {
-                bucket.sell += 1;
-                bucket.sellQty += item.quantity;
-                bucket.pnl += item.realizedPnl;
-            }
-        });
+        if (Array.isArray(snapshotBuckets) && snapshotBuckets.length) {
+            snapshotBuckets.forEach((item) => {
+                const hour = parseFilledAt(item && item.hour);
+                const bucket = hour ? index.get(startOfHour(hour).getTime()) : null;
+                if (!bucket) return;
+                bucket.buy += Number(item.buy) || 0;
+                bucket.sell += Number(item.sell) || 0;
+                bucket.buyQty += Number(item.buyQty) || 0;
+                bucket.sellQty += Number(item.sellQty) || 0;
+                bucket.pnl += Number(item.pnl) || 0;
+            });
+        } else {
+            parsed.forEach((item) => {
+                const bucket = index.get(startOfHour(item.filledAt).getTime());
+                if (!bucket) return;
+                if (item.side === "BUY") {
+                    bucket.buy += 1;
+                    bucket.buyQty += item.quantity;
+                } else {
+                    bucket.sell += 1;
+                    bucket.sellQty += item.quantity;
+                    bucket.pnl += item.realizedPnl;
+                }
+            });
+        }
 
         let maxCount = 0;
         let peakKey = -1;
@@ -1348,11 +1355,17 @@
 
     function renderTables(pos, quote) {
         const filledOrders = pos.filledOrders || [];
+        const recentOrders = filledOrders.slice(0, 20);
 
         const filledOrderCount = pos.filledOrderCount ?? filledOrders.length;
-        setText($("filledCount"), "本次运行 · " + filledOrderCount + " 笔");
+        setText(
+            $("filledCount"),
+            filledOrderCount
+                ? "本次运行 · " + filledOrderCount + " 笔 · 列表最近 " + recentOrders.length
+                : "本次运行 · 0 笔"
+        );
         renderHourlyFills(filledOrders, pos, quote);
-        const filledRows = filledOrders.map((order) => {
+        const filledRows = recentOrders.map((order) => {
             const row = document.createElement("tr");
             const side = order.side === "BUY" ? "BUY" : (order.side === "SELL" ? "SELL" : "—");
             const pnl = Number(order.realizedPnl || 0);
@@ -1377,7 +1390,7 @@
 
     function renderHourlyFills(orders, pos, quote) {
         const qtyDecimals = pos.quantityDecimals || 4;
-        const model = buildHourlyFillModel(orders, Date.now());
+        const model = buildHourlyFillModel(orders, Date.now(), { buckets: pos.filledHourly, maxHours: 24 });
         const stats = model.stats;
         const buyNode = $("fillBuyCount");
         const sellNode = $("fillSellCount");
@@ -1400,8 +1413,8 @@
         setText(
             $("fillWindow"),
             stats.hours
-                ? "本地时区 · " + stats.windowLabel + " · " + stats.activeHours + "/" + stats.hours + " 小时有成交"
-                : "等待成交"
+                ? "近 24 小时 · " + stats.windowLabel + " · " + stats.activeHours + "/" + stats.hours + " 小时有成交"
+                : "近 24 小时"
         );
         setText($("fillAxisMax"), String(model.maxCount || 0));
         setText($("fillAxisMid"), String(Math.ceil((model.maxCount || 0) / 2)));

@@ -100,7 +100,7 @@ func TestFilledSellOrderAccumulatesRealizedPNL(t *testing.T) {
 
 func TestFilledOrdersKeepNewestRecords(t *testing.T) {
 	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
-	for i := 1; i <= maxFilledOrderRecords+1; i++ {
+	for i := 1; i <= maxRecentFilledOrders+1; i++ {
 		spm.recordFilledOrder(OrderUpdate{
 			OrderID:       int64(i),
 			ClientOrderID: fmt.Sprintf("filled-%d", i),
@@ -110,16 +110,75 @@ func TestFilledOrdersKeepNewestRecords(t *testing.T) {
 	}
 
 	snap := spm.Snapshot()
-	if len(snap.FilledOrders) != maxFilledOrderRecords {
-		t.Fatalf("filled orders = %d, want %d", len(snap.FilledOrders), maxFilledOrderRecords)
+	if len(snap.FilledOrders) != maxRecentFilledOrders {
+		t.Fatalf("filled orders = %d, want %d", len(snap.FilledOrders), maxRecentFilledOrders)
 	}
-	if snap.FilledOrderCount != maxFilledOrderRecords+1 {
-		t.Fatalf("filled order count = %d, want %d", snap.FilledOrderCount, maxFilledOrderRecords+1)
+	if snap.FilledOrderCount != maxRecentFilledOrders+1 {
+		t.Fatalf("filled order count = %d, want %d", snap.FilledOrderCount, maxRecentFilledOrders+1)
 	}
-	if snap.FilledOrders[0].OrderID != int64(maxFilledOrderRecords+1) {
+	if snap.FilledOrders[0].OrderID != int64(maxRecentFilledOrders+1) {
 		t.Fatalf("newest order id = %d", snap.FilledOrders[0].OrderID)
 	}
 	if snap.FilledOrders[len(snap.FilledOrders)-1].OrderID != 2 {
 		t.Fatalf("oldest retained order id = %d", snap.FilledOrders[len(snap.FilledOrders)-1].OrderID)
+	}
+}
+
+func TestHourlyFillsKeep24HoursAfterListTrim(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
+	now := time.Now()
+	oldHour := now.Add(-5 * time.Hour)
+	spm.recordFilledOrder(OrderUpdate{
+		OrderID:       1,
+		ClientOrderID: "old-buy",
+		ExecutedQty:   0.1,
+		AvgPrice:      100,
+		UpdateTime:    oldHour.UnixMilli(),
+	}, "BUY", 0, 0, 0)
+	for i := 2; i <= maxRecentFilledOrders+2; i++ {
+		spm.recordFilledOrder(OrderUpdate{
+			OrderID:       int64(i),
+			ClientOrderID: fmt.Sprintf("new-%d", i),
+			ExecutedQty:   0.01,
+			AvgPrice:      101,
+			UpdateTime:    now.UnixMilli(),
+		}, "SELL", 0, 0, 0.02)
+	}
+
+	snap := spm.Snapshot()
+	if len(snap.FilledOrders) != maxRecentFilledOrders {
+		t.Fatalf("filled orders = %d, want %d", len(snap.FilledOrders), maxRecentFilledOrders)
+	}
+	for _, order := range snap.FilledOrders {
+		if order.OrderID == 1 {
+			t.Fatal("list should not keep the 5-hour-old fill after trim")
+		}
+	}
+	if len(snap.FilledHourly) != hourlyFillHours {
+		t.Fatalf("hourly buckets = %d, want %d", len(snap.FilledHourly), hourlyFillHours)
+	}
+
+	var oldBucket, latestBucket HourlyFillBucket
+	oldKey := startOfLocalHour(oldHour).Unix()
+	latestKey := startOfLocalHour(now).Unix()
+	for _, bucket := range snap.FilledHourly {
+		switch bucket.Hour.Unix() {
+		case oldKey:
+			oldBucket = bucket
+		case latestKey:
+			latestBucket = bucket
+		}
+	}
+	if oldBucket.Buy != 1 || oldBucket.Sell != 0 {
+		t.Fatalf("old hour bucket = %+v, want buy=1", oldBucket)
+	}
+	if latestBucket.Sell != maxRecentFilledOrders+1 {
+		t.Fatalf("latest hour sell = %d, want %d", latestBucket.Sell, maxRecentFilledOrders+1)
+	}
+	if !snap.FilledHourly[0].Hour.Equal(startOfLocalHour(now).Add(-time.Duration(hourlyFillHours-1)*time.Hour)) {
+		t.Fatalf("window start = %s", snap.FilledHourly[0].Hour)
+	}
+	if !snap.FilledHourly[len(snap.FilledHourly)-1].Hour.Equal(startOfLocalHour(now)) {
+		t.Fatalf("window end = %s", snap.FilledHourly[len(snap.FilledHourly)-1].Hour)
 	}
 }

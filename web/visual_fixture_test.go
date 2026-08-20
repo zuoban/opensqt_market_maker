@@ -83,7 +83,7 @@ func visualFixtureSnapshot() map[string]interface{} {
 	}
 
 	latest := candles[len(candles)-1]["close"]
-	filledOrders := visualFilledOrders()
+	filledOrders, filledHourly := visualFilledOrders()
 	return map[string]interface{}{
 		"time":      time.Now(),
 		"version":   "visual-fixture",
@@ -105,7 +105,8 @@ func visualFixtureSnapshot() map[string]interface{} {
 			"filledSlotCount": 2, "positionQty": 0.025, "activeBuyOrders": 1, "activeSellOrders": 2,
 			"totalBuyQty": 1.26, "totalSellQty": 1.19, "estimatedProfit": 7.14, "realizedPnl": 6.82,
 			"filledOrders":     filledOrders,
-			"filledOrderCount": int64(len(filledOrders)),
+			"filledHourly":     filledHourly,
+			"filledOrderCount": int64(48),
 		},
 		"risk": map[string]interface{}{
 			"enabled": true, "triggered": false, "lastMsg": "监控正常 · 量价均在阈值内",
@@ -133,30 +134,42 @@ func visualFixtureSnapshot() map[string]interface{} {
 	}
 }
 
-func visualFilledOrders() []interface{} {
-	buyPattern := []int{2, 1, 3, 0, 2, 4, 1, 2, 1}
-	sellPattern := []int{1, 2, 1, 2, 3, 1, 2, 0, 2}
-	orders := make([]interface{}, 0, 32)
+func visualFilledOrders() ([]interface{}, []interface{}) {
+	buyPattern := []int{1, 0, 2, 1, 3, 0, 2, 4, 1, 2, 0, 1, 2, 1, 3, 0, 2, 4, 1, 2, 1, 0, 3, 2}
+	sellPattern := []int{0, 1, 1, 2, 1, 2, 3, 1, 2, 0, 2, 1, 1, 2, 1, 2, 3, 1, 2, 0, 2, 1, 2, 3}
+	orders := make([]interface{}, 0, 64)
+	hourly := make([]interface{}, 0, 24)
 	seq := 1
 	now := time.Now()
-	for i, hoursAgo := 0, 8; i < 9; i, hoursAgo = i+1, hoursAgo-1 {
-		base := now.Add(-time.Duration(hoursAgo) * time.Hour)
-		for n := 0; n < buyPattern[i]; n++ {
+	end := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+	for i := 0; i < 24; i++ {
+		hour := end.Add(time.Duration(i-23) * time.Hour)
+		buy := buyPattern[i]
+		sell := sellPattern[i]
+		hourly = append(hourly, map[string]interface{}{
+			"hour":    hour,
+			"buy":     buy,
+			"sell":    sell,
+			"buyQty":  float64(buy) * 0.0071,
+			"sellQty": float64(sell) * 0.0068,
+			"pnl":     float64(sell) * 0.12,
+		})
+		for n := 0; n < buy; n++ {
 			orders = append(orders, map[string]interface{}{
-				"filledAt":    base.Add(time.Duration(6+n*5) * time.Minute),
+				"filledAt":    hour.Add(time.Duration(6+n*5) * time.Minute),
 				"side":        "BUY",
-				"price":       4210.0 + float64(hoursAgo),
+				"price":       4210.0 + float64(i),
 				"quantity":    0.0071,
 				"realizedPnl": 0,
 				"orderId":     seq,
 			})
 			seq++
 		}
-		for n := 0; n < sellPattern[i]; n++ {
+		for n := 0; n < sell; n++ {
 			orders = append(orders, map[string]interface{}{
-				"filledAt":    base.Add(time.Duration(18+n*4) * time.Minute),
+				"filledAt":    hour.Add(time.Duration(18+n*4) * time.Minute),
 				"side":        "SELL",
-				"price":       4230.0 + float64(hoursAgo),
+				"price":       4230.0 + float64(i),
 				"quantity":    0.0068,
 				"realizedPnl": 0.12 + float64(n)*0.03,
 				"orderId":     seq,
@@ -164,7 +177,13 @@ func visualFilledOrders() []interface{} {
 			seq++
 		}
 	}
-	return orders
+	if len(orders) > 20 {
+		orders = orders[len(orders)-20:]
+		for i, j := 0, len(orders)-1; i < j; i, j = i+1, j-1 {
+			orders[i], orders[j] = orders[j], orders[i]
+		}
+	}
+	return orders, hourly
 }
 
 func TestVisualFixtureSnapshotJSON(t *testing.T) {

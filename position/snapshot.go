@@ -43,6 +43,7 @@ type PositionSnapshot struct {
 	SellWindowPrices     []float64           `json:"sellWindowPrices"`
 	Slots                []SlotSnapshot      `json:"slots"`
 	FilledOrders         []FilledOrderRecord `json:"filledOrders"`
+	FilledHourly         []HourlyFillBucket  `json:"filledHourly"`
 	FilledOrderCount     int64               `json:"filledOrderCount"`
 	FilledSlotCount      int                 `json:"filledSlotCount"`
 	PositionQty          float64             `json:"positionQty"`
@@ -120,6 +121,7 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	for i := range spm.filledOrders {
 		snap.FilledOrders[len(spm.filledOrders)-1-i] = spm.filledOrders[i]
 	}
+	snap.FilledHourly = spm.hourlyFillSnapshotLocked(time.Now())
 	snap.FilledOrderCount = spm.filledOrderCount
 	spm.filledOrdersMu.RUnlock()
 

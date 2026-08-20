@@ -175,7 +175,7 @@
                             <span>04 / EXECUTION TAPE</span>
                             <h2>成交订单</h2>
                         </div>
-                        <span class="panel-meta" id="filledCount">本次运行 · 0 笔</span>
+                        <span class="panel-meta" id="filledCount">本次运行 · 0 笔 · 列表最近 20</span>
                     </div>
                     <div class="chart-stats fill-hourly-stats" aria-label="成交统计">
                         <div class="chart-stat">
@@ -207,7 +207,7 @@
                         <div class="fill-hourly-legend">
                             <span class="fill-key buy">B 买单</span>
                             <span class="fill-key sell">S 卖单</span>
-                            <span class="fill-hourly-window" id="fillWindow">等待成交</span>
+                            <span class="fill-hourly-window" id="fillWindow">近 24 小时</span>
                         </div>
                         <div class="fill-hourly-stage">
                             <div class="fill-hourly-axis" aria-hidden="true">
@@ -218,14 +218,14 @@
                             <div class="fill-hourly-chart" id="fillHourlyChart" tabindex="0"
                                 role="img" aria-labelledby="fillHourlySummary"></div>
                             <div class="fill-hourly-empty" id="fillHourlyEmpty">
-                                程序启动后暂无成交，柱状图将按小时统计买卖笔数
+                                近 24 小时暂无成交，柱状图将按小时统计买卖笔数
                             </div>
                         </div>
                         <p class="sr-only" id="fillHourlySummary" role="status">等待成交数据</p>
                     </div>
                     <div class="table-wrap">
                         <table class="filled-orders-table">
-                            <caption class="sr-only">程序启动后的成交订单</caption>
+                            <caption class="sr-only">最近 20 笔成交订单</caption>
                             <thead>
                                 <tr><th scope="col">成交时间</th><th scope="col">方向</th><th scope="col">成交均价</th><th scope="col">成交数量</th><th scope="col">已实现盈亏</th><th scope="col">ID</th></tr>
                             </thead>

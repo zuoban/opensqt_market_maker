@@ -1267,12 +1267,12 @@ main { display: block; }
 
 .hour-col {
     display: flex;
-    flex: 1 0 40px;
-    min-width: 40px;
-    max-width: 88px;
+    flex: 1 1 0;
+    min-width: 28px;
+    max-width: none;
     flex-direction: column;
     gap: 6px;
-    padding: 0 2px;
+    padding: 0 1px;
     border-radius: 6px;
     outline-offset: -2px;
 }
@@ -1346,13 +1346,15 @@ main { display: block; }
 }
 
 .hour-label {
+    overflow: hidden;
     color: var(--muted);
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: 9px;
     font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.04em;
     line-height: 1.2;
     text-align: center;
+    text-overflow: ellipsis;
     white-space: nowrap;
 }
 
