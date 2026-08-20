@@ -72,6 +72,9 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	if !snap.Initialized {
 		t.Fatal("expected initialized")
 	}
+	if snap.AnchorPrice != 100 {
+		t.Fatalf("anchor price = %v, want startup snapshot 100", snap.AnchorPrice)
+	}
 	if snap.BaseAsset != "ETH" {
 		t.Fatalf("base asset: %s", snap.BaseAsset)
 	}

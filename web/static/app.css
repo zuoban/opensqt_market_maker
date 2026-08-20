@@ -516,6 +516,7 @@ main { display: block; }
 
 .kpi:has(.val.pos)::after { background: var(--positive); }
 .kpi:has(.val.neg)::after { background: var(--negative); }
+.kpi:has(.val.snapshot)::after { background: var(--cyan); }
 .kpi:has(.val.warn)::after,
 .kpi:has(.hint.warn)::after { background: var(--warn); }
 
@@ -550,6 +551,8 @@ main { display: block; }
 
 .kpi .val.neg,
 .kpi .hint.neg { color: var(--negative); }
+
+.kpi .val.snapshot { color: var(--cyan); }
 
 .kpi .val.warn,
 .kpi .hint.warn { color: var(--warn); }
@@ -649,7 +652,7 @@ main { display: block; }
 
 .strategy-kpis {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 8px;
     padding: 0 8px 8px;
 }
@@ -664,7 +667,7 @@ main { display: block; }
 
 .board {
     display: grid;
-    grid-template-columns: minmax(0, 1.58fr) minmax(320px, 0.82fr);
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
     margin-top: 22px;
 }
@@ -1018,14 +1021,11 @@ main { display: block; }
     letter-spacing: 0.08em;
 }
 
-.side {
-    display: flex;
+.status-strip {
     min-width: 0;
-    flex-direction: column;
-    gap: 12px;
 }
 
-.side .panel { flex: 1 1 auto; }
+.status-strip.risk-off { display: none; }
 .risk-panel[hidden] { display: none; }
 .risk-panel::before { background: var(--warn); }
 .log-panel::before { background: var(--cyan); }
@@ -1039,8 +1039,8 @@ main { display: block; }
 }
 
 .risk-list {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
     gap: 8px;
     padding: 0 14px 14px;
 }
@@ -1100,6 +1100,10 @@ main { display: block; }
 .risk-item.warn .status { color: var(--warn); }
 
 .log-panel { min-height: 0; }
+
+.log-panel .panel-head {
+    background: linear-gradient(90deg, rgba(94, 198, 255, 0.055), transparent 46%);
+}
 
 .logs {
     max-height: 298px;
@@ -1163,6 +1167,20 @@ main { display: block; }
     grid-template-columns: minmax(0, 1fr);
     gap: 12px;
     margin-top: 12px;
+}
+
+.activity {
+    margin-top: 12px;
+}
+
+.activity .logs {
+    max-height: min(340px, 42vh);
+    padding: 8px 16px 12px;
+}
+
+.activity .log {
+    grid-template-columns: 84px 60px minmax(0, 1fr);
+    padding-block: 9px;
 }
 
 .filled-orders-panel::before { background: var(--cyan); }
@@ -1447,7 +1465,7 @@ table {
 th,
 td {
     min-width: 0;
-    padding: 11px 15px;
+    padding: 9px 14px;
     border-bottom: 1px solid var(--line);
     text-align: left;
 }
@@ -1468,17 +1486,34 @@ th {
 tbody tr { transition: background-color 140ms ease-out; }
 tbody tr:last-child td { border-bottom: 0; }
 td { overflow-wrap: anywhere; color: var(--ink); }
-.filled-orders-table { min-width: 770px; }
-.fill-time { color: var(--muted); white-space: nowrap; }
+.filled-orders-table {
+    min-width: 580px;
+    table-layout: fixed;
+}
+
+.filled-orders-table th:nth-child(1) { width: 24%; }
+.filled-orders-table th:nth-child(2) { width: 32%; }
+.filled-orders-table th:nth-child(3) { width: 30%; }
+.filled-orders-table th:nth-child(4) { width: 14%; }
+
+.fill-when { white-space: nowrap; }
+
+.fill-relative {
+    display: inline-block;
+    min-width: 64px;
+    color: var(--ink);
+    font-weight: 650;
+}
 
 .trade-side {
     display: inline-flex;
-    min-width: 52px;
+    min-width: 30px;
     justify-content: center;
     align-items: center;
-    padding: 2px 7px;
+    margin-left: 8px;
+    padding: 2px 6px;
     border-radius: 999px;
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 800;
     letter-spacing: 0.05em;
 }
@@ -1493,38 +1528,38 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     background: rgba(62, 224, 164, 0.12);
 }
 
+.fill-execution { white-space: nowrap; }
+
+.fill-price {
+    color: var(--ink-strong);
+    font-weight: 650;
+}
+
+.fill-quantity {
+    margin-left: 10px;
+    color: var(--muted);
+    font-size: 11px;
+}
+
 .fill-pnl { font-weight: 650; white-space: nowrap; }
 .fill-pnl.pos { color: var(--positive); }
 .fill-pnl.neg { color: var(--negative); }
 
-.order-id {
-    display: flex;
-    min-width: 0;
-    align-items: center;
-    gap: 8px;
-}
-
-.order-code {
-    min-width: 0;
-    color: var(--muted);
-    font: inherit;
-    white-space: nowrap;
-}
+.order-action { text-align: right; }
 
 .copy-id {
-    flex: 0 0 auto;
-    min-width: 52px;
-    min-height: 36px;
-    padding: 0 12px;
+    min-width: 58px;
+    min-height: 30px;
+    padding: 0 9px;
     touch-action: manipulation;
     border: 1px solid var(--line);
-    border-radius: 8px;
-    color: var(--ink);
-    background: rgba(8, 12, 14, 0.55);
+    border-radius: 6px;
+    color: var(--muted);
+    background: transparent;
     font-family: var(--font-sans);
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 700;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.03em;
     transition: border-color var(--ease), background-color var(--ease), color var(--ease);
 }
 
@@ -1536,8 +1571,6 @@ td { overflow-wrap: anywhere; color: var(--ink); }
 .copy-id:active {
     background: rgba(46, 230, 166, 0.12);
 }
-
-.order-id-short { display: none; }
 
 .empty,
 .muted {
@@ -1677,7 +1710,6 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .strategy-kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .fill-hourly-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-    .board { grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.8fr); }
 }
 
 @media (max-width: 980px) {
@@ -1705,8 +1737,6 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     }
     .board,
     .tables { grid-template-columns: 1fr; }
-    .side { display: grid; grid-template-columns: 1fr 1fr; align-items: start; }
-    .side.risk-off { grid-template-columns: 1fr; }
     .logs { max-height: 240px; }
 }
 
@@ -1730,7 +1760,8 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     #section-account,
     #section-market,
     #section-status,
-    #section-fills {
+    #section-fills,
+    #section-logs {
         scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 108px);
     }
 
@@ -1829,7 +1860,7 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .strategy-kpis { grid-template-columns: 1fr 1fr; }
 
     .board { margin-top: 16px; }
-    .side { grid-template-columns: 1fr; }
+    .risk-list { grid-template-columns: 1fr; }
     .panel { border-radius: 10px; }
     .panel-head { min-height: 58px; padding: 10px 13px; }
     .panel-title h2 { font-size: 17px; }
@@ -1916,11 +1947,11 @@ td { overflow-wrap: anywhere; color: var(--ink); }
         border: 0;
     }
 
-    tbody tr {
+    .filled-orders-table tbody tr {
         display: grid;
         grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-        gap: 12px 16px;
-        padding: 14px;
+        gap: 10px 14px;
+        padding: 12px;
         border-bottom: 1px solid var(--line);
     }
 
@@ -1941,32 +1972,15 @@ td { overflow-wrap: anywhere; color: var(--ink); }
         letter-spacing: 0.07em;
     }
 
-    tbody td.order-id,
-    tbody td.muted { grid-column: 1 / -1; }
-
-    tbody td.order-id {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
-        align-items: end;
-        gap: 8px;
-    }
-
-    tbody td.order-id::before { grid-column: 1 / -1; margin-bottom: 0; }
-
-    tbody td.trade-side {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 6px;
-    }
-
-    tbody td.trade-side::before { margin-bottom: 0; }
-
-    .filled-orders-table .fill-pnl { grid-column: 1 / -1; }
-    .order-code { white-space: normal; }
-    .order-id-full { display: none; }
-    .order-id-short { display: inline; }
-    .copy-id { min-height: 40px; min-width: 56px; }
+    .filled-orders-table tbody td::before { display: none; }
+    .filled-orders-table tbody td.muted { grid-column: 1 / -1; }
+    .fill-relative { min-width: 0; }
+    .trade-side { margin-left: 6px; }
+    .fill-execution { text-align: right; }
+    .fill-quantity { display: block; margin: 3px 0 0; }
+    .filled-orders-table .fill-pnl { align-self: center; }
+    .order-action { align-self: center; text-align: right; }
+    .copy-id { min-height: 34px; min-width: 62px; }
 
     .desk-footer {
         align-items: flex-start;
@@ -1982,7 +1996,7 @@ td { overflow-wrap: anywhere; color: var(--ink); }
         bottom: 0;
         left: 0;
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(5, minmax(0, 1fr));
         gap: 0;
         padding:
             4px max(8px, env(safe-area-inset-right, 0px))

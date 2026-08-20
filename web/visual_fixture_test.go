@@ -100,7 +100,7 @@ func visualFixtureSnapshot() map[string]interface{} {
 		},
 		"position": map[string]interface{}{
 			"initialized": true, "symbol": "ETHUSDT", "baseAsset": "ETH", "lastPrice": latest,
-			"gridPrice": 4232, "priceDecimals": 2, "quantityDecimals": 4, "priceInterval": 6,
+			"anchorPrice": 4218.35, "gridPrice": 4232, "priceDecimals": 2, "quantityDecimals": 4, "priceInterval": 6,
 			"orderQuantity": 30, "buyWindowSize": 2, "sellWindowSize": 2, "slots": slots,
 			"filledSlotCount": 2, "positionQty": 0.025, "positionValue": 105.5505, "activeBuyOrders": 1, "activeSellOrders": 2,
 			"totalBuyQty": 1.26, "totalSellQty": 1.19, "estimatedProfit": 7.14, "realizedPnl": 6.82,

@@ -1,6 +1,6 @@
 (function () {
     if (typeof module !== "undefined" && module.exports) {
-        module.exports = { buildKlineGridModel, buildHourlyFillModel };
+        module.exports = { buildKlineGridModel, buildHourlyFillModel, formatRelativeTime };
         return;
     }
 
@@ -192,6 +192,13 @@
             if (snapshotAge > 8000) setConnectionState("down", "数据已中断");
             else if (!authBlocked) setConnectionState("fallback", "轮询回退");
         }
+        updateRelativeTimes(now);
+    }
+
+    function updateRelativeTimes(now) {
+        document.querySelectorAll("time[data-relative-time]").forEach((node) => {
+            setText(node, formatRelativeTime(Number(node.dataset.relativeTime), now));
+        });
     }
 
     function element(tag, className, text) {
@@ -303,8 +310,15 @@
             metric("活动买 / 卖", (pos.activeBuyOrders || 0) + " / " + (pos.activeSellOrders || 0))
         ];
         const estimated = pos.estimatedProfit || 0;
+        const startupPrice = Number(pos.anchorPrice || 0);
         const strategyItems = [
             metric("程序启动时间", formatDateTime(snapshot.startedAt)),
+            metric(
+                "启动价格快照",
+                startupPrice > 0 ? fmt(startupPrice, dec) + " " + quote : "等待初始行情",
+                startupPrice > 0 ? "snapshot" : "warn",
+                startupPrice > 0 ? "首个有效行情 · 固定不变" : "首次有效行情到达后锁定"
+            ),
             metric("运行时长", uptimeText),
             metric("启动保证金余额", initialMarginReady ? fmt(acc.initialMargin) + " " + quote : "等待首次读取", initialMarginReady ? "" : "warn"),
             metric("预计盈利", fmt(estimated) + " " + quote, estimated >= 0 ? "pos" : "neg"),
@@ -1246,13 +1260,13 @@
 
     function renderRisk(risk) {
         const panel = $("riskPanel");
-        const side = document.querySelector(".side");
+        const statusStrip = document.querySelector(".status-strip");
         const enabled = Boolean(risk.enabled);
         if (panel) {
             panel.hidden = !enabled;
             panel.setAttribute("aria-hidden", enabled ? "false" : "true");
         }
-        if (side) side.classList.toggle("risk-off", !enabled);
+        if (statusStrip) statusStrip.classList.toggle("risk-off", !enabled);
         if (!enabled) return;
 
         $("riskMsg").textContent = risk.lastMsg || "等待风控读数";
@@ -1449,10 +1463,8 @@
             const row = document.createElement("tr");
             const side = order.side === "BUY" ? "BUY" : (order.side === "SELL" ? "SELL" : "—");
             const pnl = Number(order.realizedPnl || 0);
-            appendCell(row, "成交时间", formatCompactDateTime(order.filledAt), "fill-time");
-            appendCell(row, "方向", side, "trade-side " + side.toLowerCase());
-            appendCell(row, "成交均价", fmt(order.price, pos.priceDecimals));
-            appendCell(row, "成交数量", fmt(order.quantity, pos.quantityDecimals || 4));
+            row.appendChild(filledTimeCell(order.filledAt, side));
+            row.appendChild(filledExecutionCell(order, pos));
             appendCell(
                 row,
                 "已实现盈亏",
@@ -1464,7 +1476,7 @@
         });
         replaceChildren(
             $("filledBody"),
-            filledRows.length ? filledRows : [emptyRow("程序启动后暂无成交订单", 6)]
+            filledRows.length ? filledRows : [emptyRow("程序启动后暂无成交订单", 4)]
         );
     }
 
@@ -1610,21 +1622,41 @@
         row.appendChild(cell);
     }
 
-    function orderIDCell(id) {
-        const cell = element("td", "order-id");
-        cell.dataset.label = "ID";
-        const code = element("code", "order-code");
-        code.title = id;
-        code.setAttribute("aria-label", id);
-        code.append(
-            element("span", "order-id-full", id),
-            element("span", "order-id-short", shortenId(id))
+    function filledTimeCell(value, side) {
+        const cell = element("td", "fill-when");
+        cell.dataset.label = "时间 / 方向";
+        const date = new Date(value);
+        const time = element("time", "fill-relative", formatRelativeTime(value));
+        if (!Number.isNaN(date.getTime())) {
+            time.dateTime = date.toISOString();
+            time.dataset.relativeTime = String(date.getTime());
+            time.title = formatCompactDateTime(value);
+        }
+        const sideLabel = side === "BUY" ? "买" : (side === "SELL" ? "卖" : "—");
+        const badge = element("span", "trade-side " + side.toLowerCase(), sideLabel);
+        cell.append(time, badge);
+        return cell;
+    }
+
+    function filledExecutionCell(order, pos) {
+        const cell = element("td", "fill-execution");
+        cell.dataset.label = "成交";
+        cell.append(
+            element("strong", "fill-price", fmt(order.price, pos.priceDecimals)),
+            element("span", "fill-quantity", "× " + fmt(order.quantity, pos.quantityDecimals || 4))
         );
-        const button = element("button", "copy-id", "复制");
+        return cell;
+    }
+
+    function orderIDCell(id) {
+        const cell = element("td", "order-action");
+        cell.dataset.label = "订单";
+        const button = element("button", "copy-id", "复制 ID");
         button.type = "button";
         button.dataset.copy = id;
+        button.title = "复制订单 ID：" + id;
         button.setAttribute("aria-label", "复制订单 ID " + id);
-        cell.append(code, button);
+        cell.appendChild(button);
         return cell;
     }
 
@@ -1734,11 +1766,6 @@
         return row;
     }
 
-    function shortenId(value) {
-        if (value.length <= 22) return value;
-        return value.slice(0, 11) + "…" + value.slice(-7);
-    }
-
     function formatTime(value) {
         if (!value) return "—";
         const date = new Date(value);
@@ -1763,6 +1790,29 @@
             second: "2-digit",
             hour12: false
         });
+    }
+
+    function formatRelativeTime(value, now) {
+        if (!value) return "—";
+        const timestamp = new Date(value).getTime();
+        const current = now === undefined ? Date.now() : new Date(now).getTime();
+        if (!Number.isFinite(timestamp) || !Number.isFinite(current)) return "—";
+
+        const diff = timestamp - current;
+        const elapsed = Math.abs(diff);
+        if (elapsed < 60000) return "刚刚";
+
+        const units = [
+            [31536000000, "年"],
+            [2592000000, "个月"],
+            [604800000, "周"],
+            [86400000, "天"],
+            [3600000, "小时"],
+            [60000, "分钟"]
+        ];
+        const unit = units.find((item) => elapsed >= item[0]) || units[units.length - 1];
+        const amount = Math.max(1, Math.floor(elapsed / unit[0]));
+        return amount + " " + unit[1] + (diff < 0 ? "前" : "后");
     }
 
     function formatDuration(value) {

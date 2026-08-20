@@ -1,7 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 
-const { buildKlineGridModel, buildHourlyFillModel } = require("./static/app.js");
+const { buildKlineGridModel, buildHourlyFillModel, formatRelativeTime } = require("./static/app.js");
 
 function fixture() {
     return {
@@ -40,6 +41,26 @@ function fixture() {
         }
     };
 }
+
+test("fill timestamps are formatted relative to now", () => {
+    const now = new Date("2026-08-20T12:00:00.000Z");
+    assert.equal(formatRelativeTime(new Date(now.getTime() - 45_000), now), "刚刚");
+    assert.equal(formatRelativeTime(new Date(now.getTime() - 90_000), now), "1 分钟前");
+    assert.equal(formatRelativeTime(new Date(now.getTime() - 3 * 3_600_000), now), "3 小时前");
+    assert.equal(formatRelativeTime(new Date(now.getTime() + 2 * 86_400_000), now), "2 天后");
+    assert.equal(formatRelativeTime("not-a-date", now), "—");
+});
+
+test("event stream follows execution tape at the end of the dashboard", () => {
+    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
+    const fills = html.indexOf('id="section-fills"');
+    const logs = html.indexOf('id="section-logs"');
+    const mainEnd = html.indexOf("</main>");
+    assert.ok(fills >= 0);
+    assert.ok(logs > fills);
+    assert.ok(mainEnd > logs);
+    assert.ok(html.indexOf("03 / EXECUTION TAPE") < html.indexOf("04 / EVENT STREAM"));
+});
 
 test("candles are normalized, ordered and summarized", () => {
     const data = fixture();

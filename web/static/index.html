@@ -76,7 +76,7 @@
                 </details>
             </section>
 
-            <section class="board" aria-label="网格、风控与日志">
+            <section class="board" aria-label="行情与风控">
                 <section class="panel ladder-wrap market-chart-panel" id="section-market">
                     <div class="panel-head">
                         <div class="panel-title">
@@ -144,7 +144,7 @@
                     </div>
                 </section>
 
-                <aside class="side" id="section-status" aria-label="风险与运行状态">
+                <aside class="status-strip" id="section-status" aria-label="风险与运行状态">
                     <section class="panel risk-panel" id="riskPanel">
                         <div class="panel-head">
                             <div class="panel-title">
@@ -155,15 +155,6 @@
                         <p class="risk-msg" id="riskMsg">等待风控读数</p>
                         <div id="riskList" class="risk-list"></div>
                     </section>
-                    <section class="panel log-panel">
-                        <div class="panel-head">
-                            <div class="panel-title">
-                                <span>03 / EVENT STREAM</span>
-                                <h2>最近日志</h2>
-                            </div>
-                        </div>
-                        <div class="logs" id="logs" role="log" aria-live="polite" aria-relevant="additions"></div>
-                    </section>
                 </aside>
             </section>
 
@@ -171,7 +162,7 @@
                 <section class="panel filled-orders-panel" id="section-fills">
                     <div class="panel-head">
                         <div class="panel-title">
-                            <span>04 / EXECUTION TAPE</span>
+                            <span>03 / EXECUTION TAPE</span>
                             <h2>成交订单</h2>
                         </div>
                         <span class="panel-meta" id="filledCount">本次运行 · 0 笔 · 列表最近 20</span>
@@ -229,11 +220,24 @@
                         <table class="filled-orders-table">
                             <caption class="sr-only">最近 20 笔成交订单</caption>
                             <thead>
-                                <tr><th scope="col">成交时间</th><th scope="col">方向</th><th scope="col">成交均价</th><th scope="col">成交数量</th><th scope="col">已实现盈亏</th><th scope="col">ID</th></tr>
+                                <tr><th scope="col">时间 / 方向</th><th scope="col">成交</th><th scope="col">已实现盈亏</th><th scope="col"><span class="sr-only">订单操作</span></th></tr>
                             </thead>
                             <tbody id="filledBody"></tbody>
                         </table>
                     </div>
+                </section>
+            </section>
+
+            <section class="activity" id="section-logs" aria-label="最近日志">
+                <section class="panel log-panel">
+                    <div class="panel-head">
+                        <div class="panel-title">
+                            <span>04 / EVENT STREAM</span>
+                            <h2>最近日志</h2>
+                        </div>
+                        <span class="panel-meta">最新事件优先</span>
+                    </div>
+                    <div class="logs" id="logs" role="log" aria-live="polite" aria-relevant="additions"></div>
                 </section>
             </section>
         </main>
@@ -274,6 +278,10 @@
         <a href="#section-fills">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/></svg>
             <span>成交</span>
+        </a>
+        <a href="#section-logs">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.5h14v13H5zM8 9h8M8 12h8M8 15h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square"/></svg>
+            <span>日志</span>
         </a>
     </nav>
     <div class="desk-toast" id="deskToast" role="status" aria-live="polite"></div>
