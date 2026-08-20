@@ -1,8 +1,10 @@
 # OpenSQT Market Maker
 #
-# 使用前请先准备 config.yaml（可从 config.example.yaml 复制）。
-# 容器内访问监控面板时，请把 dashboard.listen 改成 "0.0.0.0:8787"，
-# 并建议设置 dashboard.token。
+# 使用前：
+#   cp config.example.yaml config.yaml
+#   cp .env.example .env
+# 在 .env 填写 API Key；策略参数可继续放在 config.yaml。
+# 非空环境变量会覆盖 YAML。
 #
 # 拉取 GitHub Packages 私有镜像：
 #   echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
@@ -19,6 +21,8 @@ services:
     container_name: opensqt_market_maker
     restart: unless-stopped
     stop_grace_period: 30s
+    env_file:
+      - .env
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./log:/app/log

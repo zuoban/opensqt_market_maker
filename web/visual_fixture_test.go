@@ -56,20 +56,20 @@ func TestVisualFixture(t *testing.T) {
 }
 
 func visualFixtureSnapshot() map[string]interface{} {
-	now := time.Now().UTC().Truncate(time.Minute)
-	candles := make([]map[string]interface{}, 0, 96)
-	for i := 0; i < 96; i++ {
+	now := time.Now().UTC().Truncate(5 * time.Minute)
+	candles := make([]map[string]interface{}, 0, 60)
+	for i := 0; i < 60; i++ {
 		wave := math.Sin(float64(i)/6)*10 + float64(i)*0.18
 		open := 4210 + wave
 		closePrice := open + math.Sin(float64(i)*1.7)*4
 		candles = append(candles, map[string]interface{}{
-			"time":     now.Add(time.Duration(i-95) * time.Minute).UnixMilli(),
+			"time":     now.Add(time.Duration(i-59) * 5 * time.Minute).UnixMilli(),
 			"open":     open,
 			"high":     math.Max(open, closePrice) + 3.2,
 			"low":      math.Min(open, closePrice) - 2.8,
 			"close":    closePrice,
 			"volume":   120 + i*3,
-			"isClosed": i < 95,
+			"isClosed": i < 59,
 		})
 	}
 
@@ -96,13 +96,13 @@ func visualFixtureSnapshot() map[string]interface{} {
 			"last": latest, "lastText": "4,222.02", "updatedAt": time.Now(), "ageMs": 80,
 		},
 		"kline": map[string]interface{}{
-			"interval": "1m", "updatedAt": time.Now(), "historyReady": true, "degraded": false, "candles": candles,
+			"interval": "5m", "updatedAt": time.Now(), "historyReady": true, "degraded": false, "candles": candles,
 		},
 		"position": map[string]interface{}{
 			"initialized": true, "symbol": "ETHUSDT", "baseAsset": "ETH", "lastPrice": latest,
 			"gridPrice": 4232, "priceDecimals": 2, "quantityDecimals": 4, "priceInterval": 6,
 			"orderQuantity": 30, "buyWindowSize": 2, "sellWindowSize": 2, "slots": slots,
-			"filledSlotCount": 2, "positionQty": 0.025, "activeBuyOrders": 1, "activeSellOrders": 2,
+			"filledSlotCount": 2, "positionQty": 0.025, "positionValue": 105.5505, "activeBuyOrders": 1, "activeSellOrders": 2,
 			"totalBuyQty": 1.26, "totalSellQty": 1.19, "estimatedProfit": 7.14, "realizedPnl": 6.82,
 			"filledOrders":     filledOrders,
 			"filledHourly":     filledHourly,

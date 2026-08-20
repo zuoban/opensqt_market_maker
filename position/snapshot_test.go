@@ -78,6 +78,12 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	if snap.FilledSlotCount != 1 {
 		t.Fatalf("filled slots = %d", snap.FilledSlotCount)
 	}
+	if snap.PositionQty != 0.01 {
+		t.Fatalf("position qty = %v", snap.PositionQty)
+	}
+	if snap.PositionValue < 0.99 || snap.PositionValue > 1.01 {
+		t.Fatalf("position value = %v, want ~1 (0.01 * 100)", snap.PositionValue)
+	}
 	if snap.ActiveBuyOrders != 1 || snap.ActiveSellOrders != 1 {
 		t.Fatalf("active orders buy=%d sell=%d", snap.ActiveBuyOrders, snap.ActiveSellOrders)
 	}

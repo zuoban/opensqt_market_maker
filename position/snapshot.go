@@ -47,6 +47,7 @@ type PositionSnapshot struct {
 	FilledOrderCount     int64               `json:"filledOrderCount"`
 	FilledSlotCount      int                 `json:"filledSlotCount"`
 	PositionQty          float64             `json:"positionQty"`
+	PositionValue        float64             `json:"positionValue"`
 	ActiveBuyOrders      int                 `json:"activeBuyOrders"`
 	ActiveSellOrders     int                 `json:"activeSellOrders"`
 	TotalBuyQty          float64             `json:"totalBuyQty"`
@@ -196,5 +197,8 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		return slots[i].Price > slots[j].Price
 	})
 	snap.Slots = slots
+	if lastPrice > 0 && snap.PositionQty > 0 {
+		snap.PositionValue = snap.PositionQty * lastPrice
+	}
 	return snap
 }

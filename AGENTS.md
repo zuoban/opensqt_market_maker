@@ -51,7 +51,7 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 | `main.go` | 启动编排、版本号 |
 | `config/` | YAML 加载与校验 |
 | `exchange/` | `IExchange` + 各所 adapter/wrapper |
-| `monitor/` | 唯一价格流；面板用的 1m K 线缓存 |
+| `monitor/` | 唯一价格流；面板用的 5m K 线缓存 |
 | `order/` | 下单执行（限流、PostOnly 降级、重试） |
 | `position/` | 超级槽位、成交记录、小时汇总 |
 | `safety/` | 启动检查、主动风控、对账、订单清理 |
@@ -64,9 +64,10 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 
 ## 配置
 
-- 模板：`config.example.yaml`
-- 运行时：`config.yaml`（不要提交）
-- 默认监控面板：`http://127.0.0.1:8787`。绑 `0.0.0.0` 时必须设 `dashboard.token`
+- 模板：`config.example.yaml`；环境变量模板：`.env.example`（复制为 `.env`，不要提交）
+- 运行时：先读 YAML，再用非空 `OPENSQT_*` 覆盖。`.env` 只填充尚未设置的进程环境变量（容器注入优先）
+- 路径：命令行 > `OPENSQT_CONFIG` > `config.yaml`。额外 dotenv 路径：`OPENSQT_ENV_FILE`
+- 默认监控面板：`http://127.0.0.1:8787`。绑 `0.0.0.0` 时必须设 `dashboard.token`（可用 `OPENSQT_DASHBOARD_LISTEN` / `OPENSQT_DASHBOARD_TOKEN`）
 
 ## 监控面板
 
@@ -74,7 +75,7 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 - 前端单测：`node --test web/app_frontend_test.js`（`app.js` 在 Node 下只导出 `buildKlineGridModel` / `buildHourlyFillModel`）。
 - 成交**列表**最多 20 条（`position.maxRecentFilledOrders`）。
 - 成交**汇总图**用快照里的 `filledHourly`（后端按本地整点累计，固定 24 小时，含空小时）。不要改回用这 20 条明细在前端加总。
-- K 线缓存上限仍是 `monitor.maxVisibleCandles`（当前 500 根 1m），与汇总图无关。
+- 面板 K 线为 **5m × 60 根**（约 5 小时）。缓存硬上限仍是 `monitor.maxVisibleCandles`（500），与汇总图无关。风控 K 线仍用配置里的 `risk_control.interval`（默认 1m），不要和面板周期混用。
 - 可视化夹具：`WEB_VISUAL=1 go test ./web -run TestVisualFixture -count=1`，监听 `127.0.0.1:18789`。
 
 ## 发版

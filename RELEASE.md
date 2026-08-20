@@ -39,7 +39,7 @@ git push origin v3.4.3
 镜像地址：
 
 ```text
-ghcr.io/zuoban/opensqt_market_maker:v3.4.5
+ghcr.io/zuoban/opensqt_market_maker:v3.4.6
 ghcr.io/zuoban/opensqt_market_maker:latest
 ```
 
@@ -68,6 +68,7 @@ TARGET_OS=MacOS TARGET_ARCH=arm64 ./scripts/package_release.sh
 - 整个 `live_server/` 目录
 - `config.example.yaml`
 - `config.yaml`
+- `.env.example`
 - `README.md`
 - `ARCHITECTURE.md`
 - `部署教程.pdf`

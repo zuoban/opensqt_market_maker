@@ -268,6 +268,13 @@
         riskPill.classList.toggle("ok", Boolean(risk.enabled) && !triggered);
 
         const realized = pos.realizedPnl != null ? pos.realizedPnl : 0;
+        const mark = Number(price.last || pos.lastPrice);
+        const positionValue = Number(pos.positionValue) > 0
+            ? Number(pos.positionValue)
+            : (Number(pos.positionQty) > 0 && Number.isFinite(mark) && mark > 0
+                ? Number(pos.positionQty) * mark
+                : 0);
+        const positionValueText = positionValue > 0 ? fmt(positionValue) + " " + quote : "";
         const initialMarginReady = Boolean(acc.initialMarginReady);
         const marginChange = Number(acc.marginChange || 0);
         const marginChangeClass = acc.stale
@@ -282,7 +289,13 @@
             metric("当前保证金余额", fmt(acc.margin) + " " + quote, acc.stale ? "warn" : "", marginChangeHint, marginChangeClass),
             metric("未实现盈亏", fmt(acc.unrealizedPnl) + " " + quote, (acc.unrealizedPnl || 0) >= 0 ? "pos" : "neg"),
             metric("已实现盈亏", fmt(realized) + " " + quote, realized >= 0 ? "pos" : "neg"),
-            metric("持仓", (pos.filledSlotCount || 0) + " 槽 · " + fmt(pos.positionQty, pos.quantityDecimals || 4)),
+            metric(
+                "持仓",
+                (pos.filledSlotCount || 0) + " 槽 · " + fmt(pos.positionQty, pos.quantityDecimals || 4) +
+                    (pos.baseAsset ? " " + pos.baseAsset : ""),
+                "",
+                positionValueText
+            ),
             metric("活动买 / 卖", (pos.activeBuyOrders || 0) + " / " + (pos.activeSellOrders || 0))
         ];
         const estimated = pos.estimatedProfit || 0;
@@ -446,7 +459,7 @@
             return result;
         }, { buy: 0, sell: 0, position: 0 });
         return {
-            interval: kline.interval || "1m",
+            interval: kline.interval || "5m",
             historyReady: Boolean(kline.historyReady),
             degraded: Boolean(kline.degraded),
             candles,
@@ -584,7 +597,6 @@
         const intervalNode = $("klineInterval");
         setText(intervalNode, interval + " · " + chartModel.candles.length + " 根");
         intervalNode.classList.toggle("warn", chartModel.degraded);
-        setText($("klineCount"), chartModel.candles.length + " 根");
 
         if (!chartModel.candles.length) {
             empty.hidden = false;
@@ -597,7 +609,6 @@
             renderKlineStats(null, pos.priceDecimals ?? 2);
             setText($("klineDetail"), "获得首根 K 线后即可查看开、高、低、收明细");
             $("klineCanvas").setAttribute("aria-label", "K 线数据尚未就绪");
-            replaceChildren($("klineBody"), [emptyRow("K 线数据尚未就绪", 6)]);
             drawKlineChart();
             return;
         }
@@ -617,7 +628,6 @@
         renderKlineStats(chartModel, decimals);
         if (chartTooltipActive && chartSelection !== null) updateSelectedCandle();
         else setText($("klineDetail"), candleDetail(latest, decimals));
-        renderKlineTable(chartModel.candles, decimals);
         drawKlineChart();
     }
 
@@ -639,27 +649,6 @@
             $("klineExecution"),
             "B " + model.execution.buy + " · S " + model.execution.sell + " · P " + model.execution.position
         );
-    }
-
-    function renderKlineTable(candles, decimals) {
-        const rows = candles.slice().reverse().map((candle) => {
-            const row = document.createElement("tr");
-            const values = [
-                ["时间", formatCompactDateTime(candle.time)],
-                ["开", fmt(candle.open, decimals)],
-                ["高", fmt(candle.high, decimals)],
-                ["低", fmt(candle.low, decimals)],
-                ["收", fmt(candle.close, decimals)],
-                ["状态", candle.isClosed ? "已完结" : "进行中"]
-            ];
-            values.forEach(([label, value], index) => {
-                const cell = element("td", index === 0 ? "fill-time" : "", value);
-                cell.dataset.label = label;
-                row.appendChild(cell);
-            });
-            return row;
-        });
-        replaceChildren($("klineBody"), rows);
     }
 
     function initKlineChart() {

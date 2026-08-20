@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,15 +20,21 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.4.5"
+var Version = "v3.4.6"
 
 func main() {
 	programStartedAt := time.Now()
 	logger.Info("🚀 www.OpenSQT.com 做市商系统启动...")
 	logger.Info("📦 版本号: %s", Version)
 
-	// 1. 加载配置
+	// 1. 加载配置：命令行路径 > OPENSQT_CONFIG > config.yaml
+	if err := config.LoadDotEnv(); err != nil {
+		logger.Fatalf("❌ 加载 .env 失败: %v", err)
+	}
 	configPath := "config.yaml"
+	if v := strings.TrimSpace(os.Getenv("OPENSQT_CONFIG")); v != "" {
+		configPath = v
+	}
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
 	}

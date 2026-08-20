@@ -81,7 +81,7 @@
                             <h2>K 线网格执行图</h2>
                         </div>
                         <div class="chart-head-actions">
-                            <span class="panel-meta chart-feed" id="klineInterval">1m · 等待行情</span>
+                            <span class="panel-meta chart-feed" id="klineInterval">5m · 等待行情</span>
                             <label class="toggle">
                                 <input type="checkbox" id="showOutside">
                                 <span>显示窗口外</span>
@@ -123,7 +123,7 @@
                             aria-label="K 线网格执行图"
                             aria-keyshortcuts="ArrowLeft ArrowRight Home End"
                             aria-describedby="klineSummary klineDetail">
-                            当前浏览器不支持 K 线画布，请使用下方数据表查看行情。
+                            当前浏览器不支持 K 线画布。
                         </canvas>
                         <div class="chart-tooltip" id="klineTooltip" role="tooltip" aria-hidden="true"></div>
                         <div id="klineEmpty" class="chart-empty">正在加载真实 K 线数据</div>
@@ -131,18 +131,6 @@
                     <div class="ladder-detail" id="klineDetail" role="status" aria-live="polite">
                         移动指针、轻触图表或使用左右方向键查看单根 K 线
                     </div>
-                    <details class="kline-data">
-                        <summary>OHLC 数据表 <span id="klineCount">0 根</span></summary>
-                        <div class="table-wrap">
-                            <table>
-                                <caption class="sr-only">图表中的真实 K 线开高低收数据</caption>
-                                <thead>
-                                    <tr><th scope="col">时间</th><th scope="col">开</th><th scope="col">高</th><th scope="col">低</th><th scope="col">收</th><th scope="col">状态</th></tr>
-                                </thead>
-                                <tbody id="klineBody"></tbody>
-                            </table>
-                        </div>
-                    </details>
                 </section>
 
                 <aside class="side" aria-label="风险与运行状态">

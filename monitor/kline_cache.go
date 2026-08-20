@@ -46,7 +46,7 @@ func (pm *PriceMonitor) EnableKlines(ctx context.Context, interval string, limit
 		return err
 	}
 	if limit <= 0 {
-		limit = 120
+		limit = 60
 	}
 	if limit > maxVisibleCandles {
 		limit = maxVisibleCandles

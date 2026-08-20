@@ -65,6 +65,7 @@ func TestKlineCacheRollsAndLimitsCandles(t *testing.T) {
 func TestCandleIntervalDuration(t *testing.T) {
 	for input, want := range map[string]time.Duration{
 		"1m": time.Minute,
+		"5m": 5 * time.Minute,
 		"4h": 4 * time.Hour,
 		"1D": 24 * time.Hour,
 	} {

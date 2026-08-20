@@ -90,8 +90,12 @@ type ExchangeConfig struct {
 	FeeRate    float64 `yaml:"fee_rate"`   // 手续费率（例如 0.0002 表示 0.02%）
 }
 
-// LoadConfig 加载配置文件
+// LoadConfig 加载 YAML，再用 OPENSQT_* 环境变量覆盖非空项。
 func LoadConfig(configPath string) (*Config, error) {
+	if err := LoadDotEnv(); err != nil {
+		return nil, err
+	}
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %v", err)
@@ -100,6 +104,10 @@ func LoadConfig(configPath string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %v", err)
+	}
+
+	if err := applyEnvOverrides(&cfg); err != nil {
+		return nil, fmt.Errorf("环境变量覆盖失败: %v", err)
 	}
 
 	if err := cfg.Validate(); err != nil {

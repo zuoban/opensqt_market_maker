@@ -16,6 +16,9 @@ log
 *.exe
 
 config.yaml
+.env
+.env.*
+!.env.example
 
 live_server
 部署教程.pdf

@@ -182,7 +182,7 @@ func (s *Server) loadKlines(ctx context.Context) {
 	}
 	loadCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	if err := s.assembler.price.EnableKlines(loadCtx, "1m", 120); err != nil {
+	if err := s.assembler.price.EnableKlines(loadCtx, "5m", 60); err != nil {
 		logger.Warn("⚠️ 监控面板历史 K 线加载失败，将从实时行情开始积累: %v", err)
 	}
 }

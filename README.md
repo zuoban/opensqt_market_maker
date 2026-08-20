@@ -118,6 +118,7 @@ opensqt_platform/
 1. 复制示例配置文件：
    ```bash
    cp config.example.yaml config.yaml
+   cp .env.example .env          # 可选：用环境变量覆盖密钥
    ```
 
 2. 编辑 `config.yaml`，填入你的 API Key 和策略参数：
@@ -139,6 +140,8 @@ opensqt_platform/
      buy_window_size: 10     # 买单挂单数量
      sell_window_size: 10    # 卖单挂单数量
    ```
+
+密钥也可以写在 `.env` 里（例如 `OPENSQT_EXCHANGES_BINANCE_API_KEY`）。非空环境变量优先于 YAML。完整变量列表见 [.env.example](.env.example)。
 
 ### 运行 (Usage)
 
@@ -180,7 +183,7 @@ dashboard:
 ghcr.io/zuoban/opensqt_market_maker:<tag>
 ```
 
-版本标签示例：`v3.4.5`、`3.4.5`、`latest`（仅版本 tag 会更新 `latest`）。`main` 分支会发布 `main` 和 `sha-*` 标签。镜像同时支持 `linux/amd64` 与 `linux/arm64`。
+版本标签示例：`v3.4.6`、`3.4.6`、`latest`（仅版本 tag 会更新 `latest`）。`main` 分支会发布 `main` 和 `sha-*` 标签。镜像同时支持 `linux/amd64` 与 `linux/arm64`。
 
 首次发布的 Package 默认是私有的。可在仓库的 **Packages** 页面把可见性改为 Public，或拉取前先登录：
 
@@ -189,14 +192,17 @@ echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
 docker pull ghcr.io/zuoban/opensqt_market_maker:latest
 ```
 
-镜像不包含 `config.yaml`，启动时必须挂载你自己的配置。容器内要访问监控面板时，请把 `dashboard.listen` 改成 `0.0.0.0:8787`，并建议设置 `dashboard.token`。
+镜像不包含 `config.yaml` 和密钥。策略参数放 YAML，API Key / 面板 token 建议放 `.env`（非空环境变量会覆盖 YAML）。
 
 ```bash
 cp config.example.yaml config.yaml
-# 编辑 config.yaml：填写 API Key，并将 dashboard.listen 改为 0.0.0.0:8787
+cp .env.example .env
+# 编辑 .env：填写 API Key，并设置 OPENSQT_DASHBOARD_TOKEN
 
 docker compose up -d --build
 ```
+
+`.env.example` 里已把 `OPENSQT_DASHBOARD_LISTEN=0.0.0.0:8787`，容器外可访问监控面板。
 
 或直接运行已发布镜像：
 
@@ -204,6 +210,7 @@ docker compose up -d --build
 docker run -d --name opensqt_market_maker --restart unless-stopped \
   --stop-timeout 30 \
   -p 8787:8787 \
+  --env-file .env \
   -v "$PWD/config.yaml:/app/config.yaml:ro" \
   -v "$PWD/log:/app/log" \
   ghcr.io/zuoban/opensqt_market_maker:latest

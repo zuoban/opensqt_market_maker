@@ -141,6 +141,7 @@ cp ARCHITECTURE.md "$STAGE_DIR/ARCHITECTURE.md"
 cp 部署教程.pdf "$STAGE_DIR/部署教程.pdf"
 cp config.example.yaml "$STAGE_DIR/config.example.yaml"
 cp config.example.yaml "$STAGE_DIR/config.yaml"
+cp .env.example "$STAGE_DIR/.env.example"
 cp -R live_server "$STAGE_DIR/live_server"
 
 echo "==> 打包归档"

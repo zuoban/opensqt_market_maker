@@ -1,4 +1,5 @@
 # 应用配置
+# API Key 等敏感项可用环境变量覆盖，见 .env.example。非空 OPENSQT_* 优先于本文件。
 app:
   current_exchange: "bitget"  # 当前使用的交易所: binance, bitget, bybit, gate, edgex
 
