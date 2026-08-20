@@ -1,6 +1,11 @@
 (function () {
     if (typeof module !== "undefined" && module.exports) {
-        module.exports = { buildKlineGridModel, buildHourlyFillModel, formatRelativeTime };
+        module.exports = {
+            buildKlineGridModel,
+            buildHourlyFillModel,
+            centeredScrollLeft,
+            formatRelativeTime
+        };
         return;
     }
 
@@ -1543,7 +1548,7 @@
             return col;
         });
         replaceChildren(chart, columns);
-        applyHourSelection(chart, selectedHourKey);
+        applyHourSelection(chart, selectedHourKey, "auto");
         setText(
             $("fillHourlySummary"),
             "近 " + stats.hours + " 小时成交 " + stats.windowTotal + " 笔，买单 " +
@@ -1561,7 +1566,30 @@
             "  · 盈亏 " + fmtSigned(bucket.pnl, 6) + " " + quote;
     }
 
-    function applyHourSelection(chart, key) {
+    function centeredScrollLeft(viewportWidth, itemLeft, itemWidth, contentWidth) {
+        const viewport = Math.max(0, Number(viewportWidth) || 0);
+        const width = Math.max(0, Number(itemWidth) || 0);
+        const maximum = Math.max(0, (Number(contentWidth) || 0) - viewport);
+        const target = (Number(itemLeft) || 0) - (viewport - width) / 2;
+        return Math.min(maximum, Math.max(0, target));
+    }
+
+    function revealHourSelection(chart, selected, behavior) {
+        if (!chart || !selected || chart.scrollWidth <= chart.clientWidth) return;
+        const left = centeredScrollLeft(
+            chart.clientWidth,
+            selected.offsetLeft,
+            selected.offsetWidth,
+            chart.scrollWidth
+        );
+        if (Math.abs(chart.scrollLeft - left) < 2) return;
+        chart.scrollTo({
+            left,
+            behavior: behavior === "smooth" && !prefersReducedMotion() ? "smooth" : "auto"
+        });
+    }
+
+    function applyHourSelection(chart, key, behavior) {
         const columns = Array.from(chart.children);
         if (!columns.length) return;
         let selected = columns.find((col) => col.dataset.hour === key);
@@ -1577,6 +1605,7 @@
         });
         selectedHourKey = selected.dataset.hour;
         setText($("fillHourDetail"), selected.dataset.detail || "");
+        revealHourSelection(chart, selected, behavior);
     }
 
     function initHourlyChart() {
@@ -1585,7 +1614,7 @@
         chart.addEventListener("click", (event) => {
             const col = event.target.closest(".hour-col");
             if (!col || !chart.contains(col)) return;
-            applyHourSelection(chart, col.dataset.hour);
+            applyHourSelection(chart, col.dataset.hour, "smooth");
         });
         chart.addEventListener("keydown", (event) => {
             if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -1598,7 +1627,7 @@
             if (event.key === "Home") next = 0;
             if (event.key === "End") next = columns.length - 1;
             event.preventDefault();
-            applyHourSelection(chart, columns[next].dataset.hour);
+            applyHourSelection(chart, columns[next].dataset.hour, "smooth");
             columns[next].focus();
         });
     }

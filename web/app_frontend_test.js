@@ -2,7 +2,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 
-const { buildKlineGridModel, buildHourlyFillModel, formatRelativeTime } = require("./static/app.js");
+const {
+    buildKlineGridModel,
+    buildHourlyFillModel,
+    centeredScrollLeft,
+    formatRelativeTime
+} = require("./static/app.js");
 
 function fixture() {
     return {
@@ -42,6 +47,23 @@ function fixture() {
     };
 }
 
+function cssBlock(source, marker) {
+    const markerAt = source.indexOf(marker);
+    assert.ok(markerAt >= 0, `missing CSS block: ${marker}`);
+    const openAt = source.indexOf("{", markerAt + marker.length);
+    assert.ok(openAt >= 0, `missing opening brace: ${marker}`);
+
+    let depth = 0;
+    for (let i = openAt; i < source.length; i++) {
+        if (source[i] === "{") depth++;
+        if (source[i] === "}" && --depth === 0) {
+            return source.slice(openAt + 1, i);
+        }
+    }
+
+    assert.fail(`unclosed CSS block: ${marker}`);
+}
+
 test("fill timestamps are formatted relative to now", () => {
     const now = new Date("2026-08-20T12:00:00.000Z");
     assert.equal(formatRelativeTime(new Date(now.getTime() - 45_000), now), "刚刚");
@@ -60,6 +82,54 @@ test("event stream follows execution tape at the end of the dashboard", () => {
     assert.ok(logs > fills);
     assert.ok(mainEnd > logs);
     assert.ok(html.indexOf("03 / EXECUTION TAPE") < html.indexOf("04 / EVENT STREAM"));
+});
+
+test("mobile order and log windows keep native vertical scrolling", () => {
+    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
+    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
+    const mobile = cssBlock(
+        css,
+        "@media (max-width: 680px), (max-width: 900px) and (max-height: 500px)"
+    );
+    const orders = cssBlock(mobile, ".filled-orders-panel .table-wrap");
+    const logs = cssBlock(mobile, ".activity .logs");
+
+    for (const rule of [orders, logs]) {
+        assert.match(rule, /max-height:\s*min\([^;]*dvh/);
+        assert.doesNotMatch(rule, /max-height:\s*none/);
+        assert.match(rule, /overflow-y:\s*auto/);
+        assert.match(rule, /overflow-x:\s*hidden/);
+        assert.match(rule, /overscroll-behavior-y:\s*auto/);
+        assert.match(rule, /touch-action:\s*pan-y/);
+        assert.match(rule, /-webkit-overflow-scrolling:\s*touch/);
+    }
+
+    const orderRegion = html.match(/<div class="table-wrap"[^>]*>/)?.[0];
+    const logRegion = html.match(/<div class="logs"[^>]*>/)?.[0];
+    for (const tag of [orderRegion, logRegion]) {
+        assert.ok(tag);
+        assert.match(tag, /tabindex="0"/);
+        assert.match(tag, /aria-label="[^"]*可上下滑动"/);
+    }
+    assert.match(orderRegion, /role="region"/);
+    assert.match(logRegion, /role="log"/);
+});
+
+test("mobile horizontal chart passes vertical gestures back to the page", () => {
+    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
+    const chart = cssBlock(css, ".fill-hourly-chart");
+
+    assert.match(chart, /overflow-x:\s*auto/);
+    assert.match(chart, /overscroll-behavior-x:\s*contain/);
+    assert.match(chart, /overscroll-behavior-y:\s*auto/);
+    assert.match(chart, /touch-action:\s*pan-x pan-y/);
+});
+
+test("hour selection centers within scroll bounds", () => {
+    assert.equal(centeredScrollLeft(300, 900, 44, 1100), 772);
+    assert.equal(centeredScrollLeft(300, 20, 44, 1100), 0);
+    assert.equal(centeredScrollLeft(300, 1090, 44, 1100), 800);
+    assert.equal(centeredScrollLeft(400, 100, 44, 300), 0);
 });
 
 test("candles are normalized, ordered and summarized", () => {

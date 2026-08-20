@@ -197,6 +197,7 @@
                         <div class="fill-hourly-legend">
                             <span class="fill-key buy">B 买单</span>
                             <span class="fill-key sell">S 卖单</span>
+                            <span class="fill-mobile-hint" aria-hidden="true">横向滑动 · 点按查看</span>
                             <span class="fill-hourly-window" id="fillWindow">近 24 小时</span>
                         </div>
                         <div class="fill-hourly-stage">
@@ -216,7 +217,7 @@
                             轻触小时柱查看该时段买卖笔数
                         </p>
                     </div>
-                    <div class="table-wrap">
+                    <div class="table-wrap" role="region" aria-label="最近成交订单，可上下滑动" tabindex="0">
                         <table class="filled-orders-table">
                             <caption class="sr-only">最近 20 笔成交订单</caption>
                             <thead>
@@ -237,7 +238,8 @@
                         </div>
                         <span class="panel-meta">最新事件优先</span>
                     </div>
-                    <div class="logs" id="logs" role="log" aria-live="polite" aria-relevant="additions"></div>
+                    <div class="logs" id="logs" role="log" aria-label="最近日志，可上下滑动" tabindex="0"
+                        aria-live="polite" aria-relevant="additions"></div>
                 </section>
             </section>
         </main>
