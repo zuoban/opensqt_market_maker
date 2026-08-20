@@ -172,6 +172,49 @@ dashboard:
 
 面板展示价格、K 线网格执行图、程序启动后的成交订单、持仓、主动风控和最近日志。默认只绑定本机；若改成 `0.0.0.0` 会对外暴露账户与仓位，请同时设置 `token`。
 
+## 🐳 Docker (GitHub Packages)
+
+推送到 `main`、打 `v*` 版本标签，或手动触发 Actions 后，GitHub Actions 会自动构建 Docker 镜像并发布到 GitHub Container Registry（GitHub Packages）：
+
+```text
+ghcr.io/zuoban/opensqt_market_maker:<tag>
+```
+
+版本标签示例：`v3.4.5`、`3.4.5`、`latest`（仅版本 tag 会更新 `latest`）。`main` 分支会发布 `main` 和 `sha-*` 标签。镜像同时支持 `linux/amd64` 与 `linux/arm64`。
+
+首次发布的 Package 默认是私有的。可在仓库的 **Packages** 页面把可见性改为 Public，或拉取前先登录：
+
+```bash
+echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
+docker pull ghcr.io/zuoban/opensqt_market_maker:latest
+```
+
+镜像不包含 `config.yaml`，启动时必须挂载你自己的配置。容器内要访问监控面板时，请把 `dashboard.listen` 改成 `0.0.0.0:8787`，并建议设置 `dashboard.token`。
+
+```bash
+cp config.example.yaml config.yaml
+# 编辑 config.yaml：填写 API Key，并将 dashboard.listen 改为 0.0.0.0:8787
+
+docker compose up -d --build
+```
+
+或直接运行已发布镜像：
+
+```bash
+docker run -d --name opensqt_market_maker --restart unless-stopped \
+  --stop-timeout 30 \
+  -p 8787:8787 \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  -v "$PWD/log:/app/log" \
+  ghcr.io/zuoban/opensqt_market_maker:latest
+```
+
+监控面板：
+
+```text
+http://127.0.0.1:8787
+```
+
 ## 📦 版本发布 (Release)
 
 项目现在使用统一版本规范：以 [main.go](main.go#L21) 中的 `Version` 为准，Git Tag 与 GitHub Release 必须和它保持一致。
@@ -191,7 +234,7 @@ TARGET_OS=windows TARGET_ARCH=amd64 ./scripts/package_release.sh
 TARGET_OS=MacOS TARGET_ARCH=arm64 ./scripts/package_release.sh
 ```
 
-推送版本 tag 后，GitHub Actions 会自动构建并发布 Linux、Windows、MacOS 三个平台附件到 GitHub Release，其中 MacOS 使用 Apple Silicon 对应的 arm64 架构。
+推送版本 tag 后，GitHub Actions 会自动构建并发布 Linux、Windows、MacOS 三个平台附件到 GitHub Release，其中 MacOS 使用 Apple Silicon 对应的 arm64 架构；同时会构建 Docker 镜像并推送到 GitHub Packages（`ghcr.io`）。
 
 生成的发行包默认包含：
 

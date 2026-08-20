@@ -1,0 +1,28 @@
+# OpenSQT Market Maker
+#
+# 使用前请先准备 config.yaml（可从 config.example.yaml 复制）。
+# 容器内访问监控面板时，请把 dashboard.listen 改成 "0.0.0.0:8787"，
+# 并建议设置 dashboard.token。
+#
+# 拉取 GitHub Packages 私有镜像：
+#   echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
+#
+# 启动：
+#   docker compose up -d --build
+
+services:
+  market-maker:
+    image: ghcr.io/zuoban/opensqt_market_maker:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opensqt_market_maker
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./log:/app/log
+    ports:
+      - "8787:8787"
+    environment:
+      TZ: Asia/Shanghai

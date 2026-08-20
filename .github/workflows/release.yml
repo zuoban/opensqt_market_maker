@@ -85,5 +85,9 @@ jobs:
             - Windows amd64 archive
             - MacOS arm64 archive
             - SHA256 checksum files
+
+            Docker image (GitHub Packages):
+            - ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            - ghcr.io/${{ github.repository }}:latest
           files: |
             release-assets/*

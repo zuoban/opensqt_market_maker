@@ -34,6 +34,16 @@ git push origin v3.4.3
 - 构建 Linux amd64、Windows amd64、MacOS arm64 三个平台附件
 - 自动创建或更新 GitHub Release
 - 自动上传压缩包和对应的 `.sha256` 文件
+- 构建 `linux/amd64` 与 `linux/arm64` Docker 镜像，并推送到 GitHub Packages（GHCR）
+
+镜像地址：
+
+```text
+ghcr.io/zuoban/opensqt_market_maker:v3.4.5
+ghcr.io/zuoban/opensqt_market_maker:latest
+```
+
+首次发布的 Package 默认私有。如需公开拉取，到仓库 Packages 页面把可见性改为 Public。
 
 7. 如需本地手动生成单个平台发行包：
 
