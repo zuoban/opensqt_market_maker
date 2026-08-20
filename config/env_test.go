@@ -144,6 +144,37 @@ func TestLoadDotEnvDoesNotOverrideExisting(t *testing.T) {
 	}
 }
 
+func TestLoadConfigEnvOnlyWithoutYAML(t *testing.T) {
+	t.Setenv("OPENSQT_APP_CURRENT_EXCHANGE", "binance")
+	t.Setenv("OPENSQT_EXCHANGES_BINANCE_API_KEY", "env-key")
+	t.Setenv("OPENSQT_EXCHANGES_BINANCE_SECRET_KEY", "env-secret")
+	t.Setenv("OPENSQT_TRADING_SYMBOL", "ETHUSDC")
+	t.Setenv("OPENSQT_TRADING_ORDER_QUANTITY", "22")
+	t.Setenv("OPENSQT_TRADING_BUY_WINDOW_SIZE", "10")
+
+	cfg, err := LoadConfig(filepath.Join(t.TempDir(), "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.App.CurrentExchange != "binance" || cfg.Trading.Symbol != "ETHUSDC" {
+		t.Fatalf("cfg = %+v", cfg.App)
+	}
+	ex := cfg.Exchanges["binance"]
+	if ex.APIKey != "env-key" || ex.SecretKey != "env-secret" {
+		t.Fatalf("exchange = %+v", ex)
+	}
+	if cfg.Trading.OrderQuantity != 22 || cfg.Trading.BuyWindowSize != 10 {
+		t.Fatalf("trading = %+v", cfg.Trading)
+	}
+}
+
+func TestLoadConfigMissingYAMLWithoutEnvFails(t *testing.T) {
+	_, err := LoadConfig(filepath.Join(t.TempDir(), "config.yaml"))
+	if err == nil {
+		t.Fatal("expected validation error without yaml or env")
+	}
+}
+
 func TestRiskSymbolsAndBoolFromEnv(t *testing.T) {
 	t.Setenv("OPENSQT_RISK_CONTROL_ENABLED", "false")
 	t.Setenv("OPENSQT_RISK_CONTROL_MONITOR_SYMBOLS", "BTCUSDT, ETHUSDT")

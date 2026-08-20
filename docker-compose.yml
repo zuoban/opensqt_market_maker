@@ -1,10 +1,13 @@
 # OpenSQT Market Maker
 #
 # 使用前：
-#   cp config.example.yaml config.yaml
 #   cp .env.example .env
-# 在 .env 填写 API Key；策略参数可继续放在 config.yaml。
-# 非空环境变量会覆盖 YAML。
+# 在 .env 填齐交易所密钥和策略参数即可，config.yaml 不是必须的。
+# 若同时提供 YAML，非空环境变量仍会覆盖 YAML。
+#
+# 可选挂载 YAML：
+#   volumes:
+#     - ./config.yaml:/app/config.yaml:ro
 #
 # 拉取 GitHub Packages 私有镜像：
 #   echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
@@ -24,7 +27,6 @@ services:
     env_file:
       - .env
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
       - ./log:/app/log
     ports:
       - "8787:8787"

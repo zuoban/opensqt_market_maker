@@ -48,4 +48,3 @@ VOLUME ["/app/log"]
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/usr/local/bin/opensqt_market_maker"]
-CMD ["/app/config.yaml"]

@@ -65,7 +65,8 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 ## 配置
 
 - 模板：`config.example.yaml`；环境变量模板：`.env.example`（复制为 `.env`，不要提交）
-- 运行时：先读 YAML，再用非空 `OPENSQT_*` 覆盖。`.env` 只填充尚未设置的进程环境变量（容器注入优先）
+- `config.yaml` **不是必须的**。文件不存在时仅用环境变量；文件存在则先 YAML 再覆盖非空 `OPENSQT_*`
+- `.env` 只填充尚未设置的进程环境变量（容器注入优先）
 - 路径：命令行 > `OPENSQT_CONFIG` > `config.yaml`。额外 dotenv 路径：`OPENSQT_ENV_FILE`
 - 默认监控面板：`http://127.0.0.1:8787`。绑 `0.0.0.0` 时必须设 `dashboard.token`（可用 `OPENSQT_DASHBOARD_LISTEN` / `OPENSQT_DASHBOARD_TOKEN`）
 

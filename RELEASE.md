@@ -39,7 +39,7 @@ git push origin v3.4.3
 镜像地址：
 
 ```text
-ghcr.io/zuoban/opensqt_market_maker:v3.4.6
+ghcr.io/zuoban/opensqt_market_maker:v3.4.7
 ghcr.io/zuoban/opensqt_market_maker:latest
 ```
 

@@ -20,7 +20,7 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.4.6"
+var Version = "v3.4.7"
 
 func main() {
 	programStartedAt := time.Now()
@@ -37,6 +37,10 @@ func main() {
 	}
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
+	}
+
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		logger.Info("未找到配置文件 %s，仅使用环境变量", configPath)
 	}
 
 	cfg, err := config.LoadConfig(configPath)

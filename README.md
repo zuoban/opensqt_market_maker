@@ -141,7 +141,7 @@ opensqt_platform/
      sell_window_size: 10    # 卖单挂单数量
    ```
 
-密钥也可以写在 `.env` 里（例如 `OPENSQT_EXCHANGES_BINANCE_API_KEY`）。非空环境变量优先于 YAML。完整变量列表见 [.env.example](.env.example)。
+也可以只使用 `.env`（例如 `OPENSQT_EXCHANGES_BINANCE_API_KEY`），不必提供 `config.yaml`。若两者都有，非空环境变量优先。完整变量列表见 [.env.example](.env.example)。
 
 ### 运行 (Usage)
 
@@ -183,7 +183,7 @@ dashboard:
 ghcr.io/zuoban/opensqt_market_maker:<tag>
 ```
 
-版本标签示例：`v3.4.6`、`3.4.6`、`latest`（仅版本 tag 会更新 `latest`）。`main` 分支会发布 `main` 和 `sha-*` 标签。镜像同时支持 `linux/amd64` 与 `linux/arm64`。
+版本标签示例：`v3.4.7`、`3.4.7`、`latest`（仅版本 tag 会更新 `latest`）。`main` 分支会发布 `main` 和 `sha-*` 标签。镜像同时支持 `linux/amd64` 与 `linux/arm64`。
 
 首次发布的 Package 默认是私有的。可在仓库的 **Packages** 页面把可见性改为 Public，或拉取前先登录：
 
@@ -192,12 +192,11 @@ echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
 docker pull ghcr.io/zuoban/opensqt_market_maker:latest
 ```
 
-镜像不包含 `config.yaml` 和密钥。策略参数放 YAML，API Key / 面板 token 建议放 `.env`（非空环境变量会覆盖 YAML）。
+镜像不包含配置和密钥。`config.yaml` 不是必须的：把 `.env` 填齐即可启动。若同时挂载 YAML，非空环境变量仍会覆盖它。
 
 ```bash
-cp config.example.yaml config.yaml
 cp .env.example .env
-# 编辑 .env：填写 API Key，并设置 OPENSQT_DASHBOARD_TOKEN
+# 编辑 .env：填写 API Key、策略参数，并设置 OPENSQT_DASHBOARD_TOKEN
 
 docker compose up -d --build
 ```
@@ -211,7 +210,6 @@ docker run -d --name opensqt_market_maker --restart unless-stopped \
   --stop-timeout 30 \
   -p 8787:8787 \
   --env-file .env \
-  -v "$PWD/config.yaml:/app/config.yaml:ro" \
   -v "$PWD/log:/app/log" \
   ghcr.io/zuoban/opensqt_market_maker:latest
 ```
