@@ -24,7 +24,11 @@
     let chartGeometry = null;
     let chartSelection = null;
     let chartTooltipActive = false;
+    let chartPinned = false;
+    let chartPointer = null;
     let chartResizeObserver = null;
+    let selectedHourKey = null;
+    let toastTimer = null;
     const renderKeys = Object.create(null);
 
     const $ = (id) => document.getElementById(id);
@@ -609,6 +613,7 @@
             renderKlineStats(null, pos.priceDecimals ?? 2);
             setText($("klineDetail"), "获得首根 K 线后即可查看开、高、低、收明细");
             $("klineCanvas").setAttribute("aria-label", "K 线数据尚未就绪");
+            syncKlineStepper();
             drawKlineChart();
             return;
         }
@@ -624,10 +629,11 @@
             " · " + direction + " " + fmtSigned(chartModel.changePct, 2) + "%" +
             " · 网格层 " + chartModel.levels.length + degradedText;
         setText($("klineSummary"), summary);
-        $("klineCanvas").setAttribute("aria-label", summary + "。可使用左右方向键逐根查看。");
+        $("klineCanvas").setAttribute("aria-label", summary + "。可使用左右方向键或两侧按钮逐根查看。");
         renderKlineStats(chartModel, decimals);
-        if (chartTooltipActive && chartSelection !== null) updateSelectedCandle();
+        if ((chartTooltipActive || chartPinned) && chartSelection !== null) updateSelectedCandle();
         else setText($("klineDetail"), candleDetail(latest, decimals));
+        syncKlineStepper();
         drawKlineChart();
     }
 
@@ -651,32 +657,92 @@
         );
     }
 
+    function isCoarsePointer(event) {
+        if (event && event.pointerType) return event.pointerType === "touch" || event.pointerType === "pen";
+        return Boolean(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    }
+
+    function prefersReducedMotion() {
+        return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    }
+
+    function inspectKlineAt(clientX, options) {
+        if (!chartModel || !chartModel.candles.length || !chartGeometry) return;
+        const canvas = $("klineCanvas");
+        const rect = canvas.getBoundingClientRect();
+        const slot = chartGeometry.plotWidth / chartModel.candles.length;
+        const index = Math.max(0, Math.min(
+            chartModel.candles.length - 1,
+            Math.floor((clientX - rect.left - chartGeometry.left) / slot)
+        ));
+        chartSelection = index;
+        chartPinned = Boolean(options && options.pin);
+        chartTooltipActive = !isCoarsePointer();
+        updateSelectedCandle();
+        syncKlineStepper();
+        drawKlineChart();
+    }
+
+    function stepKline(delta) {
+        if (!chartModel || !chartModel.candles.length) return;
+        if (chartSelection === null) chartSelection = chartModel.candles.length - 1;
+        chartSelection = Math.max(0, Math.min(chartModel.candles.length - 1, chartSelection + delta));
+        chartPinned = true;
+        chartTooltipActive = !isCoarsePointer();
+        updateSelectedCandle();
+        syncKlineStepper();
+        drawKlineChart();
+    }
+
+    function syncKlineStepper() {
+        const prev = $("klinePrev");
+        const next = $("klineNext");
+        if (!prev || !next) return;
+        const count = chartModel && chartModel.candles ? chartModel.candles.length : 0;
+        const index = chartSelection === null ? count - 1 : chartSelection;
+        prev.disabled = count < 2 || index <= 0;
+        next.disabled = count < 2 || index >= count - 1;
+    }
+
     function initKlineChart() {
         const canvas = $("klineCanvas");
         const stage = $("klineStage");
         if (!canvas || !stage) return;
 
-        const selectAt = (clientX) => {
-            if (!chartModel || !chartModel.candles.length || !chartGeometry) return;
-            const rect = canvas.getBoundingClientRect();
-            const localX = clientX - rect.left;
-            const slot = chartGeometry.plotWidth / chartModel.candles.length;
-            const index = Math.max(0, Math.min(
-                chartModel.candles.length - 1,
-                Math.floor((localX - chartGeometry.left) / slot)
-            ));
-            chartSelection = index;
-            chartTooltipActive = true;
-            updateSelectedCandle();
-            drawKlineChart();
-        };
-
-        canvas.addEventListener("pointermove", (event) => selectAt(event.clientX));
         canvas.addEventListener("pointerdown", (event) => {
-            selectAt(event.clientX);
-            canvas.focus({ preventScroll: true });
+            chartPointer = {
+                id: event.pointerId,
+                x: event.clientX,
+                y: event.clientY,
+                panning: false
+            };
+            if (!isCoarsePointer(event)) {
+                inspectKlineAt(event.clientX, { pin: false });
+                canvas.focus({ preventScroll: true });
+            }
         });
-        canvas.addEventListener("pointerleave", () => {
+        canvas.addEventListener("pointermove", (event) => {
+            if (!isCoarsePointer(event)) {
+                inspectKlineAt(event.clientX, { pin: chartPinned });
+                return;
+            }
+            if (!chartPointer || event.pointerId !== chartPointer.id) return;
+            const dx = event.clientX - chartPointer.x;
+            const dy = event.clientY - chartPointer.y;
+            if (Math.hypot(dx, dy) > 10) chartPointer.panning = true;
+        });
+        canvas.addEventListener("pointerup", (event) => {
+            if (chartPointer && event.pointerId === chartPointer.id && !chartPointer.panning && isCoarsePointer(event)) {
+                inspectKlineAt(event.clientX, { pin: true });
+                canvas.focus({ preventScroll: true });
+            }
+            if (chartPointer && event.pointerId === chartPointer.id) chartPointer = null;
+        });
+        canvas.addEventListener("pointercancel", (event) => {
+            if (chartPointer && event.pointerId === chartPointer.id) chartPointer = null;
+        });
+        canvas.addEventListener("pointerleave", (event) => {
+            if (isCoarsePointer(event) || chartPinned) return;
             if (document.activeElement !== canvas) {
                 chartTooltipActive = false;
                 hideChartTooltip();
@@ -686,12 +752,14 @@
         canvas.addEventListener("focus", () => {
             if (chartModel && chartModel.candles.length) {
                 if (chartSelection === null) chartSelection = chartModel.candles.length - 1;
-                chartTooltipActive = true;
+                chartTooltipActive = !isCoarsePointer();
                 updateSelectedCandle();
+                syncKlineStepper();
                 drawKlineChart();
             }
         });
         canvas.addEventListener("blur", () => {
+            if (chartPinned) return;
             chartTooltipActive = false;
             hideChartTooltip();
             drawKlineChart();
@@ -699,13 +767,29 @@
         canvas.addEventListener("keydown", (event) => {
             if (!chartModel || !chartModel.candles.length || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
             event.preventDefault();
-            if (chartSelection === null) chartSelection = chartModel.candles.length - 1;
-            if (event.key === "ArrowLeft") chartSelection = Math.max(0, chartSelection - 1);
-            if (event.key === "ArrowRight") chartSelection = Math.min(chartModel.candles.length - 1, chartSelection + 1);
-            if (event.key === "Home") chartSelection = 0;
-            if (event.key === "End") chartSelection = chartModel.candles.length - 1;
-            chartTooltipActive = true;
-            updateSelectedCandle();
+            if (event.key === "ArrowLeft") stepKline(-1);
+            if (event.key === "ArrowRight") stepKline(1);
+            if (event.key === "Home") {
+                chartSelection = 0;
+                stepKline(0);
+            }
+            if (event.key === "End") {
+                chartSelection = chartModel.candles.length - 1;
+                stepKline(0);
+            }
+        });
+
+        const prev = $("klinePrev");
+        const next = $("klineNext");
+        if (prev) prev.addEventListener("click", () => stepKline(-1));
+        if (next) next.addEventListener("click", () => stepKline(1));
+
+        document.addEventListener("pointerdown", (event) => {
+            if (!chartPinned) return;
+            if (event.target.closest("#klineStage, .chart-inspect")) return;
+            chartPinned = false;
+            chartTooltipActive = false;
+            hideChartTooltip();
             drawKlineChart();
         });
 
@@ -759,9 +843,10 @@
             labelBg: color("--plot-label", "rgba(8,12,14,.9)")
         };
         const compact = width < 520;
-        const left = compact ? 9 : 14;
-        const axisWidth = compact ? 58 : 72;
-        const railWidth = compact ? 78 : 98;
+        const narrow = width < 400;
+        const left = narrow ? 6 : (compact ? 9 : 14);
+        const axisWidth = narrow ? 46 : (compact ? 58 : 72);
+        const railWidth = narrow ? 62 : (compact ? 78 : 98);
         const right = axisWidth + railWidth;
         const top = 22;
         const bottom = 30;
@@ -887,7 +972,7 @@
         ctx.stroke();
         drawAxisPriceTag(ctx, compactPrice(chartModel.latest.close), latestY, railRight + 4, colors.position, colors.surface, width - railRight - 5);
 
-        if (chartTooltipActive && chartSelection !== null && candles[chartSelection]) {
+        if (chartSelection !== null && candles[chartSelection] && (chartTooltipActive || chartPinned)) {
             const selected = candles[chartSelection];
             const x = left + slotWidth * (chartSelection + 0.5);
             const y = yForPrice(selected.close);
@@ -901,7 +986,8 @@
             ctx.lineTo(plotRight, y);
             ctx.stroke();
             ctx.globalAlpha = 1;
-            positionChartTooltip(x, y, width, height, selected);
+            if (chartTooltipActive && !isCoarsePointer()) positionChartTooltip(x, y, width, height, selected);
+            else hideChartTooltip();
         } else {
             hideChartTooltip();
         }
@@ -1414,33 +1500,90 @@
         empty.hidden = hasData;
         chart.hidden = !hasData;
         if (!hasData) {
+            selectedHourKey = null;
             setText($("fillHourlySummary"), "程序启动后暂无成交订单");
+            setText($("fillHourDetail"), "近 24 小时暂无成交");
             replaceChildren(chart, []);
             return;
         }
 
+        const lastKey = String(model.buckets[model.buckets.length - 1].key);
         const columns = model.buckets.map((bucket) => {
             const total = bucket.buy + bucket.sell;
-            const col = element("div", "hour-col" + (total ? "" : " is-empty"));
-            col.tabIndex = 0;
+            const col = element("button", "hour-col" + (total ? "" : " is-empty"));
+            col.type = "button";
+            col.dataset.hour = String(bucket.key);
+            col.dataset.detail = hourDetailText(bucket, quote, qtyDecimals);
+            if (String(bucket.key) === lastKey) col.classList.add("is-now");
             col.setAttribute(
                 "aria-label",
                 bucket.label + " 买单 " + bucket.buy + " 笔，卖单 " + bucket.sell + " 笔"
             );
-            col.title = bucket.label + "  买 " + bucket.buy + " / 卖 " + bucket.sell;
             const bars = element("div", "hour-bars");
             bars.style.setProperty("--max", String(Math.max(model.maxCount, 1)));
             bars.append(hourBar("buy", bucket.buy, "买"), hourBar("sell", bucket.sell, "卖"));
-            col.append(bars, element("div", "hour-label", bucket.label));
+            col.append(bars, element("div", "hour-label", pad2(bucket.hour.getHours())));
             return col;
         });
         replaceChildren(chart, columns);
+        applyHourSelection(chart, selectedHourKey);
         setText(
             $("fillHourlySummary"),
             "近 " + stats.hours + " 小时成交 " + stats.windowTotal + " 笔，买单 " +
                 stats.buyCount + "，卖单 " + stats.sellCount +
                 (stats.peakCount ? "，峰值在 " + stats.peakHour + " 共 " + stats.peakCount + " 笔" : "")
         );
+    }
+
+    function hourDetailText(bucket, quote, qtyDecimals) {
+        const total = bucket.buy + bucket.sell;
+        if (!total) return bucket.label + "  无成交";
+        return bucket.label +
+            "  买 " + bucket.buy + " 笔 / 卖 " + bucket.sell + " 笔" +
+            "  · 量 " + fmt(bucket.buyQty, qtyDecimals) + " / " + fmt(bucket.sellQty, qtyDecimals) +
+            "  · 盈亏 " + fmtSigned(bucket.pnl, 6) + " " + quote;
+    }
+
+    function applyHourSelection(chart, key) {
+        const columns = Array.from(chart.children);
+        if (!columns.length) return;
+        let selected = columns.find((col) => col.dataset.hour === key);
+        if (!selected) {
+            selected = columns.find((col) => col.classList.contains("is-now") && !col.classList.contains("is-empty"))
+                || columns.filter((col) => !col.classList.contains("is-empty")).pop()
+                || columns[columns.length - 1];
+        }
+        columns.forEach((col) => {
+            const on = col === selected;
+            col.classList.toggle("is-selected", on);
+            col.setAttribute("aria-pressed", on ? "true" : "false");
+        });
+        selectedHourKey = selected.dataset.hour;
+        setText($("fillHourDetail"), selected.dataset.detail || "");
+    }
+
+    function initHourlyChart() {
+        const chart = $("fillHourlyChart");
+        if (!chart) return;
+        chart.addEventListener("click", (event) => {
+            const col = event.target.closest(".hour-col");
+            if (!col || !chart.contains(col)) return;
+            applyHourSelection(chart, col.dataset.hour);
+        });
+        chart.addEventListener("keydown", (event) => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            const columns = Array.from(chart.querySelectorAll(".hour-col"));
+            if (!columns.length) return;
+            const current = columns.findIndex((col) => col.dataset.hour === selectedHourKey);
+            let next = current < 0 ? columns.length - 1 : current;
+            if (event.key === "ArrowLeft") next = Math.max(0, next - 1);
+            if (event.key === "ArrowRight") next = Math.min(columns.length - 1, next + 1);
+            if (event.key === "Home") next = 0;
+            if (event.key === "End") next = columns.length - 1;
+            event.preventDefault();
+            applyHourSelection(chart, columns[next].dataset.hour);
+            columns[next].focus();
+        });
     }
 
     function hourBar(side, count, label) {
@@ -1472,8 +1615,110 @@
             element("span", "order-id-full", id),
             element("span", "order-id-short", shortenId(id))
         );
-        cell.appendChild(code);
+        const button = element("button", "copy-id", "复制");
+        button.type = "button";
+        button.dataset.copy = id;
+        button.setAttribute("aria-label", "复制订单 ID " + id);
+        cell.append(code, button);
         return cell;
+    }
+
+    function showToast(message) {
+        const node = $("deskToast");
+        if (!node) return;
+        node.textContent = message;
+        node.classList.add("is-on");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => node.classList.remove("is-on"), 2200);
+    }
+
+    async function copyText(value) {
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(value);
+                return true;
+            }
+        } catch (_error) {
+            // Fall through to the execCommand path.
+        }
+        try {
+            const input = document.createElement("textarea");
+            input.value = value;
+            input.setAttribute("readonly", "");
+            input.style.position = "fixed";
+            input.style.left = "-9999px";
+            document.body.appendChild(input);
+            input.select();
+            const ok = document.execCommand("copy");
+            input.remove();
+            return ok;
+        } catch (_error) {
+            return false;
+        }
+    }
+
+    function initCopyOrders() {
+        const body = $("filledBody");
+        if (!body) return;
+        body.addEventListener("click", async (event) => {
+            const button = event.target.closest(".copy-id");
+            if (!button) return;
+            const value = button.dataset.copy || "";
+            const ok = Boolean(value) && await copyText(value);
+            showToast(ok ? "已复制订单 ID" : "复制失败");
+        });
+    }
+
+    function setActiveNav(hash) {
+        const nav = $("deskNav");
+        if (!nav) return;
+        nav.querySelectorAll("a[href^='#']").forEach((link) => {
+            const on = link.hash === hash;
+            link.classList.toggle("is-active", on);
+            if (on) link.setAttribute("aria-current", "page");
+            else link.removeAttribute("aria-current");
+        });
+    }
+
+    function initDeskNav() {
+        const nav = $("deskNav");
+        if (!nav) return;
+        const links = Array.from(nav.querySelectorAll("a[href^='#']"));
+        let navLockUntil = 0;
+        let scrollTimer = 0;
+
+        const updateFromScroll = () => {
+            if (Date.now() < navLockUntil) return;
+            const line = Math.max(64, (document.querySelector(".mast")?.getBoundingClientRect().bottom || 64) + 8);
+            let current = links[0];
+            links.forEach((link) => {
+                const section = document.querySelector(link.hash);
+                if (!section) return;
+                if (section.getBoundingClientRect().top - line <= 12) current = link;
+            });
+            if (current) setActiveNav(current.hash);
+        };
+
+        nav.addEventListener("click", (event) => {
+            const link = event.target.closest("a[href^='#']");
+            if (!link || !nav.contains(link)) return;
+            const target = document.querySelector(link.hash);
+            if (!target) return;
+            event.preventDefault();
+            navLockUntil = Date.now() + 1200;
+            setActiveNav(link.hash);
+            target.scrollIntoView({
+                behavior: prefersReducedMotion() ? "auto" : "smooth",
+                block: "start"
+            });
+            history.replaceState(null, "", link.hash);
+        });
+        if (location.hash) setActiveNav(location.hash);
+        window.addEventListener("scroll", () => {
+            clearTimeout(scrollTimer);
+            scrollTimer = setTimeout(updateFromScroll, 80);
+        }, { passive: true });
+        updateFromScroll();
     }
 
     function emptyRow(message, colSpan) {
@@ -1609,6 +1854,9 @@
     }
 
     initKlineChart();
+    initHourlyChart();
+    initCopyOrders();
+    initDeskNav();
     pullRest();
     connect();
     restTimer = setInterval(() => {
