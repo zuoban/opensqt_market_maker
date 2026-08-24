@@ -71,17 +71,16 @@ func isPostOnlyError(err error) bool {
 		strings.Contains(errStr, "ORDER_POC_IMMEDIATE")
 }
 
-// PlaceOrder 下单（带重试）
+// PlaceOrder 下单（严格 PostOnly，带重试）
 func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 	// 限流
 	if err := oe.rateLimiter.Wait(context.Background()); err != nil {
 		return nil, fmt.Errorf("速率限制等待失败: %v", err)
 	}
 
-	maxRetries := 5 // 增加重试次数:3次PostOnly + 1次降级 + 1次保险
+	const maxRetries = 5 // 首次尝试失败后最多再重试5次
 	var lastErr error
 	postOnlyFailCount := 0
-	degraded := false // 是否已降级为普通单
 
 	for i := 0; i <= maxRetries; i++ {
 		// 转换为通用订单请求
@@ -94,16 +93,9 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			Price:         req.Price,
 			PriceDecimals: req.PriceDecimals,
 			ReduceOnly:    req.ReduceOnly,
-			PostOnly:      req.PostOnly && !degraded, // 如果已降级，强制为普通单
-			ClientOrderID: req.ClientOrderID,         // 传递自定义订单ID
-		}
-
-		// 🔥 如果PostOnly已失败3次，降级为普通限价单
-		if postOnlyFailCount >= 3 && req.PostOnly && !degraded {
-			degraded = true
-			logger.Warn("⚠️ [%s] PostOnly已失败3次，降级为普通限价单: %s %.2f",
-				oe.exchange.GetName(), req.Side, req.Price)
-			exchangeReq.PostOnly = false
+			// 在最终下单边界强制 PostOnly，防止上层遗漏导致 Taker 成交。
+			PostOnly:      true,
+			ClientOrderID: req.ClientOrderID, // 传递自定义订单ID
 		}
 
 		// 调用交易所接口
@@ -121,13 +113,8 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 				CreatedAt:     time.Now(),
 			}
 
-			// 根据实际使用的订单类型显示日志
-			orderTypeDesc := "PostOnly"
-			if !exchangeReq.PostOnly {
-				orderTypeDesc = "普通单(PostOnly降级)"
-			}
-			logger.Info("✅ [%s] 下单成功(%s): %s %.*f 数量: %.4f 订单ID: %d",
-				oe.exchange.GetName(), orderTypeDesc, req.Side, req.PriceDecimals, req.Price, req.Quantity, exchangeOrder.OrderID)
+			logger.Info("✅ [%s] 下单成功(PostOnly): %s %.*f 数量: %.4f 订单ID: %d",
+				oe.exchange.GetName(), req.Side, req.PriceDecimals, req.Price, req.Quantity, exchangeOrder.OrderID)
 			return order, nil
 		}
 
@@ -144,19 +131,15 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			logger.Warn("⚠️ 触发速率限制，等待后重试...")
 			time.Sleep(oe.rateLimitRetryDelay)
 			continue
-		} else if isPostOnlyError(err) && !degraded {
-			// 🔥 PostOnly错误：价格会立即成交，记录失败次数(必须放在其他检查之前!)
+		} else if isPostOnlyError(err) {
+			// PostOnly 被拒表示该价格会立即成交。严格 Maker 模式下只重试，绝不降级为普通单。
 			postOnlyFailCount++
-			logger.Warn("⚠️ [%s] PostOnly被拒(%d/3): %s %.2f, 等待500ms后重试",
-				oe.exchange.GetName(), postOnlyFailCount, req.Side, req.Price)
+			logger.Warn("⚠️ [%s] PostOnly被拒(%d/%d): %s %.2f，严格Maker模式不会降级",
+				oe.exchange.GetName(), postOnlyFailCount, maxRetries+1, req.Side, req.Price)
 
-			// 如果还没达到3次，继续重试PostOnly
-			if postOnlyFailCount < 3 {
-				time.Sleep(500 * time.Millisecond)
-				continue
+			if i < maxRetries {
+				time.Sleep(oe.orderRetryDelay)
 			}
-			// 达到3次后，下一轮循环会触发降级
-			time.Sleep(500 * time.Millisecond)
 			continue
 		} else if strings.Contains(errStr, "-4061") {
 			// 持仓模式不匹配（已在前面处理，这里保留以防万一）

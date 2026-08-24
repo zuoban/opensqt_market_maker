@@ -334,7 +334,7 @@ type InventorySlot struct {
     // 锁定机制
     SlotStatus string  // FREE/PENDING/LOCKED
     
-    // PostOnly降级
+    // 历史字段：卖单撤销/拒绝计数（仅用于诊断）
     PostOnlyFailCount int
     
     mu sync.RWMutex  // 槽位锁
@@ -539,7 +539,7 @@ type OrderCleaner struct {
 #### 核心功能
 - **限流**: 25单/秒，突发30（可配置）
 - **重试**: 自动重试失败订单
-- **PostOnly降级**: 连续失败3次后降级为普通单
+- **严格 PostOnly**: 所有网格单只做 Maker，被拒后只重试，绝不降级为普通单
 
 #### 执行流程
 ```go
@@ -549,14 +549,12 @@ PlaceOrder(req *OrderRequest) (*Order, error) {
     
     // 2. 重试循环（最多5次）
     for i := 0; i <= 5; i++ {
+        req.PostOnly = true
         order, err := exchange.PlaceOrder(ctx, req)
         
         // 3. PostOnly错误检测
         if isPostOnlyError(err) {
-            postOnlyFailCount++
-            if postOnlyFailCount >= 3 {
-                degraded = true  // 降级为普通单
-            }
+            // 价格会立即成交，保持 PostOnly 并重试
             continue
         }
         

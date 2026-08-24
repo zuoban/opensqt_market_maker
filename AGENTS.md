@@ -52,7 +52,7 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 | `config/` | YAML 加载与校验 |
 | `exchange/` | `IExchange` + 各所 adapter/wrapper |
 | `monitor/` | 唯一价格流；面板用的 5m K 线缓存 |
-| `order/` | 下单执行（限流、PostOnly 降级、重试） |
+| `order/` | 下单执行（限流、严格 PostOnly、重试） |
 | `position/` | 超级槽位、成交记录、小时汇总 |
 | `safety/` | 启动检查、主动风控、对账、订单清理 |
 | `web/` | 只读监控（Go embed `web/static/`） |

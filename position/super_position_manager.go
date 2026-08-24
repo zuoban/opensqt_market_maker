@@ -143,7 +143,7 @@ type InventorySlot struct {
 	// 🔥 新增：槽位锁定状态，防止并发重复操作
 	SlotStatus string // FREE/PENDING/LOCKED
 
-	// PostOnly失败计数（连续失败3次后降级为普通单）
+	// 历史字段：卖单撤销/拒绝计数（仅用于诊断，不会降级为普通单）
 	PostOnlyFailCount int
 
 	// 当前订单已计入的累计已实现盈亏（非增量推送用）
@@ -470,16 +470,13 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 			// 🔥 锁定槽位：标记为PENDING状态，防止并发操作
 			slot.SlotStatus = SlotStatusPending
 
-			// 检查PostOnly失败计数，失败3次后不再使用PostOnly
-			usePostOnly := slot.PostOnlyFailCount < 3
-
 			ordersToPlace = append(ordersToPlace, &OrderRequest{
 				Symbol:        spm.config.Trading.Symbol,
 				Side:          "BUY",
 				Price:         price,
 				Quantity:      quantity,
 				PriceDecimals: spm.priceDecimals,
-				PostOnly:      usePostOnly,
+				PostOnly:      true,
 				ClientOrderID: clientOID,
 			})
 			buyOrdersToCreate++
@@ -585,8 +582,6 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 
 			// 🔥 立即锁定槽位：标记为PENDING状态，防止并发操作
 			slot.SlotStatus = SlotStatusPending
-			// 检查PostOnly失败计数，失败3次后不再使用PostOnly
-			usePostOnly := slot.PostOnlyFailCount < 3
 			slot.mu.Unlock()
 
 			// 生成 ClientOrderID (注意：使用 SlotPrice 即买入价作为标识)
@@ -599,7 +594,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				Quantity:      candidate.Quantity,
 				PriceDecimals: spm.priceDecimals,
 				ReduceOnly:    true,
-				PostOnly:      usePostOnly,
+				PostOnly:      true,
 				ClientOrderID: clientOID, // 🔥
 			})
 			sellOrdersToCreate++
@@ -693,7 +688,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				// 🔥 订单提交成功，设置为LOCKED状态
 				slot.SlotStatus = SlotStatusLocked
 				// 注意：不在这里重置PostOnlyFailCount，因为订单可能立即被撤销
-				// PostOnly计数只在订单真正成交时重置
+				// 撤销/拒绝诊断计数只在订单真正成交时重置
 
 				logger.Debug("✅ [实时新增] 槽位价格: %s, %s订单, 订单价格: %s, 订单ID: %d, ClientOID: %s",
 					formatPrice(price, spm.priceDecimals), side, formatPrice(ord.Price, spm.priceDecimals), ord.OrderID, ord.ClientOrderID)
@@ -787,7 +782,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 				slot.PositionStatus = PositionStatusFilled // 标记为有仓
 				// 🔥 释放槽位锁：买单成交，允许后续挂卖单
 				slot.SlotStatus = SlotStatusFree
-				// 🔥 买单成交，重置PostOnly失败计数
+				// 买单成交，重置撤销/拒绝诊断计数
 				slot.PostOnlyFailCount = 0
 				logger.Info("✅ [买单成交] 价格: %s, 持仓: %.4f, 槽位状态: %s -> %s, 订单状态: %s -> %s, SlotStatus: FREE",
 					formatPrice(price, spm.priceDecimals), slot.PositionQty,
@@ -822,7 +817,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 				}
 				// 🔥 释放槽位锁：卖单成交，允许后续挂买单
 				slot.SlotStatus = SlotStatusFree
-				// 🔥 卖单成交，重置PostOnly失败计数
+				// 卖单成交，重置撤销/拒绝诊断计数
 				slot.PostOnlyFailCount = 0
 				logger.Info("✅ [卖单成交] 价格: %s, 剩余持仓: %.4f, 槽位状态: %s, 订单状态: %s, SlotStatus: FREE",
 					formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.PositionStatus, slot.OrderStatus)
@@ -864,9 +859,9 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		} else if side == "SELL" {
 			// 卖单被取消/拒绝：应该还持有币，保持持仓状态
 			if slot.PositionQty > 0 {
-				// 增加PostOnly失败计数（订单被交易所撤销通常是PostOnly失败）
+				// 记录撤销/拒绝次数供诊断；主动撤单、过期与 PostOnly 拒绝都可能进入此分支。
 				slot.PostOnlyFailCount++
-				logger.Info("🔄 [卖单取消] 价格: %s, 保持持仓状态: %.4f, 等待重挂, PostOnly失败计数: %d",
+				logger.Info("🔄 [卖单取消] 价格: %s, 保持持仓状态: %.4f, 等待重挂, 撤销/拒绝计数: %d",
 					formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.PostOnlyFailCount)
 				slot.PositionStatus = PositionStatusFilled
 				slot.SlotStatus = SlotStatusFree // 允许重新挂卖单
