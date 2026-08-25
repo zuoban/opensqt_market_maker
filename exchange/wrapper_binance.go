@@ -97,27 +97,9 @@ func (w *binanceWrapper) BatchCancelOrders(ctx context.Context, symbol string, o
 	return w.adapter.BatchCancelOrders(ctx, symbol, orderIDs)
 }
 
-// CancelAllOrders 撤销所有订单（Binance实现）
-// 查询所有未完成订单后批量撤销
+// CancelAllOrders 使用 Binance 原生一键全撤，并由适配器确认订单已经清空。
 func (w *binanceWrapper) CancelAllOrders(ctx context.Context, symbol string) error {
-	// 1. 查询所有未完成订单
-	openOrders, err := w.adapter.GetOpenOrders(ctx, symbol)
-	if err != nil {
-		return err
-	}
-
-	if len(openOrders) == 0 {
-		return nil // 没有订单需要撤销
-	}
-
-	// 2. 提取所有订单ID
-	orderIDs := make([]int64, len(openOrders))
-	for i, order := range openOrders {
-		orderIDs[i] = order.OrderID
-	}
-
-	// 3. 批量撤销（adapter会自动分批处理）
-	return w.adapter.BatchCancelOrders(ctx, symbol, orderIDs)
+	return w.adapter.CancelAllOrders(ctx, symbol)
 }
 
 func (w *binanceWrapper) GetOrder(ctx context.Context, symbol string, orderID int64) (*Order, error) {

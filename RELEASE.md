@@ -65,18 +65,19 @@ TARGET_OS=MacOS TARGET_ARCH=arm64 ./scripts/package_release.sh
 脚本 [scripts/package_release.sh](scripts/package_release.sh) 会生成以下内容：
 
 - 编译后的可执行文件 `opensqt_market_maker` 或 `opensqt_market_maker.exe`
-- 整个 `live_server/` 目录
+- `live_server/` 中由 Git 明确跟踪的演示文件
 - `config.example.yaml`
 - `config.yaml`
 - `.env.example`
 - `README.md`
 - `ARCHITECTURE.md`
-- `部署教程.pdf`
 
 ## 安全说明
 
 - 发布包中的 `config.yaml` 由 `config.example.yaml` 复制生成，不会使用你本机的真实 [config.yaml](config.yaml)。
 - 这样可以保留开箱即用的目录结构，同时避免把 API Key 或私钥打进公开 Release。
+- `live_server/` 只复制 Git 已跟踪文件，忽略文件和本机临时文件不会进入公开 Release。
+- `部署教程.pdf` 仅作为本地资料保留并已加入 `.gitignore`；发布前必须确认它不再被 Git 跟踪，因此不会进入 tag、GitHub 自动生成的源码包或公开 Release。
 
 ## 推荐命名
 

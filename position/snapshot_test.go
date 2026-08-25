@@ -11,8 +11,8 @@ import (
 type stubExecutor struct{}
 
 func (stubExecutor) PlaceOrder(req *OrderRequest) (*Order, error) { return nil, nil }
-func (stubExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool) {
-	return nil, false
+func (stubExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool, error) {
+	return nil, false, nil
 }
 func (stubExecutor) BatchCancelOrders(orderIDs []int64) error { return nil }
 

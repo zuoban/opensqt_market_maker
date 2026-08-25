@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"opensqt/exchange/streamhealth"
 	"opensqt/logger"
 
 	"github.com/gorilla/websocket"
@@ -62,9 +63,15 @@ type WebSocketManager struct {
 	priceCallback func(string, float64) // symbol, price
 
 	// 控制
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	publicCtx         context.Context
+	publicCancel      context.CancelFunc
+	publicDoneC       chan struct{}
+	publicStopping    bool
+	privateCtx        context.Context
+	privateCancel     context.CancelFunc
+	privateDoneC      chan struct{}
+	privateStopping   bool
+	privateGeneration uint64
 
 	// 价格缓存
 	latestPrice float64
@@ -73,12 +80,17 @@ type WebSocketManager struct {
 	// 🔥 标记消息处理是否已启动
 	privateHandlerStarted bool
 	publicHandlerStarted  bool
+	orderHealth           streamhealth.Tracker
 
 	// 🔥 重连控制
 	publicReconnectChan  chan struct{}
 	privateReconnectChan chan struct{}
 	reconnectDelay       time.Duration
 	subscribedSymbol     string // 记录订阅的交易对，用于重连后重新订阅
+	subscribedInstType   string
+	privateURL           string
+	publicURL            string
+	handshakeTTL         time.Duration
 }
 
 // SetPriceCallback 设置价格回调
@@ -106,11 +118,12 @@ type OrderResponse struct {
 
 // WebSocket 消息结构
 type WSMessage struct {
-	Op   string          `json:"op"`
-	Args []interface{}   `json:"args,omitempty"`
-	Data json.RawMessage `json:"data,omitempty"`
-	Code json.RawMessage `json:"code,omitempty"` // 可能是字符串或数字
-	Msg  string          `json:"msg,omitempty"`
+	Event string          `json:"event,omitempty"`
+	Op    string          `json:"op"`
+	Args  []interface{}   `json:"args,omitempty"`
+	Data  json.RawMessage `json:"data,omitempty"`
+	Code  json.RawMessage `json:"code,omitempty"` // 可能是字符串或数字
+	Msg   string          `json:"msg,omitempty"`
 }
 
 // GetCodeString 获取 code 的字符串值
@@ -147,16 +160,31 @@ func NewWebSocketManager(apiKey, secretKey, passphrase string) *WebSocketManager
 		publicReconnectChan:  make(chan struct{}, 1),
 		privateReconnectChan: make(chan struct{}, 1),
 		reconnectDelay:       5 * time.Second,
+		privateURL:           BitgetWSPrivate,
+		publicURL:            BitgetWSPublic,
+		handshakeTTL:         10 * time.Second,
 	}
 }
 
 // publicConnectLoop 公共频道连接循环（自动重连）
-func (w *WebSocketManager) publicConnectLoop() {
-	defer w.wg.Done()
+func (w *WebSocketManager) publicConnectLoop(ctx context.Context, doneC chan struct{}) {
+	defer func() {
+		w.mu.Lock()
+		if w.publicDoneC == doneC {
+			w.publicConn = nil
+			w.publicCtx = nil
+			w.publicCancel = nil
+			w.publicDoneC = nil
+			w.publicHandlerStarted = false
+			w.publicStopping = false
+		}
+		w.mu.Unlock()
+		close(doneC)
+	}()
 
 	for {
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("✅ [Bitget WS公共] 停止连接循环")
 			return
 		default:
@@ -165,12 +193,18 @@ func (w *WebSocketManager) publicConnectLoop() {
 		logger.Info("🔗 [Bitget WS公共] 正在连接...")
 
 		// 连接公共频道
-		conn, _, err := websocket.DefaultDialer.Dial(BitgetWSPublic, nil)
+		w.mu.RLock()
+		publicURL := w.publicURL
+		handshakeTTL := bitgetHandshakeTTL(w.handshakeTTL)
+		w.mu.RUnlock()
+		dialCtx, cancelDial := context.WithTimeout(ctx, handshakeTTL)
+		conn, _, err := websocket.DefaultDialer.DialContext(dialCtx, publicURL, nil)
+		cancelDial()
 		if err != nil {
 			logger.Error("❌ [Bitget WS公共] 连接失败: %v，%v后重试", err, w.reconnectDelay)
 			// 使用 select 等待，可以立即响应 context 取消
 			select {
-			case <-w.ctx.Done():
+			case <-ctx.Done():
 				logger.Info("✅ [Bitget WS公共] 停止连接循环")
 				return
 			case <-time.After(w.reconnectDelay):
@@ -179,19 +213,25 @@ func (w *WebSocketManager) publicConnectLoop() {
 		}
 
 		w.mu.Lock()
+		if w.publicDoneC != doneC {
+			w.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
 		w.publicConn = conn
 		symbol := w.subscribedSymbol
+		instType := w.subscribedInstType
 		w.mu.Unlock()
 
 		logger.Info("✅ [Bitget WS公共] 已连接")
 
 		// 订阅价格更新
-		if err := w.subscribeTicker(symbol); err != nil {
+		if err := w.subscribeTicker(conn, symbol, instType); err != nil {
 			logger.Error("❌ [Bitget WS公共] 订阅失败: %v", err)
 			conn.Close()
 			// 使用 select 等待，可以立即响应 context 取消
 			select {
-			case <-w.ctx.Done():
+			case <-ctx.Done():
 				logger.Info("✅ [Bitget WS公共] 停止连接循环")
 				return
 			case <-time.After(w.reconnectDelay):
@@ -201,19 +241,22 @@ func (w *WebSocketManager) publicConnectLoop() {
 
 		// 启动 ping 和读取协程
 		done := make(chan struct{})
+		stopKeepAliveC := make(chan struct{})
 		go func() {
-			w.keepAlive(conn, "公共", w.publicReconnectChan)
+			w.keepAlive(ctx, conn, "公共", w.publicReconnectChan, stopKeepAliveC)
 			close(done)
 		}()
 
 		// 启动读取循环（阻塞直到连接断开）
-		w.handlePublicMessages(conn)
+		w.handlePublicMessages(ctx, conn)
+		close(stopKeepAliveC)
+		_ = conn.Close()
 
 		// 等待 keepAlive 退出（同时监听 context 取消）
 		select {
 		case <-done:
 			// keepAlive 正常退出
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			// context 取消，不等待 keepAlive
 			logger.Info("✅ [Bitget WS公共] 停止连接循环")
 			return
@@ -229,7 +272,7 @@ func (w *WebSocketManager) publicConnectLoop() {
 
 		// 检查是否因为 context 取消而断开，如果是则直接退出
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("✅ [Bitget WS公共] 停止连接循环")
 			return
 		default:
@@ -238,7 +281,7 @@ func (w *WebSocketManager) publicConnectLoop() {
 		logger.Warn("⚠️ [Bitget WS公共] 连接断开，%v后重连...", w.reconnectDelay)
 		// 使用 select 等待，可以立即响应 context 取消
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("✅ [Bitget WS公共] 停止连接循环")
 			return
 		case <-time.After(w.reconnectDelay):
@@ -247,12 +290,40 @@ func (w *WebSocketManager) publicConnectLoop() {
 }
 
 // privateConnectLoop 私有频道连接循环（自动重连）
-func (w *WebSocketManager) privateConnectLoop() {
-	defer w.wg.Done()
+func (w *WebSocketManager) privateConnectLoop(ctx context.Context, doneC chan struct{}, generation uint64, initialResultC chan<- error) {
+	initialPending := initialResultC != nil
+	reportInitial := func(err error) {
+		if !initialPending {
+			return
+		}
+		initialPending = false
+		initialResultC <- err
+	}
+	defer func() {
+		if initialPending {
+			err := ctx.Err()
+			if err == nil {
+				err = fmt.Errorf("订单流在握手完成前停止")
+			}
+			reportInitial(err)
+		}
+		w.mu.Lock()
+		if w.privateDoneC == doneC && w.privateGeneration == generation {
+			w.privateHandlerStarted = false
+			w.privateStopping = false
+			w.privateConn = nil
+			w.privateCtx = nil
+			w.privateCancel = nil
+			w.privateDoneC = nil
+			w.orderHealth.Set(streamhealth.StateStopped, nil)
+		}
+		w.mu.Unlock()
+		close(doneC)
+	}()
 
 	for {
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("✅ [Bitget WS私有] 停止连接循环")
 			return
 		default:
@@ -261,11 +332,23 @@ func (w *WebSocketManager) privateConnectLoop() {
 		logger.Info("🔗 [Bitget WS私有] 正在连接...")
 
 		// 连接私有频道
-		if err := w.connectPrivate(); err != nil {
-			logger.Error("❌ [Bitget WS私有] 连接失败: %v，%v后重试", err, w.reconnectDelay)
+		conn, err := w.connectPrivate(ctx, doneC, generation)
+		if err != nil {
+			if ctx.Err() != nil {
+				reportInitial(ctx.Err())
+				return
+			}
+			wrappedErr := fmt.Errorf("私有流登录失败: %w", err)
+			if initialPending {
+				w.setPrivateHealth(generation, streamhealth.StateStopped, wrappedErr)
+				reportInitial(wrappedErr)
+				return
+			}
+			w.setPrivateHealth(generation, streamhealth.StateDegraded, wrappedErr)
+			logger.Error("❌ [Bitget WS私有] %v，%v后重试", wrappedErr, w.reconnectDelay)
 			// 使用 select 等待，可以立即响应 context 取消
 			select {
-			case <-w.ctx.Done():
+			case <-ctx.Done():
 				logger.Info("✅ [Bitget WS私有] 停止连接循环")
 				return
 			case <-time.After(w.reconnectDelay):
@@ -273,65 +356,80 @@ func (w *WebSocketManager) privateConnectLoop() {
 			continue
 		}
 
-		w.mu.Lock()
-		conn := w.privateConn
+		w.mu.RLock()
 		symbol := w.subscribedSymbol
-		w.mu.Unlock()
+		instType := w.subscribedInstType
+		w.mu.RUnlock()
 
 		// 订阅订单更新
-		if err := w.subscribeOrders(symbol); err != nil {
-			logger.Error("❌ [Bitget WS私有] 订阅失败: %v", err)
-			conn.Close()
+		err = w.subscribeOrders(conn, symbol, instType)
+		if err == nil {
+			err = w.waitPrivateSubscription(conn, instType, generation)
+		}
+		if err != nil {
+			_ = conn.Close()
+			w.clearPrivateConn(doneC, generation, conn)
+			if ctx.Err() != nil {
+				reportInitial(ctx.Err())
+				return
+			}
+			wrappedErr := fmt.Errorf("私有订单频道订阅失败: %w", err)
+			if initialPending {
+				w.setPrivateHealth(generation, streamhealth.StateStopped, wrappedErr)
+				reportInitial(wrappedErr)
+				return
+			}
+			w.setPrivateHealth(generation, streamhealth.StateDegraded, wrappedErr)
+			logger.Error("❌ [Bitget WS私有] %v", wrappedErr)
 			// 使用 select 等待，可以立即响应 context 取消
 			select {
-			case <-w.ctx.Done():
+			case <-ctx.Done():
 				logger.Info("✅ [Bitget WS私有] 停止连接循环")
 				return
 			case <-time.After(w.reconnectDelay):
 			}
 			continue
 		}
+		if ctx.Err() != nil || !w.setPrivateHealth(generation, streamhealth.StateReady, nil) {
+			_ = conn.Close()
+			stopErr := ctx.Err()
+			if stopErr == nil {
+				stopErr = fmt.Errorf("私有订单流已停止")
+			}
+			reportInitial(stopErr)
+			return
+		}
+		reportInitial(nil)
+		logger.Info("✅ [Bitget WS私有] 订单频道已登录并订阅")
 
 		// 启动 ping 和读取协程
 		done := make(chan struct{})
+		stopKeepAliveC := make(chan struct{})
 		go func() {
-			w.keepAlive(conn, "私有", w.privateReconnectChan)
+			w.keepAlive(ctx, conn, "私有", w.privateReconnectChan, stopKeepAliveC)
 			close(done)
 		}()
 
 		// 启动读取循环（阻塞直到连接断开）
-		w.handlePrivateMessages(conn)
-
-		// 等待 keepAlive 退出（同时监听 context 取消）
-		select {
-		case <-done:
-			// keepAlive 正常退出
-		case <-w.ctx.Done():
-			// context 取消，不等待 keepAlive
-			logger.Info("✅ [Bitget WS私有] 停止连接循环")
+		streamErr := w.handlePrivateMessages(ctx, conn, generation, instType)
+		close(stopKeepAliveC)
+		_ = conn.Close()
+		if ctx.Err() == nil {
+			if streamErr == nil {
+				streamErr = fmt.Errorf("私有订单流连接已断开")
+			}
+			w.setPrivateHealth(generation, streamhealth.StateDegraded, streamErr)
+		}
+		<-done
+		w.clearPrivateConn(doneC, generation, conn)
+		if ctx.Err() != nil {
 			return
 		}
 
-		// 连接断开，清理
-		w.mu.Lock()
-		if w.privateConn == conn {
-			w.privateConn = nil
-		}
-		w.mu.Unlock()
-		conn.Close()
-
-		// 检查是否因为 context 取消而断开，如果是则直接退出
-		select {
-		case <-w.ctx.Done():
-			logger.Info("✅ [Bitget WS私有] 停止连接循环")
-			return
-		default:
-		}
-
-		logger.Warn("⚠️ [Bitget WS私有] 连接断开，%v后重连...", w.reconnectDelay)
+		logger.Warn("⚠️ [Bitget WS私有] 连接断开: %v，%v后重连...", streamErr, w.reconnectDelay)
 		// 使用 select 等待，可以立即响应 context 取消
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			logger.Info("✅ [Bitget WS私有] 停止连接循环")
 			return
 		case <-time.After(w.reconnectDelay):
@@ -343,69 +441,186 @@ func (w *WebSocketManager) privateConnectLoop() {
 // 保留该方法以兼容旧代码，但建议直接调用 Start()
 func (w *WebSocketManager) ConnectAndLogin(ctx context.Context, symbol string) error {
 	// 直接调用 Start 方法
-	return w.Start(ctx, symbol, nil)
+	return w.Start(ctx, symbol, "USDT-FUTURES", nil)
 }
 
 // Start 启动 WebSocket 连接（公共频道+私有频道）
 // 订阅价格更新(ticker)和订单更新(orders)
 // callback: 订单更新回调函数，为nil时不订阅订单频道
-func (w *WebSocketManager) Start(ctx context.Context, symbol string, callback func(interface{})) error {
-	w.mu.Lock()
-	w.ctx, w.cancel = context.WithCancel(ctx)
-	w.orderCallback = callback
-	w.subscribedSymbol = symbol // 记录订阅的交易对
-	w.mu.Unlock()
-
-	// 🔥 启动公共频道重连循环
-	if !w.publicHandlerStarted {
-		w.wg.Add(1)
-		go w.publicConnectLoop()
-		w.publicHandlerStarted = true
+func (w *WebSocketManager) Start(ctx context.Context, symbol, instType string, callback func(interface{})) error {
+	if ctx == nil {
+		return fmt.Errorf("WebSocket 上下文不能为空")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("WebSocket 上下文已结束: %w", err)
+	}
+	instType = normalizeBitgetInstType(instType)
+	if symbol == "" || instType == "" {
+		return fmt.Errorf("订阅交易对和产品类型不能为空")
 	}
 
-	// 🔥 启动私有频道重连循环（如果有订单回调）
+	w.mu.Lock()
+	if w.publicStopping || (callback != nil && w.privateStopping) {
+		state := w.orderHealth.State()
+		w.mu.Unlock()
+		return fmt.Errorf("WebSocket 正在停止（订单流状态=%s）", state)
+	}
+	if w.publicHandlerStarted && (w.publicCtx == nil || w.publicCtx.Err() != nil) {
+		state := w.orderHealth.State()
+		w.mu.Unlock()
+		return fmt.Errorf("公共 WebSocket 正在退出（订单流状态=%s）", state)
+	}
+	if callback != nil && w.privateHandlerStarted && (w.privateCtx == nil || w.privateCtx.Err() != nil) {
+		state := w.orderHealth.State()
+		w.mu.Unlock()
+		return fmt.Errorf("私有 WebSocket 正在退出（订单流状态=%s）", state)
+	}
+	if w.subscribedSymbol != "" && (w.publicHandlerStarted || w.privateHandlerStarted) &&
+		(w.subscribedSymbol != symbol || !strings.EqualFold(w.subscribedInstType, instType)) {
+		w.mu.Unlock()
+		return fmt.Errorf("已运行的 WebSocket 订阅为 %s/%s，不能改为 %s/%s",
+			w.subscribedInstType, w.subscribedSymbol, instType, symbol)
+	}
+	w.subscribedSymbol = symbol // 记录订阅的交易对
+	w.subscribedInstType = instType
+
+	startPublic := false
+	var publicCtx context.Context
+	var publicDoneC chan struct{}
+	if !w.publicHandlerStarted {
+		publicCtx, w.publicCancel = context.WithCancel(ctx)
+		w.publicCtx = publicCtx
+		w.publicDoneC = make(chan struct{})
+		publicDoneC = w.publicDoneC
+		w.publicHandlerStarted = true
+		startPublic = true
+	}
+
+	startPrivate := false
+	var privateCtx context.Context
+	var privateDoneC chan struct{}
+	var generation uint64
 	if callback != nil && !w.privateHandlerStarted {
-		w.wg.Add(1)
-		go w.privateConnectLoop()
+		w.orderCallback = callback
+		privateCtx, w.privateCancel = context.WithCancel(ctx)
+		w.privateCtx = privateCtx
+		w.privateDoneC = make(chan struct{})
+		privateDoneC = w.privateDoneC
+		w.privateGeneration++
+		generation = w.privateGeneration
 		w.privateHandlerStarted = true
+		startPrivate = true
+		w.orderHealth.Set(streamhealth.StateStarting, nil)
+	}
+	alreadyPrivateReady := callback != nil && !startPrivate && w.orderHealth.Ready()
+	if callback != nil && alreadyPrivateReady {
+		w.orderCallback = callback
+	}
+	w.mu.Unlock()
+
+	if startPublic {
+		go w.publicConnectLoop(publicCtx, publicDoneC)
+	}
+	var initialResultC chan error
+	if startPrivate {
+		initialResultC = make(chan error, 1)
+		go w.privateConnectLoop(privateCtx, privateDoneC, generation, initialResultC)
 	}
 
 	if callback != nil {
-		logger.Info("✅ [Bitget WebSocket] 启动成功，将订阅 %s 的价格和订单更新", symbol)
+		if !startPrivate && !alreadyPrivateReady {
+			return fmt.Errorf("私有订单流已在运行但未就绪（状态=%s）", w.orderHealth.State())
+		}
+		if startPrivate {
+			if err := <-initialResultC; err != nil {
+				<-privateDoneC
+				return err
+			}
+		}
+		logger.Info("✅ [Bitget WebSocket] 私有订单流已就绪，并将订阅 %s 的价格更新", symbol)
 	} else {
-		logger.Info("✅ [Bitget WebSocket] 启动成功，将订阅 %s 的价格更新", symbol)
+		logger.Info("✅ [Bitget WebSocket] 已启动 %s 的价格连接", symbol)
 	}
 	return nil
 }
 
 // Stop 停止 WebSocket
 func (w *WebSocketManager) Stop() {
-	// 🔥 第一步：取消 context 并关闭连接（需要加锁）
 	w.mu.Lock()
-	if w.cancel != nil {
-		w.cancel()
+	privateCancel := w.privateCancel
+	publicCancel := w.publicCancel
+	privateDoneC := w.privateDoneC
+	publicDoneC := w.publicDoneC
+	privateConn := w.privateConn
+	publicConn := w.publicConn
+	if w.privateHandlerStarted {
+		w.privateStopping = true
+		w.orderHealth.Set(streamhealth.StateStopping, nil)
 	}
-
-	if w.privateConn != nil {
-		w.privateConn.Close()
-	}
-	if w.publicConn != nil {
-		w.publicConn.Close()
+	if w.publicHandlerStarted {
+		w.publicStopping = true
 	}
 	w.mu.Unlock()
 
-	// 🔥 第二步：等待所有 goroutine 退出（不能持有锁，避免死锁）
-	w.wg.Wait()
+	if privateCancel != nil {
+		privateCancel()
+	}
+	if publicCancel != nil {
+		publicCancel()
+	}
+	if privateConn != nil {
+		_ = privateConn.Close()
+	}
+	if publicConn != nil {
+		_ = publicConn.Close()
+	}
+	w.waitStreamStopped(privateDoneC, "私有")
+	w.waitStreamStopped(publicDoneC, "公共")
 	logger.Info("✅ [Bitget WebSocket] 已停止")
 }
 
+func (w *WebSocketManager) waitStreamStopped(doneC <-chan struct{}, name string) {
+	if doneC == nil {
+		return
+	}
+	select {
+	case <-doneC:
+	case <-time.After(10 * time.Second):
+		logger.Warn("⚠️ [Bitget WS%s] 停止超时", name)
+	}
+}
+
 // connectPrivate 连接私有 WebSocket
-func (w *WebSocketManager) connectPrivate() error {
-	conn, _, err := websocket.DefaultDialer.Dial(BitgetWSPrivate, nil)
+func (w *WebSocketManager) connectPrivate(ctx context.Context, doneC chan struct{}, generation uint64) (*websocket.Conn, error) {
+	w.mu.RLock()
+	privateURL := w.privateURL
+	handshakeTTL := w.handshakeTTL
+	w.mu.RUnlock()
+	dialCtx, cancelDial := context.WithTimeout(ctx, bitgetHandshakeTTL(handshakeTTL))
+	conn, _, err := websocket.DefaultDialer.DialContext(dialCtx, privateURL, nil)
+	cancelDial()
 	if err != nil {
-		return err
+		return nil, err
+	}
+	w.mu.Lock()
+	if w.privateDoneC != doneC || w.privateGeneration != generation || w.privateStopping {
+		w.mu.Unlock()
+		_ = conn.Close()
+		return nil, context.Canceled
 	}
 	w.privateConn = conn
+	w.mu.Unlock()
+	handshakeTTL = bitgetHandshakeTTL(handshakeTTL)
+	if err := conn.SetReadDeadline(time.Now().Add(handshakeTTL)); err != nil {
+		_ = conn.Close()
+		w.clearPrivateConn(doneC, generation, conn)
+		return nil, err
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(handshakeTTL)); err != nil {
+		_ = conn.Close()
+		w.clearPrivateConn(doneC, generation, conn)
+		return nil, err
+	}
 
 	// 发送登录认证
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
@@ -424,22 +639,35 @@ func (w *WebSocketManager) connectPrivate() error {
 	}
 
 	if err := conn.WriteJSON(loginMsg); err != nil {
-		return fmt.Errorf("发送登录消息失败: %w", err)
+		_ = conn.Close()
+		w.clearPrivateConn(doneC, generation, conn)
+		return nil, fmt.Errorf("发送登录消息失败: %w", err)
 	}
 
 	// 等待登录响应
 	var resp WSMessage
 	if err := conn.ReadJSON(&resp); err != nil {
-		return fmt.Errorf("读取登录响应失败: %w", err)
+		_ = conn.Close()
+		w.clearPrivateConn(doneC, generation, conn)
+		return nil, fmt.Errorf("读取登录响应失败: %w", err)
 	}
 
 	codeStr := resp.GetCodeString()
-	if codeStr != "0" && codeStr != "" {
-		return fmt.Errorf("登录失败: code=%s, msg=%s", codeStr, resp.Msg)
+	if resp.Event != "login" || codeStr != "0" {
+		_ = conn.Close()
+		w.clearPrivateConn(doneC, generation, conn)
+		return nil, fmt.Errorf("登录失败: event=%s code=%s, msg=%s", resp.Event, codeStr, resp.Msg)
 	}
 
 	logger.Info("✅ [Bitget WebSocket] 私有频道登录成功")
-	return nil
+	return conn, nil
+}
+
+func bitgetHandshakeTTL(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return 10 * time.Second
+	}
+	return ttl
 }
 
 // connectPublic 连接公共 WebSocket
@@ -454,47 +682,96 @@ func (w *WebSocketManager) connectPublic() error {
 }
 
 // subscribeOrders 订阅订单更新
-func (w *WebSocketManager) subscribeOrders(symbol string) error {
+func (w *WebSocketManager) subscribeOrders(conn *websocket.Conn, symbol, instType string) error {
 	subMsg := map[string]interface{}{
 		"op": "subscribe",
 		"args": []WSSubscribeArg{
 			{
-				InstType: "USDT-FUTURES",
+				InstType: instType,
 				Channel:  "orders",
 				InstId:   "default", // 订阅所有交易对
 			},
 		},
 	}
 
-	logger.Info("📡 [Bitget WS] 订阅私有频道: orders")
-	return w.privateConn.WriteJSON(subMsg)
+	logger.Info("📡 [Bitget WS] 订阅私有频道: %s/orders (%s)", instType, symbol)
+	return conn.WriteJSON(subMsg)
+}
+
+func (w *WebSocketManager) waitPrivateSubscription(conn *websocket.Conn, expectedInstType string, generation uint64) error {
+	clearDeadlines := func() error {
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			return err
+		}
+		return conn.SetWriteDeadline(time.Time{})
+	}
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		if string(message) == "pong" {
+			continue
+		}
+		var msg struct {
+			Event string          `json:"event"`
+			Arg   WSSubscribeArg  `json:"arg"`
+			Data  json.RawMessage `json:"data"`
+			Code  json.RawMessage `json:"code"`
+			Msg   string          `json:"msg"`
+		}
+		if err := json.Unmarshal(message, &msg); err != nil {
+			continue
+		}
+		if msg.Event == "error" {
+			return fmt.Errorf("订单订阅被拒绝: code=%s msg=%s", string(msg.Code), msg.Msg)
+		}
+		if msg.Event == "subscribe" && msg.Arg.Channel == "orders" {
+			if !strings.EqualFold(msg.Arg.InstType, expectedInstType) {
+				return fmt.Errorf("订单订阅确认产品类型不匹配: got=%s want=%s", msg.Arg.InstType, expectedInstType)
+			}
+			return clearDeadlines()
+		}
+		if msg.Arg.Channel == "orders" && len(msg.Data) > 0 {
+			if !strings.EqualFold(msg.Arg.InstType, expectedInstType) {
+				return fmt.Errorf("订单首帧产品类型不匹配: got=%s want=%s", msg.Arg.InstType, expectedInstType)
+			}
+			w.handleOrderUpdate(msg.Data, generation)
+			return clearDeadlines()
+		}
+	}
 }
 
 // subscribeTicker 订阅价格更新
-func (w *WebSocketManager) subscribeTicker(symbol string) error {
+func (w *WebSocketManager) subscribeTicker(conn *websocket.Conn, symbol, instType string) error {
 	subMsg := map[string]interface{}{
 		"op": "subscribe",
 		"args": []WSSubscribeArg{
 			{
-				InstType: "USDT-FUTURES",
+				InstType: instType,
 				Channel:  "ticker",
 				InstId:   symbol,
 			},
 		},
 	}
 
-	return w.publicConn.WriteJSON(subMsg)
+	ttl := bitgetHandshakeTTL(w.handshakeTTL)
+	if err := conn.SetWriteDeadline(time.Now().Add(ttl)); err != nil {
+		return err
+	}
+	defer conn.SetWriteDeadline(time.Time{})
+	return conn.WriteJSON(subMsg)
 }
 
 // handlePrivateMessages 处理私有频道消息（订单更新和成交明细）
-func (w *WebSocketManager) handlePrivateMessages(conn *websocket.Conn) {
+func (w *WebSocketManager) handlePrivateMessages(ctx context.Context, conn *websocket.Conn, generation uint64, expectedInstType string) error {
 	// 🔥 设置读取超时：90秒
 	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 	for {
 		select {
-		case <-w.ctx.Done():
-			return
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
 			_, message, err := conn.ReadMessage()
 			if err != nil {
@@ -504,7 +781,7 @@ func (w *WebSocketManager) handlePrivateMessages(conn *websocket.Conn) {
 				case w.privateReconnectChan <- struct{}{}:
 				default:
 				}
-				return
+				return err
 			}
 
 			// 🔥 收到消息后更新读取超时
@@ -544,13 +821,16 @@ func (w *WebSocketManager) handlePrivateMessages(conn *websocket.Conn) {
 			// 处理错误消息
 			if msg.Event == "error" {
 				logger.Error("❌ [Bitget WS] 错误: %s", msg.Msg)
-				continue
+				return fmt.Errorf("私有订单流错误: %s", msg.Msg)
 			}
 
 			// 处理订单推送 (channel="orders")
 			if msg.Arg.Channel == "orders" && len(msg.Data) > 0 {
+				if !strings.EqualFold(msg.Arg.InstType, expectedInstType) {
+					return fmt.Errorf("订单推送产品类型不匹配: got=%s want=%s", msg.Arg.InstType, expectedInstType)
+				}
 				logger.Debug("🔍 [Bitget WS订单] 推送数据: %s", string(msg.Data))
-				w.handleOrderUpdate(msg.Data)
+				w.handleOrderUpdate(msg.Data, generation)
 				continue
 			}
 		}
@@ -558,13 +838,13 @@ func (w *WebSocketManager) handlePrivateMessages(conn *websocket.Conn) {
 }
 
 // handlePublicMessages 处理公共频道消息（价格更新）
-func (w *WebSocketManager) handlePublicMessages(conn *websocket.Conn) {
+func (w *WebSocketManager) handlePublicMessages(ctx context.Context, conn *websocket.Conn) {
 	// 🔥 设置读取超时：90秒（大于3倍ping间隔）
 	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
 	for {
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 			_, message, err := conn.ReadMessage()
@@ -608,7 +888,7 @@ func (w *WebSocketManager) handlePublicMessages(conn *websocket.Conn) {
 }
 
 // handleOrderUpdate 处理订单更新
-func (w *WebSocketManager) handleOrderUpdate(data json.RawMessage) {
+func (w *WebSocketManager) handleOrderUpdate(data json.RawMessage, generation uint64) {
 	var updates []map[string]interface{}
 	if err := json.Unmarshal(data, &updates); err != nil {
 		logger.Warn("⚠️ [Bitget WebSocket] 解析订单更新失败: %v", err)
@@ -635,13 +915,20 @@ func (w *WebSocketManager) handleOrderUpdate(data json.RawMessage) {
 		logger.Debug("🔍 [Bitget WS订单] ID=%s, 状态=%s, 方向=%s, 成交量=%s",
 			orderID, status, side, accBaseVolume)
 
-		if w.orderCallback != nil {
+		w.mu.RLock()
+		if w.privateGeneration != generation || !w.privateHandlerStarted || w.privateStopping {
+			w.mu.RUnlock()
+			return
+		}
+		callback := w.orderCallback
+		w.mu.RUnlock()
+		if callback != nil {
 			// 转换为 OrderUpdate 格式
 			orderUpdate := w.parseOrderUpdate(update)
 			if orderUpdate != nil {
 				logger.Debug("🔍 [Bitget WS订单] 解析后: ID=%d, Status=%s, ExecutedQty=%.4f",
 					orderUpdate.OrderID, orderUpdate.Status, orderUpdate.ExecutedQty)
-				w.orderCallback(orderUpdate)
+				callback(orderUpdate)
 			}
 		}
 	}
@@ -670,10 +957,13 @@ func (w *WebSocketManager) handlePriceUpdate(data json.RawMessage) {
 				w.latestPrice = price
 				w.priceMu.Unlock()
 
-				if w.priceCallback != nil {
+				w.mu.RLock()
+				callback := w.priceCallback
+				w.mu.RUnlock()
+				if callback != nil {
 					// instId 是交易对名称
 					symbol, _ := update["instId"].(string)
-					w.priceCallback(symbol, price)
+					callback(symbol, price)
 				}
 			}
 		}
@@ -796,13 +1086,15 @@ func (w *WebSocketManager) GetLatestPrice() float64 {
 }
 
 // keepAlive WebSocket 保活（每15秒发送 ping）
-func (w *WebSocketManager) keepAlive(conn *websocket.Conn, connType string, reconnectChan chan struct{}) {
+func (w *WebSocketManager) keepAlive(ctx context.Context, conn *websocket.Conn, connType string, reconnectChan chan struct{}, stopC <-chan struct{}) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-w.ctx.Done():
+		case <-ctx.Done():
+			return
+		case <-stopC:
 			return
 		case <-ticker.C:
 			if conn != nil {
@@ -815,12 +1107,35 @@ func (w *WebSocketManager) keepAlive(conn *websocket.Conn, connType string, reco
 					case reconnectChan <- struct{}{}:
 					default:
 					}
+					_ = conn.Close()
 					return
 				}
 				logger.Debug("💓 [Bitget WS%s] Ping已发送", connType)
 			}
 		}
 	}
+}
+
+func (w *WebSocketManager) clearPrivateConn(doneC chan struct{}, generation uint64, conn *websocket.Conn) {
+	w.mu.Lock()
+	if w.privateDoneC == doneC && w.privateGeneration == generation && w.privateConn == conn {
+		w.privateConn = nil
+	}
+	w.mu.Unlock()
+}
+
+func (w *WebSocketManager) setPrivateHealth(generation uint64, state streamhealth.State, err error) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.privateGeneration != generation || !w.privateHandlerStarted || w.privateStopping {
+		return false
+	}
+	w.orderHealth.Set(state, err)
+	return true
+}
+
+func normalizeBitgetInstType(productType string) string {
+	return strings.ToUpper(strings.TrimSpace(productType))
 }
 
 // generateSign 生成签名

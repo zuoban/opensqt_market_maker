@@ -244,12 +244,14 @@ TARGET_OS=MacOS TARGET_ARCH=arm64 ./scripts/package_release.sh
 生成的发行包默认包含：
 
 - 编译后的可执行文件
-- `live_server/` 整个目录
+- `live_server/` 中由 Git 明确跟踪的演示文件
 - `config.example.yaml`
 - `config.yaml`（由示例配置生成，避免泄露本机密钥）
+- `.env.example`
 - `README.md`
 - `ARCHITECTURE.md`
-- `部署教程.pdf`
+
+本地的 `部署教程.pdf` 不会进入版本 tag、自动源码包或公开发行附件。
 
 ## 🏗️ 系统架构 (Architecture)
 

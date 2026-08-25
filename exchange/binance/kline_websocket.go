@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +23,93 @@ type Candle struct {
 	Volume    float64
 	Timestamp int64
 	IsClosed  bool // K线是否完结
+}
+
+type klineStreamEnvelope struct {
+	Stream string `json:"stream"`
+	Data   struct {
+		EventType string `json:"e"`
+		Symbol    string `json:"s"`
+		K         struct {
+			Timestamp int64  `json:"t"`
+			Symbol    string `json:"s"`
+			Interval  string `json:"i"`
+			Open      string `json:"o"`
+			Close     string `json:"c"`
+			High      string `json:"h"`
+			Low       string `json:"l"`
+			Volume    string `json:"v"`
+			IsClosed  bool   `json:"x"`
+		} `json:"k"`
+	} `json:"data"`
+}
+
+func parseKlineStreamMessage(message []byte, symbols []string, interval string) (*Candle, error) {
+	var msg klineStreamEnvelope
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return nil, fmt.Errorf("解析 K线 JSON 失败: %w", err)
+	}
+	if msg.Data.EventType != "kline" {
+		return nil, fmt.Errorf("K线事件类型无效: %q", msg.Data.EventType)
+	}
+	symbol := strings.ToUpper(strings.TrimSpace(msg.Data.K.Symbol))
+	if symbol == "" || (msg.Data.Symbol != "" && !strings.EqualFold(msg.Data.Symbol, symbol)) {
+		return nil, fmt.Errorf("K线交易对字段无效: event=%q kline=%q", msg.Data.Symbol, msg.Data.K.Symbol)
+	}
+	allowed := false
+	for _, configured := range symbols {
+		if strings.EqualFold(strings.TrimSpace(configured), symbol) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return nil, fmt.Errorf("收到未订阅的 K线交易对: %s", symbol)
+	}
+	if strings.TrimSpace(msg.Data.K.Interval) != strings.TrimSpace(interval) {
+		return nil, fmt.Errorf("K线周期不匹配: got %q, want %q", msg.Data.K.Interval, interval)
+	}
+	if msg.Data.K.Timestamp <= 0 {
+		return nil, fmt.Errorf("K线开始时间无效: %d", msg.Data.K.Timestamp)
+	}
+
+	open, err := parseFiniteFloat("open", msg.Data.K.Open)
+	if err != nil {
+		return nil, err
+	}
+	high, err := parseFiniteFloat("high", msg.Data.K.High)
+	if err != nil {
+		return nil, err
+	}
+	low, err := parseFiniteFloat("low", msg.Data.K.Low)
+	if err != nil {
+		return nil, err
+	}
+	closePrice, err := parseFiniteFloat("close", msg.Data.K.Close)
+	if err != nil {
+		return nil, err
+	}
+	volume, err := parseFiniteFloat("volume", msg.Data.K.Volume)
+	if err != nil {
+		return nil, err
+	}
+	if open <= 0 || high <= 0 || low <= 0 || closePrice <= 0 || volume < 0 {
+		return nil, fmt.Errorf("K线数值范围无效: O=%g H=%g L=%g C=%g V=%g", open, high, low, closePrice, volume)
+	}
+	if high < open || high < closePrice || high < low || low > open || low > closePrice {
+		return nil, fmt.Errorf("K线 OHLC 关系无效: O=%g H=%g L=%g C=%g", open, high, low, closePrice)
+	}
+
+	return &Candle{
+		Symbol:    symbol,
+		Open:      open,
+		High:      high,
+		Low:       low,
+		Close:     closePrice,
+		Volume:    volume,
+		Timestamp: msg.Data.K.Timestamp,
+		IsClosed:  msg.Data.K.IsClosed,
+	}, nil
 }
 
 // KlineWebSocketManager Binance K线WebSocket管理器
@@ -91,7 +177,7 @@ func (k *KlineWebSocketManager) connectLoop(ctx context.Context) {
 
 		logger.Info("🔗 正在连接 Binance K线WebSocket...")
 
-		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 		if err != nil {
 			logger.Error("❌ K线WebSocket连接失败: %v，%v后重试", err, k.reconnectDelay)
 			// 使用 select 等待，可以立即响应 context 取消
@@ -246,55 +332,10 @@ func (k *KlineWebSocketManager) readLoop(ctx context.Context, conn *websocket.Co
 		// 首次收到消息时打印，确认WebSocket连接正常
 		//logger.Debug("收到K线WebSocket原始消息: %s", string(message))
 
-		// 解析消息
-		var msg struct {
-			Stream string `json:"stream"`
-			Data   struct {
-				EventType string `json:"e"` // 事件类型（"kline"）
-				EventTime int64  `json:"E"` // 事件时间（毫秒时间戳）
-				Symbol    string `json:"s"` // 交易对
-				K         struct {
-					T  int64  `json:"t"` // K线开始时间
-					T2 int64  `json:"T"` // K线结束时间
-					S  string `json:"s"` // 交易对
-					I  string `json:"i"` // K线间隔
-					F  int64  `json:"f"` // 第一笔交易ID
-					L  int64  `json:"L"` // 最后一笔交易ID
-					O  string `json:"o"` // 开盘价
-					C  string `json:"c"` // 收盘价
-					H  string `json:"h"` // 最高价
-					L2 string `json:"l"` // 最低价
-					V  string `json:"v"` // 成交量
-					N  int64  `json:"n"` // 成交笔数
-					X  bool   `json:"x"` // K线是否完结
-					Q  string `json:"q"` // 成交额
-					V2 string `json:"V"` // 主动买入成交量
-					Q2 string `json:"Q"` // 主动买入成交额
-				} `json:"k"`
-			} `json:"data"`
-		}
-
-		if err := json.Unmarshal(message, &msg); err != nil {
-			logger.Warn("⚠️ 解析K线消息失败: %v, 原始消息: %s", err, string(message))
+		candle, err := parseKlineStreamMessage(message, k.symbols, k.interval)
+		if err != nil {
+			logger.Warn("⚠️ 忽略无效 Binance K线消息: %v", err)
 			continue
-		}
-
-		// 转换为Candle（接收所有K线数据，包括未完结的）
-		open, _ := strconv.ParseFloat(msg.Data.K.O, 64)
-		high, _ := strconv.ParseFloat(msg.Data.K.H, 64)
-		low, _ := strconv.ParseFloat(msg.Data.K.L2, 64)
-		close, _ := strconv.ParseFloat(msg.Data.K.C, 64)
-		volume, _ := strconv.ParseFloat(msg.Data.K.V, 64)
-
-		candle := &Candle{
-			Symbol:    msg.Data.K.S,
-			Open:      open,
-			High:      high,
-			Low:       low,
-			Close:     close,
-			Volume:    volume,
-			Timestamp: msg.Data.K.T,
-			IsClosed:  msg.Data.K.X, // 设置K线是否完结
 		}
 
 		// 调用回调（无论K线是否完结都回调）

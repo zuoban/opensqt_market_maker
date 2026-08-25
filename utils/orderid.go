@@ -78,7 +78,7 @@ func ParseOrderID(clientOrderID string, priceDecimals int) (float64, string, int
 
 	// 1. 解析价格整数
 	priceInt, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
+	if err != nil || priceInt <= 0 {
 		return 0, "", 0, false
 	}
 
@@ -87,10 +87,14 @@ func ParseOrderID(clientOrderID string, priceDecimals int) (float64, string, int
 	price := float64(priceInt) / multiplier
 
 	// 2. 解析方向
-	sideCode := parts[1]
-	side := "BUY"
-	if sideCode == "S" {
+	var side string
+	switch parts[1] {
+	case "B":
+		side = "BUY"
+	case "S":
 		side = "SELL"
+	default:
+		return 0, "", 0, false
 	}
 
 	// 3. 解析时间戳（前10位）

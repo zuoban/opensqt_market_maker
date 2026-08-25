@@ -166,14 +166,8 @@ func (pm *PriceMonitor) periodicPriceSender() {
 func (pm *PriceMonitor) Stop() {
 	pm.cancel()
 	pm.isRunning.Store(false)
-	// 使用select避免向已关闭的channel发送数据
-	select {
-	case <-pm.priceChangeCh:
-		// channel已关闭或为空
-	default:
-		// channel未关闭，安全关闭
-		close(pm.priceChangeCh)
-	}
+	// priceChangeCh 只有 periodicPriceSender 写入。这里不主动关闭，订阅者会由
+	// ctx.Done() 退出；这样可避免 Stop 与 ticker 同时命中时发生 send-on-closed-channel。
 }
 
 // GetLastPrice 获取最新价格

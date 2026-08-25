@@ -31,6 +31,9 @@ config.yaml
 .env.local
 !.env.example
 
+# 仅保留在本机的发布资料
+/部署教程.pdf
+
 # 如果以后有本地覆盖配置，也可以加：
 # config.local.yaml
 

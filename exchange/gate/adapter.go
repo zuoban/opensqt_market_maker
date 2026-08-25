@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"opensqt/exchange/exchangeerr"
 	"opensqt/logger"
 	"opensqt/utils"
 )
@@ -171,6 +172,16 @@ func (g *GateAdapter) fetchContractInfo(ctx context.Context) error {
 	return nil
 }
 
+// contractsToBaseQuantity 将 Gate REST/WS 返回的合约张数统一转换为基础币数量。
+// Gate 的 size/fill_size/position.size 都以张为单位；上层槽位、成交累计和
+// 对账只接受基础币数量。乘数不可用时保留旧的直通行为。
+func (g *GateAdapter) contractsToBaseQuantity(contracts float64) float64 {
+	if g.quantoMultiplier > 0 {
+		return contracts * g.quantoMultiplier
+	}
+	return contracts
+}
+
 // PlaceOrder 下单
 func (g *GateAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Order, error) {
 	// 使用 REST API 下单（更可靠）
@@ -241,7 +252,15 @@ func (g *GateAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest) 
 		if strings.Contains(err.Error(), "insufficient") || strings.Contains(err.Error(), "balance") {
 			return nil, fmt.Errorf("保证金不足: %w", err)
 		}
-		return nil, err
+		return nil, classifyGatePlacementError(err)
+	}
+	if futuresOrder == nil || futuresOrder.ID <= 0 {
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("Gate.io 下单响应缺少有效订单 ID"))
+	}
+	if clientOrderID != "" && futuresOrder.Text != clientOrderID {
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("Gate.io 下单响应 text=%q，与请求 %q 不一致", futuresOrder.Text, clientOrderID))
 	}
 
 	// 转换为标准订单格式
@@ -252,8 +271,8 @@ func (g *GateAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest) 
 		Side:          convertSide(float64(futuresOrder.Size)),
 		Type:          OrderTypeLimit,
 		Price:         req.Price,
-		Quantity:      abs(float64(futuresOrder.Size)),
-		ExecutedQty:   abs(float64(futuresOrder.FillSize)),
+		Quantity:      g.contractsToBaseQuantity(abs(float64(futuresOrder.Size))),
+		ExecutedQty:   g.contractsToBaseQuantity(abs(float64(futuresOrder.FillSize))),
 		Status:        convertStatus(futuresOrder.Status),
 		CreatedAt:     time.Unix(int64(futuresOrder.CreateTime), 0),
 		UpdateTime:    int64(futuresOrder.FinishTime * 1000),
@@ -265,6 +284,24 @@ func (g *GateAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest) 
 	}
 
 	return result, nil
+}
+
+func classifyGatePlacementError(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	// 本地构造失败、认证/账户错误和明确的 4xx 响应都能证明未受理。
+	if strings.Contains(message, "序列化请求体失败") ||
+		strings.Contains(message, "创建请求失败") ||
+		strings.Contains(message, "合约账户未激活") ||
+		strings.Contains(message, "API 签名错误") ||
+		strings.Contains(message, "API Key 无效") ||
+		strings.Contains(message, "状态码: 4") ||
+		strings.Contains(message, "状态码=4") {
+		return err
+	}
+	return exchangeerr.WrapOrderPlacementUnknown(err)
 }
 
 // BatchPlaceOrders 批量下单
@@ -392,8 +429,8 @@ func (g *GateAdapter) GetOrder(ctx context.Context, symbol string, orderID int64
 		Symbol:        g.symbol,
 		Side:          convertSide(float64(futuresOrder.Size)),
 		Type:          OrderTypeLimit,
-		Quantity:      abs(float64(futuresOrder.Size)),
-		ExecutedQty:   abs(float64(futuresOrder.FillSize)),
+		Quantity:      g.contractsToBaseQuantity(abs(float64(futuresOrder.Size))),
+		ExecutedQty:   g.contractsToBaseQuantity(abs(float64(futuresOrder.FillSize))),
 		Status:        convertStatus(futuresOrder.Status),
 		CreatedAt:     time.Unix(int64(futuresOrder.CreateTime), 0),
 		UpdateTime:    int64(futuresOrder.FinishTime * 1000),
@@ -427,8 +464,8 @@ func (g *GateAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Orde
 			Symbol:        g.symbol,
 			Side:          convertSide(float64(fo.Size)),
 			Type:          OrderTypeLimit,
-			Quantity:      abs(float64(fo.Size)),
-			ExecutedQty:   abs(float64(fo.FillSize)),
+			Quantity:      g.contractsToBaseQuantity(abs(float64(fo.Size))),
+			ExecutedQty:   g.contractsToBaseQuantity(abs(float64(fo.FillSize))),
 			Status:        convertStatus(fo.Status),
 			CreatedAt:     time.Unix(int64(fo.CreateTime), 0),
 			UpdateTime:    int64(fo.FinishTime * 1000),
@@ -456,6 +493,7 @@ func (g *GateAdapter) GetAccount(ctx context.Context) (*Account, error) {
 	if err != nil {
 		return nil, err
 	}
+	g.wsManager.SetUserID(futuresAcc.User)
 
 	// 解析余额
 	total, _ := strconv.ParseFloat(futuresAcc.Total, 64)
@@ -530,7 +568,7 @@ func (g *GateAdapter) GetPositions(ctx context.Context, symbol string) ([]*Posit
 
 	position := &Position{
 		Symbol:        g.symbol,
-		Size:          float64(fp.Size),
+		Size:          g.contractsToBaseQuantity(float64(fp.Size)),
 		EntryPrice:    entryPrice,
 		MarkPrice:     markPrice,
 		UnrealizedPNL: unrealisedPnl,
@@ -557,25 +595,17 @@ func (g *GateAdapter) StartOrderStream(ctx context.Context, callback func(interf
 	// 包装回调函数,将合约张数转换为币数量
 	wrappedCallback := func(update interface{}) {
 		if orderUpdate, ok := update.(OrderUpdate); ok {
-			// Gate.io返回的是合约张数,需要乘以quanto_multiplier转换为币数量
-			if g.quantoMultiplier > 0 {
-				orderUpdate.Quantity = orderUpdate.Quantity * g.quantoMultiplier
-				orderUpdate.ExecutedQty = orderUpdate.ExecutedQty * g.quantoMultiplier
-			}
+			orderUpdate.Quantity = g.contractsToBaseQuantity(orderUpdate.Quantity)
+			orderUpdate.ExecutedQty = g.contractsToBaseQuantity(orderUpdate.ExecutedQty)
 			callback(orderUpdate)
 		} else {
 			callback(update)
 		}
 	}
 
-	g.wsManager.SetOrderCallback(wrappedCallback)
-
-	// 如果 WebSocket 未运行，则启动
-	if !g.wsManager.IsRunning() {
-		return g.wsManager.Start(ctx, g.symbol)
-	}
-
-	return nil
+	// 始终让 manager 根据 READY/STOPPING 状态决定是否可复用，
+	// 不能仅凭旧连接尚未清理就报告启动成功。
+	return g.wsManager.Start(ctx, g.symbol, wrappedCallback)
 }
 
 // StopOrderStream 停止订单流
@@ -587,12 +617,7 @@ func (g *GateAdapter) StopOrderStream() error {
 func (g *GateAdapter) StartPriceStream(ctx context.Context, callback func(string, float64)) error {
 	g.wsManager.SetPriceCallback(callback)
 
-	// 如果 WebSocket 未运行，则启动
-	if !g.wsManager.IsRunning() {
-		return g.wsManager.Start(ctx, g.symbol)
-	}
-
-	return nil
+	return g.wsManager.Start(ctx, g.symbol)
 }
 
 // GetLatestPrice 获取最新价格

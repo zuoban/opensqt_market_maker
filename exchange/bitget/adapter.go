@@ -3,11 +3,13 @@ package bitget
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"opensqt/exchange/exchangeerr"
 	"opensqt/logger"
 )
 
@@ -350,7 +352,7 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 		if strings.Contains(err.Error(), "insufficient balance") || strings.Contains(err.Error(), "40007") {
 			return nil, fmt.Errorf("保证金不足: %w", err)
 		}
-		return nil, err
+		return nil, classifyBitgetPlacementError(err)
 	}
 
 	// 解析响应
@@ -359,7 +361,8 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 		ClientOrderID string `json:"clientOid"`
 	}
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
-		return nil, fmt.Errorf("解析下单响应失败: %w", err)
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("解析 Bitget 下单响应失败: %w", err))
 	}
 
 	// 🔍 添加调试：打印完整响应
@@ -367,7 +370,12 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 
 	orderID, _ := strconv.ParseInt(data.OrderID, 10, 64)
 	if orderID == 0 {
-		return nil, fmt.Errorf("下单响应中orderId为空或无效: %s", string(resp.Data))
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("Bitget 下单响应中 orderId 为空或无效"))
+	}
+	if req.ClientOrderID != "" && data.ClientOrderID != req.ClientOrderID {
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("Bitget 下单响应 clientOid=%q，与请求 %q 不一致", data.ClientOrderID, req.ClientOrderID))
 	}
 
 	order := &Order{
@@ -382,19 +390,28 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 		CreatedAt:     time.Now(),
 	}
 
-	// 🔥 诊断：获取当前市场价格，检查订单价格是否合理
-	ctxPrice, cancelPrice := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancelPrice()
-	currentPrice, err := b.GetLatestPrice(ctxPrice, b.symbol)
-	if err == nil {
-		priceDiff := req.Price - currentPrice
-		priceDiffPercent := (priceDiff / currentPrice) * 100
-		logger.Debug("🔍 [Bitget下单诊断] 订单价格: %.2f, 当前价格: %.2f, 价差: %.2f (%.3f%%)",
-			req.Price, currentPrice, priceDiff, priceDiffPercent)
-	}
-
 	// 注意：不在这里打印日志，由executor统一打印避免重复
 	return order, nil
+}
+
+func classifyBitgetPlacementError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode >= 500 {
+			return exchangeerr.WrapOrderPlacementUnknown(err)
+		}
+		return err
+	}
+	message := err.Error()
+	// 本地构造失败和明确 API 业务拒绝都能证明订单未被接受。
+	if strings.Contains(message, "序列化请求体失败") ||
+		strings.Contains(message, "创建请求失败") {
+		return err
+	}
+	return exchangeerr.WrapOrderPlacementUnknown(err)
 }
 
 // BatchPlaceOrders 批量下单
@@ -901,7 +918,7 @@ func (b *BitgetAdapter) StartOrderStream(ctx context.Context, callback func(inte
 		}
 	}
 
-	return b.wsManager.Start(ctx, b.symbol, wrappedCallback)
+	return b.wsManager.Start(ctx, b.symbol, b.productType, wrappedCallback)
 }
 
 // StopOrderStream 停止订单流
@@ -944,15 +961,10 @@ func (b *BitgetAdapter) StartPriceStream(ctx context.Context, symbol string, cal
 		}
 	})
 
-	// 如果 WebSocket 还没启动，启动公共频道（ticker）
-	// 注意：传入 nil 作为订单回调，表示只订阅价格，不订阅订单
-	if !b.wsManager.IsRunning() {
-		logger.Debug("🔗 [Bitget] 启动价格流 WebSocket（公共频道）")
-		return b.wsManager.Start(ctx, b.symbol, nil)
-	}
-
-	logger.Debug("✅ [Bitget] 价格流回调已注册（WebSocket已在运行）")
-	return nil
+	// 始终让 manager 确认公共代际存活；仅有私有连接时 IsRunning
+	// 也会为 true，不能因此跳过价格流重启。
+	logger.Debug("🔗 [Bitget] 确保价格流 WebSocket（公共频道）已启动")
+	return b.wsManager.Start(ctx, b.symbol, b.productType, nil)
 }
 
 // StartKlineStream 启动K线流（WebSocket）

@@ -6,6 +6,8 @@ import (
 	"opensqt/config"
 	"opensqt/exchange"
 	"opensqt/logger"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +26,12 @@ type RiskMonitor struct {
 	symbolDataMap map[string]*SymbolData
 	mu            sync.RWMutex
 	triggered     bool
+	ready         bool
 	lastMsg       string
+	liveReadyCh   chan struct{}
+	liveReadyOnce sync.Once
+	seenLive      map[string]bool
+	lastEventAt   map[string]time.Time
 }
 
 // NewRiskMonitor 创建风控监视器
@@ -40,15 +47,20 @@ func NewRiskMonitor(cfg *config.Config, ex exchange.IExchange) *RiskMonitor {
 		cfg:           cfg,
 		exchange:      ex,
 		symbolDataMap: symbolDataMap,
+		liveReadyCh:   make(chan struct{}),
+		seenLive:      make(map[string]bool, len(symbolDataMap)),
+		lastEventAt:   make(map[string]time.Time, len(symbolDataMap)),
 	}
 }
 
 // Start 启动监控
-func (r *RiskMonitor) Start(ctx context.Context) {
+func (r *RiskMonitor) Start(ctx context.Context) error {
 	if !r.cfg.RiskControl.Enabled {
 		logger.Info("⚠️ 主动安全风控未启用")
-		return
+		r.setReady(true, "风控已禁用")
+		return nil
 	}
+	r.setReady(false, "风控初始化中")
 
 	logger.Info("🛡️ 启动主动安全风控监控 (周期: %s, 倍数: %.1f, 窗口: %d)",
 		r.cfg.RiskControl.Interval, r.cfg.RiskControl.VolumeMultiplier, r.cfg.RiskControl.AverageWindow)
@@ -60,33 +72,67 @@ func (r *RiskMonitor) Start(ctx context.Context) {
 	for _, symbol := range r.cfg.RiskControl.MonitorSymbols {
 		candles, err := r.exchange.GetHistoricalKlines(ctx, symbol, r.cfg.RiskControl.Interval, r.cfg.RiskControl.AverageWindow+1)
 		if err != nil {
-			logger.Warn("⚠️ 加载 %s 历史K线失败: %v", symbol, err)
-			continue
+			err = fmt.Errorf("加载 %s 历史K线失败: %w", symbol, err)
+			r.setReady(false, err.Error())
+			return err
 		}
 
-		if len(candles) > 0 {
-			r.mu.Lock()
-			symbolData, exists := r.symbolDataMap[symbol]
-			r.mu.Unlock()
-
-			if exists {
-				symbolData.mu.Lock()
-				symbolData.candles = candles
-				symbolData.mu.Unlock()
-				logger.Info("✅ %s: 已加载 %d 根历史K线", symbol, len(candles))
+		closedCount := 0
+		for _, candle := range candles {
+			if candle != nil && candle.IsClosed {
+				closedCount++
 			}
 		}
+		if closedCount < r.cfg.RiskControl.AverageWindow {
+			err := fmt.Errorf("%s 历史完结K线不足: %d < %d", symbol, closedCount, r.cfg.RiskControl.AverageWindow)
+			r.setReady(false, err.Error())
+			return err
+		}
+
+		r.mu.RLock()
+		symbolData, exists := r.symbolDataMap[symbol]
+		r.mu.RUnlock()
+		if !exists {
+			err := fmt.Errorf("风控币种未初始化: %s", symbol)
+			r.setReady(false, err.Error())
+			return err
+		}
+		symbolData.mu.Lock()
+		for _, candle := range candles {
+			mergeRiskCandle(&symbolData.candles, candle, r.cfg.RiskControl.AverageWindow+2)
+		}
+		loaded := len(symbolData.candles)
+		symbolData.mu.Unlock()
+		logger.Info("✅ %s: 已加载 %d 根历史K线", symbol, loaded)
 	}
-	logger.Info("✅ 历史K线数据加载完成，风控系统已就绪")
+	logger.Info("✅ 历史K线数据加载完成，等待实时K线流...")
 
 	// 启动K线流
 	if err := r.exchange.StartKlineStream(ctx, r.cfg.RiskControl.MonitorSymbols, r.cfg.RiskControl.Interval, r.onCandleUpdate); err != nil {
-		logger.Error("❌ 启动K线流失败: %v", err)
-		return
+		err = fmt.Errorf("启动K线流失败: %w", err)
+		r.setReady(false, err.Error())
+		return err
+	}
+
+	readyTimer := time.NewTimer(15 * time.Second)
+	defer readyTimer.Stop()
+	select {
+	case <-r.liveReadyCh:
+		r.setReady(true, "风控数据已就绪")
+	case <-readyTimer.C:
+		err := fmt.Errorf("等待所有实时 K 线就绪超时")
+		r.setReady(false, err.Error())
+		_ = r.exchange.StopKlineStream()
+		return err
+	case <-ctx.Done():
+		r.setReady(false, "风控启动已取消")
+		return ctx.Err()
 	}
 
 	// 启动定期报告协程（每60秒）
 	go r.reportLoop(ctx)
+	go r.staleLoop(ctx)
+	return nil
 }
 
 // onCandleUpdate K线更新回调（实时检测）
@@ -98,9 +144,22 @@ func (r *RiskMonitor) onCandleUpdate(candle *exchange.Candle) {
 	c := candle
 
 	// 更新缓存
-	r.mu.RLock()
+	r.mu.Lock()
 	symbolData, exists := r.symbolDataMap[c.Symbol]
-	r.mu.RUnlock()
+	if exists {
+		r.lastEventAt[c.Symbol] = time.Now()
+		r.seenLive[c.Symbol] = true
+	}
+	allSeen := exists && len(r.seenLive) == len(r.symbolDataMap)
+	if allSeen {
+		for symbol := range r.symbolDataMap {
+			if !r.seenLive[symbol] {
+				allSeen = false
+				break
+			}
+		}
+	}
+	r.mu.Unlock()
 
 	if !exists {
 		logger.Warn("⚠️ 收到未监控的币种K线: %s", c.Symbol)
@@ -108,50 +167,13 @@ func (r *RiskMonitor) onCandleUpdate(candle *exchange.Candle) {
 	}
 
 	symbolData.mu.Lock()
-
-	if c.IsClosed {
-		// 完结的K线：追加到列表
-		symbolData.candles = append(symbolData.candles, c)
-
-		// 保留足够数量的完结K线（窗口大小）+ 可能的1根未完结K线
-		// 只保留最近的完结K线，删除过旧的
-		requiredClosedCount := r.cfg.RiskControl.AverageWindow
-		closedCount := 0
-		for i := len(symbolData.candles) - 1; i >= 0; i-- {
-			if symbolData.candles[i].IsClosed {
-				closedCount++
-			}
-		}
-
-		// 如果完结K线超过需要的数量，从前面删除旧的
-		if closedCount > requiredClosedCount+1 {
-			// 找到需要保留的起始位置（从后往前数requiredClosedCount+1根完结K线）
-			keepClosedCount := requiredClosedCount + 1
-			foundCount := 0
-			startIdx := len(symbolData.candles) - 1
-			for i := len(symbolData.candles) - 1; i >= 0; i-- {
-				if symbolData.candles[i].IsClosed {
-					foundCount++
-					if foundCount >= keepClosedCount {
-						startIdx = i
-						break
-					}
-				}
-			}
-			symbolData.candles = symbolData.candles[startIdx:]
-		}
-	} else {
-		// 未完结的K线
-		if len(symbolData.candles) > 0 && !symbolData.candles[len(symbolData.candles)-1].IsClosed {
-			// 最后一根也是未完结的：更新它
-			symbolData.candles[len(symbolData.candles)-1] = c
-		} else {
-			// 最后一根是完结的或列表为空：追加这个未完结K线
-			symbolData.candles = append(symbolData.candles, c)
-		}
-	}
+	mergeRiskCandle(&symbolData.candles, c, r.cfg.RiskControl.AverageWindow+2)
 	currentCount := len(symbolData.candles)
 	symbolData.mu.Unlock()
+
+	if allSeen {
+		r.liveReadyOnce.Do(func() { close(r.liveReadyCh) })
+	}
 
 	// 只在完结K线时打印日志，避免日志过多
 	if c.IsClosed {
@@ -248,7 +270,7 @@ func (r *RiskMonitor) checkSymbolRecovery(symbol string) (bool, string) {
 	}
 
 	symbolData.mu.RLock()
-	candles := symbolData.candles
+	candles := cloneCandles(symbolData.candles)
 	candleCount := len(candles)
 	symbolData.mu.RUnlock()
 
@@ -320,7 +342,7 @@ func (r *RiskMonitor) checkSymbol(symbol string) (bool, string) {
 	}
 
 	symbolData.mu.RLock()
-	candles := symbolData.candles
+	candles := cloneCandles(symbolData.candles)
 	candleCount := len(candles)
 	symbolData.mu.RUnlock()
 
@@ -370,7 +392,14 @@ func (r *RiskMonitor) checkSymbol(symbol string) (bool, string) {
 func (r *RiskMonitor) IsTriggered() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.triggered
+	return r.triggered || (r.cfg.RiskControl.Enabled && !r.ready)
+}
+
+// IsReady 表示历史数据和实时 K 线均健康。
+func (r *RiskMonitor) IsReady() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return !r.cfg.RiskControl.Enabled || r.ready
 }
 
 // reportLoop 定期报告状态（每60秒）
@@ -390,9 +419,7 @@ func (r *RiskMonitor) reportLoop(ctx context.Context) {
 
 // reportStatus 报告状态
 func (r *RiskMonitor) reportStatus() {
-	r.mu.RLock()
-	triggered := r.triggered
-	r.mu.RUnlock()
+	triggered := r.IsTriggered()
 
 	if triggered {
 		logger.Warn("⚠️ [风控监测] 当前市场交易出现异动,触发主动安全风控,停止交易!")
@@ -454,7 +481,124 @@ func (r *RiskMonitor) printMovingAverages(inRiskControl bool) {
 
 // Stop 停止监控
 func (r *RiskMonitor) Stop() {
+	r.setReady(false, "风控已停止")
 	if r.exchange != nil {
 		r.exchange.StopKlineStream()
 	}
+}
+
+func (r *RiskMonitor) setReady(ready bool, msg string) {
+	r.mu.Lock()
+	changed := r.ready != ready
+	r.ready = ready
+	if msg != "" && (!ready || !r.triggered) {
+		r.lastMsg = msg
+	}
+	r.mu.Unlock()
+	if changed {
+		if ready {
+			logger.Info("✅ [风控数据] %s", msg)
+		} else {
+			logger.Warn("⚠️ [风控数据] %s", msg)
+		}
+	}
+}
+
+func (r *RiskMonitor) staleLoop(ctx context.Context) {
+	interval := parseRiskInterval(r.cfg.RiskControl.Interval)
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	checkEvery := interval / 2
+	if checkEvery < 5*time.Second {
+		checkEvery = 5 * time.Second
+	}
+	if checkEvery > 30*time.Second {
+		checkEvery = 30 * time.Second
+	}
+	staleAfter := 2 * interval
+	if staleAfter < 30*time.Second {
+		staleAfter = 30 * time.Second
+	}
+	ticker := time.NewTicker(checkEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			var stale []string
+			r.mu.RLock()
+			for _, symbol := range r.cfg.RiskControl.MonitorSymbols {
+				last := r.lastEventAt[symbol]
+				if last.IsZero() || now.Sub(last) > staleAfter {
+					stale = append(stale, symbol)
+				}
+			}
+			r.mu.RUnlock()
+			if len(stale) > 0 {
+				r.setReady(false, fmt.Sprintf("K线数据陈旧: %s", strings.Join(stale, ",")))
+			} else {
+				r.setReady(true, "K线数据已恢复")
+			}
+		}
+	}
+}
+
+func parseRiskInterval(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(value[:len(value)-1])
+	if err != nil || n <= 0 {
+		return 0
+	}
+	switch value[len(value)-1] {
+	case 'm':
+		return time.Duration(n) * time.Minute
+	case 'h':
+		return time.Duration(n) * time.Hour
+	case 'd':
+		return time.Duration(n) * 24 * time.Hour
+	default:
+		return 0
+	}
+}
+
+func mergeRiskCandle(dst *[]*exchange.Candle, candle *exchange.Candle, limit int) {
+	if candle == nil {
+		return
+	}
+	copyOfCandle := *candle
+	items := *dst
+	replaced := false
+	for i, existing := range items {
+		if existing == nil || existing.Timestamp != candle.Timestamp {
+			continue
+		}
+		// 已收到完结事件后，不允许乱序的未完结快照覆盖它。
+		if existing.IsClosed && !candle.IsClosed {
+			return
+		}
+		items[i] = &copyOfCandle
+		replaced = true
+		break
+	}
+	if !replaced {
+		items = append(items, &copyOfCandle)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i] == nil {
+			return true
+		}
+		if items[j] == nil {
+			return false
+		}
+		return items[i].Timestamp < items[j].Timestamp
+	})
+	if limit > 0 && len(items) > limit {
+		items = append([]*exchange.Candle(nil), items[len(items)-limit:]...)
+	}
+	*dst = items
 }

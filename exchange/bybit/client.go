@@ -27,6 +27,17 @@ type Response struct {
 	Time    int64           `json:"time"`
 }
 
+type APIError struct {
+	StatusCode int
+	RetCode    int
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("Bybit API 错误: code=%d, msg=%s (状态码: %d)",
+		e.RetCode, strings.TrimSpace(e.Message), e.StatusCode)
+}
+
 type Client struct {
 	httpClient *http.Client
 	signer     *Signer
@@ -109,8 +120,12 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query map[s
 		return nil, fmt.Errorf("解析 Bybit 响应失败: %w, 响应体: %s", err, string(respBody))
 	}
 
-	if response.RetCode != 0 {
-		return nil, fmt.Errorf("Bybit API 错误: code=%d, msg=%s", response.RetCode, strings.TrimSpace(response.RetMsg))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || response.RetCode != 0 {
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			RetCode:    response.RetCode,
+			Message:    response.RetMsg,
+		}
 	}
 
 	return &response, nil

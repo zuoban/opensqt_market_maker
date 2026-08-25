@@ -13,6 +13,7 @@ import (
 type OrderCleanerSlotInfo struct {
 	Price       float64
 	OrderID     int64
+	ClientOID   string
 	OrderSide   string
 	OrderStatus string
 }
@@ -26,8 +27,8 @@ type IOrderExecutor interface {
 type IOrderCleanerPositionManager interface {
 	// 遍历所有槽位
 	IterateSlots(fn func(price float64, slot interface{}) bool)
-	// 更新槽位状态
-	UpdateSlotOrderStatus(price float64, status string)
+	// 仅当槽位仍属于被撤订单且状态未变化时，更新槽位状态。
+	CompareAndSwapSlotOrderStatus(price float64, orderID int64, clientOID, expectedStatus, newStatus string) bool
 }
 
 // OrderCleaner 订单清理器
@@ -77,14 +78,8 @@ func (oc *OrderCleaner) CleanupOrders() {
 
 	// 统计当前订单数
 	totalOrders := 0
-	var buyOrders []struct {
-		Price   float64
-		OrderID int64
-	}
-	var sellOrders []struct {
-		Price   float64
-		OrderID int64
-	}
+	var buyOrders []OrderCleanerSlotInfo
+	var sellOrders []OrderCleanerSlotInfo
 
 	oc.pm.IterateSlots(func(price float64, slotRaw interface{}) bool {
 		// 使用反射提取槽位字段
@@ -111,22 +106,24 @@ func (oc *OrderCleaner) CleanupOrders() {
 		}
 
 		orderID := getInt64Field("OrderID")
+		clientOID := getStringField("ClientOID")
 		orderSide := getStringField("OrderSide")
 		orderStatus := getStringField("OrderStatus")
 
 		// 🔥 修复：排除部分成交的订单（PARTIALLY_FILLED不能撤销，会造成资金悬空）
 		if orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed {
 			totalOrders++
+			target := OrderCleanerSlotInfo{
+				Price:       price,
+				OrderID:     orderID,
+				ClientOID:   clientOID,
+				OrderSide:   orderSide,
+				OrderStatus: orderStatus,
+			}
 			if orderSide == "BUY" {
-				buyOrders = append(buyOrders, struct {
-					Price   float64
-					OrderID int64
-				}{Price: price, OrderID: orderID})
+				buyOrders = append(buyOrders, target)
 			} else if orderSide == "SELL" {
-				sellOrders = append(sellOrders, struct {
-					Price   float64
-					OrderID int64
-				}{Price: price, OrderID: orderID})
+				sellOrders = append(sellOrders, target)
 			}
 		}
 		return true
@@ -184,10 +181,8 @@ func (oc *OrderCleaner) CleanupOrders() {
 
 			if cancelCount > 0 {
 				orderIDs := make([]int64, 0, cancelCount)
-				prices := make([]float64, 0, cancelCount)
 				for i := 0; i < cancelCount; i++ {
 					orderIDs = append(orderIDs, buyOrders[i].OrderID)
-					prices = append(prices, buyOrders[i].Price)
 				}
 
 				logger.Info("🧹 [订单清理-买单] 买单数: %d, 取消价格最低的 %d 个 (%.2f ~ %.2f)",
@@ -196,9 +191,13 @@ func (oc *OrderCleaner) CleanupOrders() {
 				if err := oc.executor.BatchCancelOrders(orderIDs); err != nil {
 					logger.Error("❌ [订单清理-买单] 批量撤单失败: %v", err)
 				} else {
-					// 更新槽位状态为已申请撤单
-					for _, price := range prices {
-						oc.pm.UpdateSlotOrderStatus(price, OrderStatusCancelRequested)
+					// WebSocket 可能在 REST 撤单返回前已清槽或复用了同价槽位；
+					// 只有订单身份和快照状态仍一致时才能写入 CANCEL_REQUESTED。
+					for _, target := range buyOrders[:cancelCount] {
+						oc.pm.CompareAndSwapSlotOrderStatus(
+							target.Price, target.OrderID, target.ClientOID,
+							target.OrderStatus, OrderStatusCancelRequested,
+						)
 					}
 					canceledCount += cancelCount
 				}
@@ -219,10 +218,8 @@ func (oc *OrderCleaner) CleanupOrders() {
 
 			if cancelCount > 0 {
 				orderIDs := make([]int64, 0, cancelCount)
-				prices := make([]float64, 0, cancelCount)
 				for i := 0; i < cancelCount; i++ {
 					orderIDs = append(orderIDs, sellOrders[i].OrderID)
-					prices = append(prices, sellOrders[i].Price)
 				}
 
 				logger.Info("🧹 [订单清理-卖单] 卖单数: %d, 取消价格最高的 %d 个 (%.2f ~ %.2f)",
@@ -231,9 +228,12 @@ func (oc *OrderCleaner) CleanupOrders() {
 				if err := oc.executor.BatchCancelOrders(orderIDs); err != nil {
 					logger.Error("❌ [订单清理-卖单] 批量撤单失败: %v", err)
 				} else {
-					// 更新槽位状态为已申请撤单
-					for _, price := range prices {
-						oc.pm.UpdateSlotOrderStatus(price, OrderStatusCancelRequested)
+					// 与买单相同，按订单身份和快照状态做条件更新。
+					for _, target := range sellOrders[:cancelCount] {
+						oc.pm.CompareAndSwapSlotOrderStatus(
+							target.Price, target.OrderID, target.ClientOID,
+							target.OrderStatus, OrderStatusCancelRequested,
+						)
 					}
 					canceledCount += cancelCount
 				}

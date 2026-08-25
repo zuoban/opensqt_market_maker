@@ -46,6 +46,44 @@ func TestApplySellRealizedPNLFromExchange(t *testing.T) {
 	}
 }
 
+func TestIncrementalPNLDeduplicatesRepeatedAndOutOfOrderFills(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
+	spm.anchorPrice = 100
+	slot := spm.getOrCreateSlot(100)
+	slot.PositionStatus = PositionStatusFilled
+	slot.PositionQty = 0.03
+	slot.SlotStatus = SlotStatusLocked
+
+	oid := utils.GenerateOrderID(100, "SELL", 2)
+	slot.ClientOID = oid
+	slot.OrderSide = "SELL"
+	slot.OrderStatus = OrderStatusPlaced
+
+	first := OrderUpdate{
+		ClientOrderID:          oid,
+		Status:                 "PARTIALLY_FILLED",
+		Side:                   "SELL",
+		ExecutedQty:            0.02,
+		AvgPrice:               101,
+		RealizedPNL:            0.08,
+		RealizedPNLIncremental: true,
+	}
+	spm.OnOrderUpdate(first)
+	spm.OnOrderUpdate(first)
+
+	stale := first
+	stale.ExecutedQty = 0.01
+	stale.RealizedPNL = 0.04
+	spm.OnOrderUpdate(stale)
+
+	if got := spm.GetRealizedPNL(); got != 0.08 {
+		t.Fatalf("duplicate/out-of-order pnl = %v, want 0.08", got)
+	}
+	if slot.PositionQty < 0.01-1e-12 || slot.PositionQty > 0.01+1e-12 || slot.OrderFilledQty != 0.02 {
+		t.Fatalf("slot regressed after stale fill: position=%v filled=%v", slot.PositionQty, slot.OrderFilledQty)
+	}
+}
+
 func TestApplySellRealizedPNLCumulative(t *testing.T) {
 	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
 	slot := spm.getOrCreateSlot(100)

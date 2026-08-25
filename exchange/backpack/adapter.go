@@ -2,6 +2,7 @@ package backpack
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"opensqt/exchange/exchangeerr"
 	"opensqt/logger"
 
 	"encoding/json"
@@ -194,12 +196,28 @@ func (b *BackpackAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*O
 
 	respBody, err := b.client.DoSignedRequest(ctx, "POST", "/api/v1/order", "orderExecute", nil, body, map[string]string{"X-BROKER-ID": backpackBroker})
 	if err != nil {
-		return nil, err
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			return nil, err
+		}
+		return nil, exchangeerr.WrapOrderPlacementUnknown(err)
 	}
 
 	var response orderResponse
 	if err := json.Unmarshal(respBody, &response); err != nil {
-		return nil, fmt.Errorf("解析 Backpack 下单响应失败: %w", err)
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("解析 Backpack 下单响应失败: %w", err))
+	}
+	if strings.TrimSpace(response.ID) == "" || parseInt64(response.ID) <= 0 {
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("Backpack 下单响应缺少有效 orderId"))
+	}
+	if req.ClientOrderID != "" {
+		clientOrderID, ok := b.idMapper.lookup(response.ClientID)
+		if !ok || clientOrderID != req.ClientOrderID {
+			return nil, exchangeerr.WrapOrderPlacementUnknown(
+				fmt.Errorf("Backpack 下单响应 clientId=%d 无法匹配请求 %q", response.ClientID, req.ClientOrderID))
+		}
 	}
 
 	return b.convertOrderResponse(&response, req.Symbol), nil

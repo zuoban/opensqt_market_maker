@@ -2,6 +2,7 @@ package position
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -36,7 +37,22 @@ type OrderUpdate struct {
 const (
 	maxRecentFilledOrders = 20
 	hourlyFillHours       = 24
+	fillQtyTolerance      = 1e-12
+	maxTerminalOrders     = 4096
 )
+
+var ErrAcceptedOrderPreconditionInvalid = errors.New("交易所已接受订单但槽位下单前提已失效")
+
+type terminalOrderProgress struct {
+	ExecutedQty float64
+	// ReportedPNL 是交易所最后一次被接受的订单累计盈亏。
+	ReportedPNL float64
+	// AccountedPNL 是本地已经实际计入总盈亏的金额，可能来自成交价差回退。
+	// 后续拿到交易所累计盈亏时必须以它为基线补差，避免回退值与权威值双计。
+	AccountedPNL float64
+	// UpdateTime 是终态进度的事件版本水位；仅 PNL 修正必须严格更新才会被接受。
+	UpdateTime int64
+}
 
 // FilledOrderRecord 本次程序运行期间完成成交的订单。
 type FilledOrderRecord struct {
@@ -71,7 +87,7 @@ type hourlyFillAcc struct {
 // OrderExecutorInterface 订单执行器接口（避免循环导入）
 type OrderExecutorInterface interface {
 	PlaceOrder(req *OrderRequest) (*Order, error)
-	BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool)
+	BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool, error)
 	BatchCancelOrders(orderIDs []int64) error
 }
 
@@ -85,6 +101,26 @@ type OrderRequest struct {
 	ReduceOnly    bool   // 是否只减仓（平仓单）
 	PostOnly      bool   // 是否只做 Maker（Post Only）
 	ClientOrderID string // 自定义订单ID
+
+	// AcquireSubmissionLease 在每次真正调用交易所下单接口前执行。成功时返回的
+	// release 会一直持有对应槽位锁，调用方必须在该次接口调用返回后立即释放。
+	// 限流和重试等待期间不得持有 lease；同步重入同一槽位的订单回调也不受支持。
+	AcquireSubmissionLease func() (release func(), ok bool)
+
+	// submissionUncertain 表示至少一次交易所请求已经发出，但最终结果无法确认。
+	// 这种 reservation 不能按普通失败释放，否则下一轮会换 ClientOrderID 重下。
+	submissionUncertain atomic.Bool
+}
+
+// MarkSubmissionUncertain 由执行边界在请求结果不确定时调用。
+func (r *OrderRequest) MarkSubmissionUncertain() {
+	if r != nil {
+		r.submissionUncertain.Store(true)
+	}
+}
+
+func (r *OrderRequest) isSubmissionUncertain() bool {
+	return r != nil && r.submissionUncertain.Load()
 }
 
 // Order 订单信息（避免循环导入）
@@ -93,10 +129,14 @@ type Order struct {
 	ClientOrderID string
 	Symbol        string
 	Side          string
+	Type          string
 	Price         float64
 	Quantity      float64
+	ExecutedQty   float64
+	AvgPrice      float64
 	Status        string
 	CreatedAt     time.Time
+	UpdateTime    int64
 }
 
 // 订单状态常量
@@ -137,6 +177,7 @@ type InventorySlot struct {
 	OrderSide      string    // 订单方向 (BUY/SELL)
 	OrderStatus    string    // 订单状态
 	OrderPrice     float64   // 订单价格
+	OrderQuantity  float64   // reservation/活动订单的提交数量
 	OrderFilledQty float64   // 成交数量
 	OrderCreatedAt time.Time // 创建时间
 
@@ -211,6 +252,12 @@ type SuperPositionManager struct {
 	filledHourly     map[int64]*hourlyFillAcc
 	filledOrderCount int64
 
+	// 终态订单的最后累计成交进度。槽位清空后，交易所仍可能重放终态或乱序成交推送；
+	// 按订单保留单调进度，避免同一成交被再次计入持仓、统计和盈亏。
+	terminalOrdersMu  sync.RWMutex
+	terminalOrders    map[string]terminalOrderProgress
+	terminalOrderKeys []string
+
 	// 初始化标志
 	isInitialized atomic.Bool
 
@@ -234,6 +281,7 @@ func NewSuperPositionManager(cfg *config.Config, executor OrderExecutorInterface
 		quantityDecimals:   quantityDecimals,
 		filledOrderKeys:    make(map[string]struct{}),
 		filledHourly:       make(map[int64]*hourlyFillAcc),
+		terminalOrders:     make(map[string]terminalOrderProgress),
 	}
 	spm.totalBuyQty.Store(0.0)
 	spm.totalSellQty.Store(0.0)
@@ -298,8 +346,7 @@ func (spm *SuperPositionManager) generateClientOrderID(price float64, side strin
 // 返回: price, side, valid
 func (spm *SuperPositionManager) parseClientOrderID(clientOrderID string) (float64, string, bool) {
 	// 1. 先移除交易所前缀
-	exchangeName := strings.ToLower(spm.exchange.GetName())
-	cleanID := utils.RemoveBrokerPrefix(exchangeName, clientOrderID)
+	cleanID := spm.canonicalClientOrderID(clientOrderID)
 
 	// 2. 使用统一的 utils 包解析
 	price, side, _, valid := utils.ParseOrderID(cleanID, spm.priceDecimals)
@@ -313,6 +360,211 @@ func (spm *SuperPositionManager) parseClientOrderID(clientOrderID string) (float
 	// 例如: 3116.85 和 3114.85 可能都被四舍五入成同一个值
 
 	return price, side, true
+}
+
+func (spm *SuperPositionManager) canonicalClientOrderID(clientOrderID string) string {
+	exchangeName := strings.ToLower(spm.exchange.GetName())
+	return utils.RemoveBrokerPrefix(exchangeName, clientOrderID)
+}
+
+func sameOrderQuantity(a, b float64) bool {
+	return math.Abs(a-b) <= fillQtyTolerance
+}
+
+// reserveOrderLocked 将待提交订单的完整身份绑定到槽位。调用方必须持有 slot.mu。
+// 仅有 PENDING 不足以证明某个请求仍属于该槽位；ClientOID、方向和数量共同组成
+// reservation，失败清理和提交前复检都只能操作完全匹配的 reservation。
+func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *OrderRequest) {
+	slot.OrderID = 0
+	slot.ClientOID = req.ClientOrderID
+	slot.OrderSide = req.Side
+	slot.OrderStatus = OrderStatusNotPlaced
+	slot.OrderPrice = req.Price
+	slot.OrderQuantity = req.Quantity
+	slot.OrderFilledQty = 0
+	slot.OrderCreatedAt = time.Now()
+	slot.orderReportedPNL = 0
+	slot.orderAccumulatedPNL = 0
+	slot.SlotStatus = SlotStatusPending
+
+	req.AcquireSubmissionLease = func() (func(), bool) {
+		slot.mu.Lock()
+		if !spm.matchesReservationLocked(slot, req) || !spm.reservationStillValidLocked(slot, req) {
+			// 只清理由本请求创建且尚未被订单流确认的 reservation。若身份已经
+			// 变化，说明另一个时序已经接管槽位，绝不能碰它。
+			if spm.matchesReservationLocked(slot, req) {
+				spm.clearReservationLocked(slot)
+			}
+			slot.mu.Unlock()
+			return nil, false
+		}
+		return slot.mu.Unlock, true
+	}
+}
+
+func (spm *SuperPositionManager) matchesReservationLocked(slot *InventorySlot, req *OrderRequest) bool {
+	return slot.SlotStatus == SlotStatusPending &&
+		slot.OrderID == 0 &&
+		slot.ClientOID == req.ClientOrderID &&
+		slot.OrderSide == req.Side &&
+		slot.OrderStatus == OrderStatusNotPlaced &&
+		sameOrderQuantity(slot.OrderQuantity, req.Quantity)
+}
+
+func (spm *SuperPositionManager) reservationStillValidLocked(slot *InventorySlot, req *OrderRequest) bool {
+	if req == nil || req.Quantity <= 0 || math.IsNaN(req.Quantity) || math.IsInf(req.Quantity, 0) {
+		return false
+	}
+	switch req.Side {
+	case "BUY":
+		return !req.ReduceOnly && slot.PositionStatus == PositionStatusEmpty &&
+			slot.PositionQty <= fillQtyTolerance
+	case "SELL":
+		return req.ReduceOnly && slot.PositionStatus == PositionStatusFilled &&
+			slot.PositionQty > fillQtyTolerance && sameOrderQuantity(slot.PositionQty, req.Quantity)
+	default:
+		return false
+	}
+}
+
+// acceptedOrderPreconditionStillValidLocked 验证一个已进入交易所边界的订单
+// 是否仍与槽位库存一致。对活跃部分成交订单，BUY 的库存必须等于该单
+// 已成交量，SELL 的剩余库存必须等于委托量减已成交量。这能识别旧订单
+// 迟到终态在 REST 返回后对当前 reservation 造成的库存修正。
+func (spm *SuperPositionManager) acceptedOrderPreconditionStillValidLocked(slot *InventorySlot, req *OrderRequest) bool {
+	if slot == nil || req == nil || req.Quantity <= 0 ||
+		math.IsNaN(req.Quantity) || math.IsInf(req.Quantity, 0) ||
+		math.IsNaN(slot.PositionQty) || math.IsInf(slot.PositionQty, 0) || slot.PositionQty < 0 ||
+		math.IsNaN(slot.OrderFilledQty) || math.IsInf(slot.OrderFilledQty, 0) || slot.OrderFilledQty < 0 {
+		return false
+	}
+	if slot.OrderFilledQty > req.Quantity+fillQtyTolerance {
+		return false
+	}
+
+	switch req.Side {
+	case "BUY":
+		return !req.ReduceOnly && slot.PositionStatus == PositionStatusEmpty &&
+			sameOrderQuantity(slot.PositionQty, slot.OrderFilledQty)
+	case "SELL":
+		remaining := req.Quantity - slot.OrderFilledQty
+		return req.ReduceOnly && slot.PositionStatus == PositionStatusFilled &&
+			remaining > fillQtyTolerance && sameOrderQuantity(slot.PositionQty, remaining)
+	default:
+		return false
+	}
+}
+
+func normalizedPlacementStatus(status string) string {
+	status = strings.ToUpper(strings.TrimSpace(status))
+	if status == "" || status == OrderStatusPlaced || status == OrderStatusConfirmed {
+		return "NEW"
+	}
+	return status
+}
+
+func knownPlacementStatus(status string) bool {
+	switch normalizedPlacementStatus(status) {
+	case "NEW", OrderStatusPartiallyFilled, OrderStatusFilled,
+		"CANCELED", "EXPIRED", "REJECTED":
+		return true
+	default:
+		return false
+	}
+}
+
+func placementStatusIsTerminal(status string) bool {
+	status = normalizedPlacementStatus(status)
+	return status == OrderStatusFilled || isTerminalOrderStatus(status)
+}
+
+func placementOrderUpdate(ord *Order, side string) OrderUpdate {
+	return OrderUpdate{
+		OrderID:       ord.OrderID,
+		ClientOrderID: ord.ClientOrderID,
+		Symbol:        ord.Symbol,
+		Status:        normalizedPlacementStatus(ord.Status),
+		ExecutedQty:   ord.ExecutedQty,
+		Price:         ord.Price,
+		AvgPrice:      ord.AvgPrice,
+		Side:          side,
+		Type:          ord.Type,
+		UpdateTime:    ord.UpdateTime,
+	}
+}
+
+// bindAcceptedOrderForCancellationLocked 把已被交易所接受、但槽位前提已失效的
+// 非终态订单线性化为 CANCEL_REQUESTED。订单保持本地可见，后续对账固定
+// fail-closed，直到订单流或权威回读给出终态。调用方必须持有 slot.mu。
+func (spm *SuperPositionManager) bindAcceptedOrderForCancellationLocked(
+	slot *InventorySlot,
+	req *OrderRequest,
+	ord *Order,
+	side string,
+) error {
+	if ord == nil || ord.OrderID <= 0 {
+		return fmt.Errorf("已接受订单缺少有效 OrderID")
+	}
+	if ord.ClientOrderID == "" ||
+		spm.canonicalClientOrderID(ord.ClientOrderID) != spm.canonicalClientOrderID(req.ClientOrderID) {
+		return fmt.Errorf("已接受订单 ClientOID=%q 与 reservation=%q 不匹配",
+			ord.ClientOrderID, req.ClientOrderID)
+	}
+	quantity := ord.Quantity
+	if quantity <= 0 || math.IsNaN(quantity) || math.IsInf(quantity, 0) {
+		quantity = req.Quantity
+	}
+
+	slot.OrderID = ord.OrderID
+	slot.ClientOID = ord.ClientOrderID
+	slot.OrderSide = side
+	slot.OrderPrice = ord.Price
+	slot.OrderQuantity = quantity
+	if ord.CreatedAt.IsZero() {
+		slot.OrderCreatedAt = time.Now()
+	} else {
+		slot.OrderCreatedAt = ord.CreatedAt
+	}
+	slot.SlotStatus = SlotStatusLocked
+
+	update := placementOrderUpdate(ord, side)
+	_, executionInvalid := spm.applyOrderExecutionDelta(slot, update, side, slot.Price)
+	slot.OrderStatus = OrderStatusCancelRequested
+	if executionInvalid {
+		return fmt.Errorf("已接受订单 %d 的累计成交量无法安全收敛", ord.OrderID)
+	}
+	return nil
+}
+
+func (spm *SuperPositionManager) clearReservationLocked(slot *InventorySlot) {
+	slot.OrderID = 0
+	slot.ClientOID = ""
+	slot.OrderSide = ""
+	slot.OrderStatus = OrderStatusNotPlaced
+	slot.OrderPrice = 0
+	slot.OrderQuantity = 0
+	slot.OrderFilledQty = 0
+	slot.OrderCreatedAt = time.Time{}
+	slot.orderReportedPNL = 0
+	slot.orderAccumulatedPNL = 0
+	slot.SlotStatus = SlotStatusFree
+}
+
+// releaseFailedReservation 只释放明确未提交且身份仍完全匹配的 reservation。
+// UNKNOWN 请求由调用方保留，等待订单流或对账给出确定结果。
+func (spm *SuperPositionManager) releaseFailedReservation(req *OrderRequest) {
+	price, _, valid := spm.parseClientOrderID(req.ClientOrderID)
+	if !valid {
+		return
+	}
+	slot := spm.getOrCreateSlot(price)
+	slot.mu.Lock()
+	if spm.matchesReservationLocked(slot, req) {
+		spm.clearReservationLocked(slot)
+		logger.Debug("🔓 [释放槽位] 明确未提交，释放槽位 %s 的 reservation (ClientOID: %s)",
+			formatPrice(price, spm.priceDecimals), req.ClientOrderID)
+	}
+	slot.mu.Unlock()
 }
 
 // placeInitialBuyOrders 设定初始槽位（并恢复持仓槽位）
@@ -467,10 +719,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 			// 生成 ClientOrderID
 			clientOID := spm.generateClientOrderID(price, "BUY")
 
-			// 🔥 锁定槽位：标记为PENDING状态，防止并发操作
-			slot.SlotStatus = SlotStatusPending
-
-			ordersToPlace = append(ordersToPlace, &OrderRequest{
+			req := &OrderRequest{
 				Symbol:        spm.config.Trading.Symbol,
 				Side:          "BUY",
 				Price:         price,
@@ -478,7 +727,9 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				PriceDecimals: spm.priceDecimals,
 				PostOnly:      true,
 				ClientOrderID: clientOID,
-			})
+			}
+			spm.reserveOrderLocked(slot, req)
+			ordersToPlace = append(ordersToPlace, req)
 			buyOrdersToCreate++
 		}
 
@@ -492,7 +743,6 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	type sellCandidate struct {
 		SlotPrice     float64 // 槽位价格 (买入价)
 		SellPrice     float64 // 目标卖出价
-		Quantity      float64
 		DistanceToMid float64
 	}
 	var sellCandidates []sellCandidate
@@ -529,7 +779,6 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				sellCandidates = append(sellCandidates, sellCandidate{
 					SlotPrice:     slotPrice,
 					SellPrice:     sellPrice,
-					Quantity:      slot.PositionQty,
 					DistanceToMid: distance,
 				})
 			}
@@ -572,31 +821,39 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				continue
 			}
 
-			currentStatus := slot.PositionStatus
 			currentQty := slot.PositionQty
-
-			if currentStatus != PositionStatusFilled || currentQty <= 0 {
+			if slot.PositionStatus != PositionStatusFilled || currentQty <= 0 {
 				slot.mu.Unlock()
 				continue
 			}
 
-			// 🔥 立即锁定槽位：标记为PENDING状态，防止并发操作
-			slot.SlotStatus = SlotStatusPending
-			slot.mu.Unlock()
+			// 候选收集后持仓可能已被终态修正。名义价值和提交数量都必须使用
+			// 当前锁内值，不能沿用候选快照。
+			minValue := spm.config.Trading.MinOrderValue
+			if minValue <= 0 {
+				minValue = 6.0
+			}
+			if candidate.SellPrice*currentQty < minValue {
+				slot.mu.Unlock()
+				continue
+			}
 
 			// 生成 ClientOrderID (注意：使用 SlotPrice 即买入价作为标识)
 			clientOID := spm.generateClientOrderID(candidate.SlotPrice, "SELL")
 
-			ordersToPlace = append(ordersToPlace, &OrderRequest{
+			req := &OrderRequest{
 				Symbol:        spm.config.Trading.Symbol,
 				Side:          "SELL",
 				Price:         candidate.SellPrice,
-				Quantity:      candidate.Quantity,
+				Quantity:      currentQty,
 				PriceDecimals: spm.priceDecimals,
 				ReduceOnly:    true,
 				PostOnly:      true,
 				ClientOrderID: clientOID, // 🔥
-			})
+			}
+			spm.reserveOrderLocked(slot, req)
+			ordersToPlace = append(ordersToPlace, req)
+			slot.mu.Unlock()
 			sellOrdersToCreate++
 		}
 	}
@@ -604,51 +861,84 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	// 执行下单
 	if len(ordersToPlace) > 0 {
 		logger.Debug("🔄 [实时调整] 需要新增: %d 个订单", len(ordersToPlace))
-		placedOrders, marginError := spm.executor.BatchPlaceOrders(ordersToPlace)
+		requestsByClientOID := make(map[string]*OrderRequest, len(ordersToPlace))
+		for _, req := range ordersToPlace {
+			requestsByClientOID[spm.canonicalClientOrderID(req.ClientOrderID)] = req
+		}
+		placedOrders, marginError, placementErr := spm.executor.BatchPlaceOrders(ordersToPlace)
 
 		if marginError {
 			logger.Warn("⚠️ [保证金不足] 检测到保证金不足错误，暂停下单 %d 秒", int(spm.marginLockDuration.Seconds()))
 			spm.insufficientMargin = true
 			spm.marginLockTime = time.Now()
-			spm.CancelAllBuyOrders()
+			if err := spm.CancelAllBuyOrders(); err != nil {
+				placementErr = errors.Join(placementErr, fmt.Errorf("保证金不足后的撤买单确认失败: %w", err))
+			}
 		}
 
 		// 🔥 构建成功订单的ClientOrderID集合
 		placedClientOIDs := make(map[string]bool)
 		for _, ord := range placedOrders {
-			placedClientOIDs[ord.ClientOrderID] = true
+			if ord == nil {
+				continue
+			}
+			placedClientOIDs[spm.canonicalClientOrderID(ord.ClientOrderID)] = true
 		}
 
 		// 🔥 释放未成功提交订单的槽位锁
 		for _, req := range ordersToPlace {
-			if !placedClientOIDs[req.ClientOrderID] {
-				// 这个订单没有成功提交，需要释放槽位锁
-				price, _, valid := spm.parseClientOrderID(req.ClientOrderID)
-				if valid {
-					slot := spm.getOrCreateSlot(price)
-					slot.mu.Lock()
-					if slot.SlotStatus == SlotStatusPending {
-						slot.SlotStatus = SlotStatusFree
-						logger.Debug("🔓 [释放槽位] 订单提交失败，释放槽位 %s 的锁 (ClientOID: %s)",
-							formatPrice(price, spm.priceDecimals), req.ClientOrderID)
-					}
-					slot.mu.Unlock()
-				}
+			if !placedClientOIDs[spm.canonicalClientOrderID(req.ClientOrderID)] &&
+				!req.isSubmissionUncertain() {
+				spm.releaseFailedReservation(req)
 			}
 		}
 
+		var acceptedOrderErrs []error
+		acceptedOrdersToCancel := make(map[int64]struct{})
 		for _, ord := range placedOrders {
+			if ord == nil {
+				acceptedOrderErrs = append(acceptedOrderErrs, fmt.Errorf("下单返回空订单"))
+				continue
+			}
 			// 解析 ClientOrderID
 			price, side, valid := spm.parseClientOrderID(ord.ClientOrderID)
 
 			if !valid {
 				logger.Warn("⚠️ [实时调整] 无法解析 ClientOID: %s", ord.ClientOrderID)
+				acceptedOrderErrs = append(acceptedOrderErrs,
+					fmt.Errorf("交易所已接受 OrderID=%d，但 ClientOID=%q 无法解析", ord.OrderID, ord.ClientOrderID))
+				if ord.OrderID > 0 {
+					acceptedOrdersToCancel[ord.OrderID] = struct{}{}
+				}
+				continue
+			}
+			req, expected := requestsByClientOID[spm.canonicalClientOrderID(ord.ClientOrderID)]
+			if !expected || req.Side != side {
+				logger.Warn("⚠️ [实时调整] 下单回包不属于本批 reservation: ClientOID=%s, Side=%s",
+					ord.ClientOrderID, side)
+				acceptedOrderErrs = append(acceptedOrderErrs,
+					fmt.Errorf("交易所已接受 OrderID=%d，但不属于本批 reservation", ord.OrderID))
+				if ord.OrderID > 0 {
+					acceptedOrdersToCancel[ord.OrderID] = struct{}{}
+				}
 				continue
 			}
 
 			// 获取槽位 (注意：无论是买单还是卖单，ID中编码的都是 SlotPrice)
 			slot := spm.getOrCreateSlot(price)
 			slot.mu.Lock()
+
+			// 用户数据流可能在 REST 下单返回前就推送取消类终态。此时槽位已经
+			// 被终态处理释放，绝不能再用迟到的 REST 回包把旧订单复活为 LOCKED。
+			if _, terminalSeen := spm.getTerminalOrderProgress(OrderUpdate{
+				OrderID:       ord.OrderID,
+				ClientOrderID: ord.ClientOrderID,
+			}); terminalSeen {
+				logger.Debug("⏭️ [忽略迟到下单回包] 终态订单不再回填: OrderID=%d, ClientOID=%s",
+					ord.OrderID, ord.ClientOrderID)
+				slot.mu.Unlock()
+				continue
+			}
 
 			// 🔥 关键修复：检查是否是秒成交场景（买单或卖单都可能）
 			// 秒成交的特征:
@@ -664,6 +954,61 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 			}
 
 			if !isInstantFill {
+				reservationPending := spm.matchesReservationLocked(slot, req)
+				sameConfirmedOrder := slot.SlotStatus == SlotStatusLocked &&
+					spm.canonicalClientOrderID(slot.ClientOID) == spm.canonicalClientOrderID(req.ClientOrderID) &&
+					slot.OrderSide == req.Side
+				if !reservationPending && !sameConfirmedOrder {
+					logger.Warn("⚠️ [忽略过期下单回包] 槽位 %s 已不属于 ClientOID=%s",
+						formatPrice(price, spm.priceDecimals), ord.ClientOrderID)
+					slot.mu.Unlock()
+					continue
+				}
+
+				statusKnown := knownPlacementStatus(ord.Status)
+				preconditionValid := spm.acceptedOrderPreconditionStillValidLocked(slot, req)
+				if !statusKnown || !preconditionValid {
+					update := placementOrderUpdate(ord, side)
+					if statusKnown && placementStatusIsTerminal(ord.Status) {
+						// 终态回包已无远端活跃单，先按权威累计成交量
+						// 收敛本地库存；仍向上返错，强制门禁重新对账。
+						slot.mu.Unlock()
+						spm.OnOrderUpdate(update)
+					} else {
+						bindErr := spm.bindAcceptedOrderForCancellationLocked(slot, req, ord, side)
+						slot.mu.Unlock()
+						if bindErr != nil {
+							acceptedOrderErrs = append(acceptedOrderErrs,
+								fmt.Errorf("订单 %d 无法安全绑定为待撤: %w", ord.OrderID, bindErr))
+						}
+						if ord.OrderID > 0 {
+							acceptedOrdersToCancel[ord.OrderID] = struct{}{}
+						}
+					}
+
+					if !preconditionValid {
+						acceptedOrderErrs = append(acceptedOrderErrs, fmt.Errorf(
+							"%w: 槽位 %s %s 订单 OrderID=%d 已进入交易所",
+							ErrAcceptedOrderPreconditionInvalid,
+							formatPrice(price, spm.priceDecimals), side, ord.OrderID))
+					} else {
+						acceptedOrderErrs = append(acceptedOrderErrs, fmt.Errorf(
+							"交易所已接受 OrderID=%d，但返回未知状态 %q",
+							ord.OrderID, ord.Status))
+					}
+					continue
+				}
+
+				// UNKNOWN 按 ClientOrderID 回读可能直接得到部分成交或
+				// 终态。这些是权威状态，必须经统一成交通道收敛，不得回填
+				// 为普通 PLACED/LOCKED。
+				if normalizedPlacementStatus(ord.Status) != "NEW" {
+					update := placementOrderUpdate(ord, side)
+					slot.mu.Unlock()
+					spm.OnOrderUpdate(update)
+					continue
+				}
+
 				// 正常情况: 更新订单状态
 				// 🔥 检查OrderID冲突：只有当ClientOID已设置且不匹配时才是真正的冲突
 				// 如果ClientOID为空或匹配，说明是正常的WebSocket先到或批量处理顺序问题
@@ -682,9 +1027,18 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				slot.OrderID = ord.OrderID
 				slot.ClientOID = ord.ClientOrderID
 				slot.OrderSide = side // "BUY" or "SELL"
-				slot.OrderStatus = OrderStatusPlaced
+				if reservationPending {
+					slot.OrderStatus = OrderStatusPlaced
+				}
 				slot.OrderPrice = ord.Price
-				slot.OrderCreatedAt = time.Now()
+				if ord.Quantity > 0 {
+					slot.OrderQuantity = ord.Quantity
+				}
+				if ord.CreatedAt.IsZero() {
+					slot.OrderCreatedAt = time.Now()
+				} else {
+					slot.OrderCreatedAt = ord.CreatedAt
+				}
 				// 🔥 订单提交成功，设置为LOCKED状态
 				slot.SlotStatus = SlotStatusLocked
 				// 注意：不在这里重置PostOnlyFailCount，因为订单可能立即被撤销
@@ -700,6 +1054,24 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 
 			slot.mu.Unlock()
 		}
+
+		if len(acceptedOrdersToCancel) > 0 {
+			orderIDs := make([]int64, 0, len(acceptedOrdersToCancel))
+			for orderID := range acceptedOrdersToCancel {
+				orderIDs = append(orderIDs, orderID)
+			}
+			sort.Slice(orderIDs, func(i, j int) bool { return orderIDs[i] < orderIDs[j] })
+			if err := spm.executor.BatchCancelOrders(orderIDs); err != nil {
+				acceptedOrderErrs = append(acceptedOrderErrs,
+					fmt.Errorf("槽位前提失效后定向撤单失败，本地保持 CANCEL_REQUESTED: %w", err))
+			}
+		}
+		placementErr = errors.Join(placementErr, errors.Join(acceptedOrderErrs...))
+
+		if placementErr != nil {
+			return fmt.Errorf("批量下单未完全成功（已确认 %d/%d 个）: %w",
+				len(placedOrders), len(ordersToPlace), placementErr)
+		}
 	}
 
 	return nil
@@ -708,6 +1080,10 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 // OnOrderUpdate 订单更新回调（异步订单同步流）
 func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 	// 🔥 重构：完全依赖 ClientOrderID 解析
+	// 订单流和 REST 回包对返佣前缀的保留方式可能不同。进入任何去重、终态
+	// 进度或槽位身份判断前统一成程序自己的 ClientOrderID，避免同一订单被当成
+	// 两个身份，也让 UNKNOWN reservation 能被订单流权威收敛。
+	update.ClientOrderID = spm.canonicalClientOrderID(update.ClientOrderID)
 	price, side, valid := spm.parseClientOrderID(update.ClientOrderID)
 
 	if !valid {
@@ -719,15 +1095,31 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 
-	// 完成成交后槽位会清空订单字段；忽略重复 FILLED 推送，避免重复计数和重复展示。
-	if update.Status == OrderStatusFilled && spm.wasFilledOrderRecorded(update) {
-		logger.Debug("⏭️ [重复成交被忽略] ID=%d, ClientOID=%s", update.OrderID, update.ClientOrderID)
+	// 完成成交后槽位会清空订单字段；该订单的任何后续重放都必须忽略，
+	// 否则迟到的 PARTIALLY_FILLED/终态推送会重新绑定槽位并重复累计。
+	if spm.wasFilledOrderRecorded(update) {
+		logger.Debug("⏭️ [已完成订单更新被忽略] ID=%d, ClientOID=%s, Status=%s",
+			update.OrderID, update.ClientOrderID, update.Status)
+		return
+	}
+
+	terminalStatus := isTerminalOrderStatus(update.Status)
+	terminalProgress, terminalSeen := spm.getTerminalOrderProgress(update)
+	if terminalSeen {
+		if !terminalStatus {
+			logger.Debug("⏭️ [忽略终态后的乱序推送] ID=%d, ClientOID=%s, Status=%s",
+				update.OrderID, update.ClientOrderID, update.Status)
+			return
+		}
+		spm.applyTerminalOrderCorrection(slot, update, side, price, terminalProgress)
 		return
 	}
 
 	// 校验：确保这个更新属于当前的订单 (防止旧订单的延迟推送干扰新订单)
+	// 已记录终态的旧订单在上方走独立修正路径，不会重新绑定或清理当前订单。
 	// 优先使用 ClientOrderID 匹配 (某些交易所如 Gate.io 的 OrderID 可能略有差异)
-	if slot.ClientOID != "" && slot.ClientOID != update.ClientOrderID {
+	if slot.ClientOID != "" &&
+		spm.canonicalClientOrderID(slot.ClientOID) != update.ClientOrderID {
 		// ClientOrderID 不匹配，忽略此更新
 		logger.Info("⚠️ [订单更新被忽略] 槽位 %.2f: ClientOID不匹配 (槽位: %s, 推送: %s, OrderID: %d)",
 			price, slot.ClientOID, update.ClientOrderID, update.OrderID)
@@ -745,38 +1137,35 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		logger.Debug("📝 [更新OrderID] 槽位 %.2f: %d -> %d (ClientOID: %s)", price, slot.OrderID, update.OrderID, update.ClientOrderID)
 		slot.OrderID = update.OrderID
 	}
+	// REST 回包未知或订单流先到时，匹配的交易所事件就是 reservation 已被接受的
+	// 权威证据。及时转为 LOCKED，避免 UNKNOWN 永久停在 PENDING。
+	if slot.SlotStatus == SlotStatusPending &&
+		spm.canonicalClientOrderID(slot.ClientOID) == spm.canonicalClientOrderID(update.ClientOrderID) &&
+		slot.OrderSide == side && !isTerminalOrderStatus(update.Status) {
+		slot.SlotStatus = SlotStatusLocked
+	}
 
 	// 处理状态转换
 	switch update.Status {
 	case "NEW":
-		if slot.OrderStatus == OrderStatusPlaced {
+		if slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusNotPlaced {
 			slot.OrderStatus = OrderStatusConfirmed
 		}
 
 	case "PARTIALLY_FILLED", "FILLED":
 		orderPrice := slot.OrderPrice
-		// 计算增量
-		deltaQty := update.ExecutedQty - slot.OrderFilledQty
-		if deltaQty < 0 {
-			deltaQty = 0
+		_, stale := spm.applyOrderExecutionDelta(slot, update, side, price)
+		if stale {
+			return
 		}
 
-		slot.OrderFilledQty = update.ExecutedQty
-
-		// 根据方向更新持仓
 		if side == "BUY" {
-			if deltaQty > 0 {
-				slot.PositionQty += deltaQty
-				// 累加统计
-				oldTotal := spm.totalBuyQty.Load().(float64)
-				spm.totalBuyQty.Store(oldTotal + deltaQty)
-			}
-
 			if update.Status == "FILLED" {
 				slot.OrderStatus = OrderStatusNotPlaced // 重置订单状态
 				slot.OrderID = 0
 				slot.ClientOID = ""
 				slot.OrderSide = "" // 🔥 清除订单方向，避免误判
+				slot.OrderQuantity = 0
 				slot.OrderFilledQty = 0
 
 				slot.PositionStatus = PositionStatusFilled // 标记为有仓
@@ -794,22 +1183,12 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 			}
 
 		} else { // SELL
-			if deltaQty > 0 {
-				slot.PositionQty -= deltaQty
-				if slot.PositionQty < 0 {
-					slot.PositionQty = 0
-				}
-				// 累加统计
-				oldTotal := spm.totalSellQty.Load().(float64)
-				spm.totalSellQty.Store(oldTotal + deltaQty)
-			}
-			spm.applySellRealizedPNL(slot, update, deltaQty)
-
 			if update.Status == "FILLED" {
 				slot.OrderStatus = OrderStatusNotPlaced // 重置订单状态
 				slot.OrderID = 0
 				slot.ClientOID = ""
 				slot.OrderSide = "" // 🔥 清除订单方向，避免误判
+				slot.OrderQuantity = 0
 				slot.OrderFilledQty = 0
 
 				if slot.PositionQty < 0.000001 {
@@ -837,6 +1216,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		}
 
 	case "CANCELED", "EXPIRED", "REJECTED":
+		_, _ = spm.applyOrderExecutionDelta(slot, update, side, price)
 		logger.Info("⚠️ [订单%s] 价格: %s, 方向: %s, 原因: %s, 已成交: %.4f",
 			update.Status, formatPrice(price, spm.priceDecimals), side, update.Status, slot.OrderFilledQty)
 
@@ -860,7 +1240,9 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 			// 卖单被取消/拒绝：应该还持有币，保持持仓状态
 			if slot.PositionQty > 0 {
 				// 记录撤销/拒绝次数供诊断；主动撤单、过期与 PostOnly 拒绝都可能进入此分支。
-				slot.PostOnlyFailCount++
+				if !terminalSeen {
+					slot.PostOnlyFailCount++
+				}
 				logger.Info("🔄 [卖单取消] 价格: %s, 保持持仓状态: %.4f, 等待重挂, 撤销/拒绝计数: %d",
 					formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.PostOnlyFailCount)
 				slot.PositionStatus = PositionStatusFilled
@@ -874,15 +1256,218 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 			}
 		}
 
+		spm.rememberTerminalOrderProgress(
+			update,
+			slot.OrderFilledQty,
+			slot.orderReportedPNL,
+			slot.orderAccumulatedPNL,
+		)
+
 		// 清空订单信息
 		slot.OrderStatus = OrderStatusCanceled
 		slot.OrderID = 0
 		slot.ClientOID = ""
+		slot.OrderQuantity = 0
 		slot.OrderFilledQty = 0
 		slot.orderReportedPNL = 0
 		slot.orderAccumulatedPNL = 0
 		// 保留 OrderSide 用于日志调试
 	}
+}
+
+func isTerminalOrderStatus(status string) bool {
+	switch status {
+	case "CANCELED", "EXPIRED", "REJECTED":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyOrderExecutionDelta 将交易所累计成交量转换成本地增量。
+// 所有可能携带最终累计量的状态都必须走这里，包括撤销、过期和拒绝。
+func (spm *SuperPositionManager) applyOrderExecutionDelta(slot *InventorySlot, update OrderUpdate, side string, slotPrice float64) (float64, bool) {
+	if math.IsNaN(update.ExecutedQty) || math.IsInf(update.ExecutedQty, 0) || update.ExecutedQty < 0 {
+		logger.Warn("⚠️ [忽略非法累计成交] 槽位 %s: 推送 %.12f, 状态 %s",
+			formatPrice(slotPrice, spm.priceDecimals), update.ExecutedQty, update.Status)
+		return 0, true
+	}
+	if update.ExecutedQty+fillQtyTolerance < slot.OrderFilledQty {
+		logger.Warn("⚠️ [忽略乱序成交] 槽位 %s: 已成交 %.12f, 推送 %.12f, 状态 %s",
+			formatPrice(slotPrice, spm.priceDecimals), slot.OrderFilledQty, update.ExecutedQty, update.Status)
+		return 0, true
+	}
+
+	deltaQty := update.ExecutedQty - slot.OrderFilledQty
+	if deltaQty < fillQtyTolerance {
+		deltaQty = 0
+	}
+	if update.ExecutedQty > slot.OrderFilledQty {
+		slot.OrderFilledQty = update.ExecutedQty
+	}
+
+	if side == "BUY" {
+		if deltaQty > 0 {
+			slot.PositionQty += deltaQty
+			oldTotal := spm.totalBuyQty.Load().(float64)
+			spm.totalBuyQty.Store(oldTotal + deltaQty)
+		}
+		return deltaQty, false
+	}
+
+	if deltaQty > 0 {
+		slot.PositionQty -= deltaQty
+		if slot.PositionQty < 0 {
+			slot.PositionQty = 0
+		}
+		oldTotal := spm.totalSellQty.Load().(float64)
+		spm.totalSellQty.Store(oldTotal + deltaQty)
+	}
+	spm.applySellRealizedPNL(slot, update, deltaQty)
+	return deltaQty, false
+}
+
+func (spm *SuperPositionManager) getTerminalOrderProgress(update OrderUpdate) (terminalOrderProgress, bool) {
+	key := filledOrderKey(update)
+	if key == "" {
+		return terminalOrderProgress{}, false
+	}
+	spm.terminalOrdersMu.RLock()
+	progress, exists := spm.terminalOrders[key]
+	spm.terminalOrdersMu.RUnlock()
+	return progress, exists
+}
+
+func (spm *SuperPositionManager) rememberTerminalOrderProgress(update OrderUpdate, executedQty, reportedPNL, accountedPNL float64) {
+	spm.storeTerminalOrderProgress(update, terminalOrderProgress{
+		ExecutedQty:  executedQty,
+		ReportedPNL:  reportedPNL,
+		AccountedPNL: accountedPNL,
+		UpdateTime:   update.UpdateTime,
+	})
+}
+
+func (spm *SuperPositionManager) storeTerminalOrderProgress(update OrderUpdate, next terminalOrderProgress) {
+	key := filledOrderKey(update)
+	if key == "" {
+		return
+	}
+	spm.terminalOrdersMu.Lock()
+	_, exists := spm.terminalOrders[key]
+	spm.terminalOrders[key] = next
+	if !exists {
+		spm.terminalOrderKeys = append(spm.terminalOrderKeys, key)
+		if len(spm.terminalOrderKeys) > maxTerminalOrders {
+			oldest := spm.terminalOrderKeys[0]
+			spm.terminalOrderKeys = spm.terminalOrderKeys[1:]
+			delete(spm.terminalOrders, oldest)
+		}
+	}
+	spm.terminalOrdersMu.Unlock()
+}
+
+// applyTerminalOrderCorrection 只补记已终结旧订单的新增成交和可证明为更新版本的累计 PNL。
+// 它绝不触碰当前槽位绑定的订单身份、OrderStatus 或 SlotStatus，避免旧推送干扰新订单。
+func (spm *SuperPositionManager) applyTerminalOrderCorrection(
+	slot *InventorySlot,
+	update OrderUpdate,
+	side string,
+	slotPrice float64,
+	progress terminalOrderProgress,
+) {
+	if math.IsNaN(update.ExecutedQty) || math.IsInf(update.ExecutedQty, 0) || update.ExecutedQty < 0 {
+		logger.Warn("⚠️ [忽略非法终态累计成交] 槽位 %s: 推送 %.12f, 状态 %s",
+			formatPrice(slotPrice, spm.priceDecimals), update.ExecutedQty, update.Status)
+		return
+	}
+	if update.ExecutedQty+fillQtyTolerance < progress.ExecutedQty {
+		logger.Debug("⏭️ [忽略回退的终态推送] ID=%d, ClientOID=%s, 已记录=%.12f, 推送=%.12f",
+			update.OrderID, update.ClientOrderID, progress.ExecutedQty, update.ExecutedQty)
+		return
+	}
+
+	deltaQty := update.ExecutedQty - progress.ExecutedQty
+	if deltaQty < fillQtyTolerance {
+		deltaQty = 0
+	}
+
+	// 数量不变时，只接受有严格事件版本的累计 PNL 修正。UpdateTime 缺失或
+	// 乱序时无法证明新旧关系，因此宁可忽略，也不能让累计盈亏来回回退。
+	hasCumulativePNL := side == "SELL" && !update.RealizedPNLIncremental && update.RealizedPNL != 0
+	pnlChanged := hasCumulativePNL && math.Abs(update.RealizedPNL-progress.ReportedPNL) > fillQtyTolerance
+	acceptPNLCorrection := pnlChanged && deltaQty == 0 &&
+		progress.UpdateTime > 0 && update.UpdateTime > progress.UpdateTime
+	if deltaQty == 0 && !acceptPNLCorrection {
+		logger.Debug("⏭️ [重复终态被忽略] ID=%d, ClientOID=%s, Status=%s",
+			update.OrderID, update.ClientOrderID, update.Status)
+		return
+	}
+
+	if side == "BUY" {
+		if deltaQty > 0 {
+			slot.PositionQty += deltaQty
+			oldTotal := spm.totalBuyQty.Load().(float64)
+			spm.totalBuyQty.Store(oldTotal + deltaQty)
+			slot.PositionStatus = PositionStatusFilled
+		}
+	} else {
+		if deltaQty > 0 {
+			slot.PositionQty -= deltaQty
+			if slot.PositionQty < 0 {
+				slot.PositionQty = 0
+			}
+			oldTotal := spm.totalSellQty.Load().(float64)
+			spm.totalSellQty.Store(oldTotal + deltaQty)
+		}
+
+		pnlDelta := 0.0
+		source := "成交价差"
+		if update.RealizedPNLIncremental {
+			// 同数量的增量 PNL 无法去重，上方已经拒绝；这里只处理新增成交。
+			pnlDelta = update.RealizedPNL
+			if pnlDelta != 0 {
+				source = "成交推送"
+			}
+		} else if update.RealizedPNL != 0 {
+			// 交易所累计值替换本地已经入账的回退/增量合计，只补二者差额。
+			pnlDelta = update.RealizedPNL - progress.AccountedPNL
+			progress.ReportedPNL = update.RealizedPNL
+			source = "成交推送"
+		}
+		if pnlDelta == 0 && deltaQty > 0 && !hasCumulativePNL {
+			sellPx := update.AvgPrice
+			if sellPx <= 0 {
+				sellPx = update.Price
+			}
+			if sellPx > 0 && slotPrice > 0 {
+				pnlDelta = deltaQty * (sellPx - slotPrice)
+			}
+		}
+		progress.AccountedPNL += pnlDelta
+		if hasCumulativePNL {
+			// 即使差额为零，权威累计值也定义了本订单最终已入账水位。
+			progress.AccountedPNL = update.RealizedPNL
+		}
+		if pnlDelta != 0 {
+			total := spm.addRealizedPNL(pnlDelta)
+			logger.Info("💵 [终态盈亏修正] 价格: %s, 本笔: %.6f, 累计: %.6f (%s)",
+				formatPrice(slotPrice, spm.priceDecimals), pnlDelta, total, source)
+		}
+
+		if slot.PositionQty < 0.000001 {
+			slot.PositionStatus = PositionStatusEmpty
+		} else {
+			slot.PositionStatus = PositionStatusFilled
+		}
+	}
+
+	if update.ExecutedQty > progress.ExecutedQty {
+		progress.ExecutedQty = update.ExecutedQty
+	}
+	if update.UpdateTime > progress.UpdateTime {
+		progress.UpdateTime = update.UpdateTime
+	}
+	spm.storeTerminalOrderProgress(update, progress)
 }
 
 func filledOrderKey(update OrderUpdate) string {
@@ -1033,17 +1618,24 @@ func timestampToTime(timestamp int64) time.Time {
 func (spm *SuperPositionManager) applySellRealizedPNL(slot *InventorySlot, update OrderUpdate, deltaQty float64) {
 	var delta float64
 	source := "成交价差"
+	hasCumulativePNL := !update.RealizedPNLIncremental && update.RealizedPNL != 0
 	if update.RealizedPNLIncremental {
+		// 增量盈亏属于本笔成交；重复推送没有新增成交量时不得再次累加。
+		if deltaQty <= 0 {
+			return
+		}
 		delta = update.RealizedPNL
 		if delta != 0 {
 			source = "成交推送"
 		}
-	} else if update.RealizedPNL != 0 {
-		delta = update.RealizedPNL - slot.orderReportedPNL
+	} else if hasCumulativePNL {
+		// 累计值是该订单的权威总额。以本地实际入账值（包括价差回退）为
+		// 基线补差，避免先回退 0.10、后累计 0.11 时最终变成 0.21。
+		delta = update.RealizedPNL - slot.orderAccumulatedPNL
 		slot.orderReportedPNL = update.RealizedPNL
 		source = "成交推送"
 	}
-	if delta == 0 && deltaQty > 0 {
+	if delta == 0 && deltaQty > 0 && !hasCumulativePNL {
 		sellPx := update.AvgPrice
 		if sellPx <= 0 {
 			sellPx = update.Price
@@ -1150,8 +1742,13 @@ type SlotData struct {
 	PositionStatus string
 	PositionQty    float64
 	OrderID        int64
+	ClientOID      string
 	OrderSide      string
 	OrderStatus    string
+	OrderPrice     float64
+	OrderQuantity  float64
+	OrderFilledQty float64
+	SlotStatus     string
 	OrderCreatedAt time.Time
 }
 
@@ -1171,8 +1768,13 @@ func (spm *SuperPositionManager) IterateSlots(fn func(price float64, slot interf
 			PositionStatus: slot.PositionStatus,
 			PositionQty:    slot.PositionQty,
 			OrderID:        slot.OrderID,
+			ClientOID:      slot.ClientOID,
 			OrderSide:      slot.OrderSide,
 			OrderStatus:    slot.OrderStatus,
+			OrderPrice:     slot.OrderPrice,
+			OrderQuantity:  slot.OrderQuantity,
+			OrderFilledQty: slot.OrderFilledQty,
+			SlotStatus:     slot.SlotStatus,
 			OrderCreatedAt: slot.OrderCreatedAt,
 		}
 
@@ -1219,92 +1821,39 @@ func (spm *SuperPositionManager) GetPriceInterval() float64 {
 // ===== 订单清理功能已迁移到 safety.OrderCleaner =====
 // StartOrderCleanup 和 cleanupOrders 方法已移至 safety/order_cleaner.go
 
-// UpdateSlotOrderStatus 更新槽位订单状态（供 OrderCleaner 使用）
-func (spm *SuperPositionManager) UpdateSlotOrderStatus(price float64, status string) {
-	slot := spm.getOrCreateSlot(price)
+// CompareAndSwapSlotOrderStatus 仅在槽位仍属于指定订单、且订单状态与清理快照
+// 一致时更新状态。撤单 REST 返回前，订单流可能已经清槽或让同价新订单接管；
+// 这些情况下必须拒绝旧清理结果的迟到反写。
+func (spm *SuperPositionManager) CompareAndSwapSlotOrderStatus(
+	price float64,
+	orderID int64,
+	clientOID, expectedStatus, newStatus string,
+) bool {
+	value, ok := spm.slots.Load(price)
+	if !ok {
+		return false
+	}
+	slot := value.(*InventorySlot)
 	slot.mu.Lock()
-	slot.OrderStatus = status
-	slot.mu.Unlock()
+	defer slot.mu.Unlock()
+
+	if slot.OrderID != orderID || slot.OrderStatus != expectedStatus {
+		return false
+	}
+	if clientOID != "" && spm.canonicalClientOrderID(slot.ClientOID) != spm.canonicalClientOrderID(clientOID) {
+		return false
+	}
+
+	slot.OrderStatus = newStatus
+	return true
 }
 
-// CancelAllBuyOrders 撤销所有买单（风控触发时使用）
-func (spm *SuperPositionManager) CancelAllBuyOrders() {
-	var buyOrderIDs []int64
-	var buyPrices []float64
-
-	// 🔥 修复：收集所有OrderID>0且OrderSide=BUY的订单，不管OrderStatus
-	spm.slots.Range(func(key, value interface{}) bool {
-		price := key.(float64)
-		slot := value.(*InventorySlot)
-
-		slot.mu.RLock()
-		if slot.OrderSide == "BUY" && slot.OrderID > 0 {
-			buyOrderIDs = append(buyOrderIDs, slot.OrderID)
-			buyPrices = append(buyPrices, price)
-		}
-		slot.mu.RUnlock()
-		return true
-	})
-
-	if len(buyOrderIDs) == 0 {
-		return
-	}
-
-	logger.Info("🔄 [撤销买单] 准备撤销 %d 个买单以释放保证金", len(buyOrderIDs))
-
-	// 🔥 重复尝试3次，确保撤单干净
-	for attempt := 1; attempt <= 3; attempt++ {
-		if len(buyOrderIDs) == 0 {
-			break
-		}
-
-		logger.Info("🔄 [撤销买单] 第 %d 次尝试，剩余 %d 个订单", attempt, len(buyOrderIDs))
-
-		if err := spm.executor.BatchCancelOrders(buyOrderIDs); err != nil {
-			logger.Error("❌ [撤销买单] 批量撤单失败: %v", err)
-		}
-
-		// 更新槽位状态
-		for _, price := range buyPrices {
-			slot := spm.getOrCreateSlot(price)
-			slot.mu.Lock()
-			slot.OrderStatus = OrderStatusCancelRequested
-			slot.mu.Unlock()
-		}
-
-		// 等待2秒让撤单生效（WebSocket推送通知）
-		time.Sleep(2 * time.Second)
-
-		// 🔥 二次检查：重新扫描本地槽位状态
-		if attempt < 3 {
-			buyOrderIDs = nil
-			buyPrices = nil
-
-			spm.slots.Range(func(key, value interface{}) bool {
-				price := key.(float64)
-				slot := value.(*InventorySlot)
-
-				slot.mu.RLock()
-				// 如果OrderStatus不是CANCELED且OrderID>0，说明可能还有残留
-				if slot.OrderSide == "BUY" && slot.OrderID > 0 &&
-					slot.OrderStatus != OrderStatusCanceled {
-					buyOrderIDs = append(buyOrderIDs, slot.OrderID)
-					buyPrices = append(buyPrices, price)
-				}
-				slot.mu.RUnlock()
-				return true
-			})
-
-			if len(buyOrderIDs) > 0 {
-				logger.Warn("⚠️ [撤销买单] 检测到 %d 个残留买单，继续清理", len(buyOrderIDs))
-			} else {
-				logger.Info("✅ [撤销买单] 所有买单已清理完成")
-				break
-			}
-		}
-	}
-
-	logger.Info("✅ [撤销买单] 清理完成")
+// CancelAllBuyOrders 撤销并确认所有受管买单。只有交易所终态已经回读、且本地槽位
+// 已应用最终累计成交量后才返回成功；任何不确定状态都会向调用方传播错误。
+func (spm *SuperPositionManager) CancelAllBuyOrders() error {
+	ctx, cancel := context.WithTimeout(context.Background(), buyCancelTimeout)
+	defer cancel()
+	return spm.cancelAllBuyOrders(ctx)
 }
 
 // ===== 对账功能已迁移到 safety.Reconciler =====

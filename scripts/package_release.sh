@@ -133,20 +133,28 @@ rm -rf "$STAGE_DIR" "$ARCHIVE_PATH" "$CHECKSUM_PATH"
 mkdir -p "$STAGE_DIR"
 
 echo "==> 构建 $APP_NAME $VERSION ($TARGET_OS/$TARGET_ARCH -> $GOOS/$GOARCH)"
-CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -o "$BIN_PATH" .
+CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags="-s -w" -o "$BIN_PATH" .
 
 echo "==> 准备发布包内容"
 cp README.md "$STAGE_DIR/README.md"
 cp ARCHITECTURE.md "$STAGE_DIR/ARCHITECTURE.md"
-cp 部署教程.pdf "$STAGE_DIR/部署教程.pdf"
 cp config.example.yaml "$STAGE_DIR/config.example.yaml"
 cp config.example.yaml "$STAGE_DIR/config.yaml"
 cp .env.example "$STAGE_DIR/.env.example"
-cp -R live_server "$STAGE_DIR/live_server"
+
+# 仅复制版本库中明确跟踪的演示文件，避免把本机忽略文件、临时文件或凭据带入公开发行包。
+while IFS= read -r -d '' source_path; do
+  target_path="$STAGE_DIR/$source_path"
+  mkdir -p "$(dirname "$target_path")"
+  cp "$source_path" "$target_path"
+done < <(git ls-files -z -- live_server)
 
 echo "==> 打包归档"
 create_archive
-sha256_file "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
+(
+  cd "$DIST_DIR"
+  sha256_file "$(basename "$ARCHIVE_PATH")"
+) > "$CHECKSUM_PATH"
 
 echo "==> 发布包已生成"
 echo "$ARCHIVE_PATH"

@@ -1,8 +1,8 @@
 # OpenSQT 做市商系统架构说明
 
-> **版本**: v3.4.11
-> **文档创建日期**: 2025-12-24  
-> **目的**: 为系统重构改造提供全面的架构参考
+> **版本**: v3.5.0
+> **最近更新**: 2026-08-25
+> **目的**: 说明当前运行架构、交易安全边界与扩展约束
 
 ---
 
@@ -21,10 +21,10 @@
 ## 系统概述
 
 ### 系统定位
-OpenSQT 是一个**毫秒级高频加密货币做市商系统**，专注于永续合约市场的做多网格交易策略。
+OpenSQT 是一个 WebSocket 驱动的加密货币永续合约**单向做多网格做市系统**。每个网格使用固定报价货币金额，并以严格 PostOnly 限价单执行。
 
 ### 核心功能
-- ✅ 多交易所支持（Binance、Bitget、Gate.io）
+- ✅ 多交易所支持（Binance、Bitget、Gate.io、Bybit、Backpack）
 - ✅ 基于网格的自动做市策略
 - ✅ WebSocket 实时价格和订单流
 - ✅ 智能仓位管理（超级槽位系统）
@@ -33,7 +33,7 @@ OpenSQT 是一个**毫秒级高频加密货币做市商系统**，专注于永�
 - ✅ 持仓安全性检查
 
 ### 技术栈
-- **语言**: Go 1.21+
+- **语言**: Go 1.25
 - **配置管理**: YAML
 - **WebSocket**: gorilla/websocket
 - **限流**: golang.org/x/time/rate
@@ -142,41 +142,58 @@ opensqt_platform/
 
 ### 启动流程
 ```
-1. 加载配置 (config.yaml)
+1. 加载配置（YAML + OPENSQT_* 环境变量）
    ↓
 2. 创建交易所实例 (factory.go)
+   └── Binance：同步服务器时间、加载合约过滤器、校验交易权限/单向持仓/空头持仓
    ↓
 3. 启动价格监控 (PriceMonitor.Start)
-   ├── WebSocket 连接
-   └── 等待首次价格推送
+   ├── 唯一价格 WebSocket
+   └── 等待首个有效价格
    ↓
-4. 持仓安全性检查 (safety.CheckAccountSafety)
-   ├── 验证账户余额
-   ├── 验证杠杆倍数
-   └── 计算最大可持仓数
+4. 启动前安全检查
+   ├── Binance 查询账户真实 Maker 费率
+   ├── 验证保证金币种余额与杠杆
+   └── 验证网格间距扣除双边手续费后仍有利润
    ↓
-5. 启动订单流 (exchange.StartOrderStream)
-   ├── 监听订单成交
+5. 创建执行器与核心组件（新单门禁保持关闭）
+   ↓
+6. 启动订单流 (exchange.StartOrderStream)
+   ├── 所有交易所必须完成私有订阅握手并进入 READY
+   ├── 连接代际、订阅确认或消息校验异常会立即转为 DEGRADED
    └── 回调 → SuperPositionManager.OnOrderUpdate
    ↓
-6. 初始化仓位管理器 (SuperPositionManager.Initialize)
+7. 初始化仓位管理器 (SuperPositionManager.Initialize)
    ├── 设置价格锚点
-   ├── 创建初始买单槽位
-   └── 批量下单
+   └── 恢复持仓槽位；此时仍禁止下单
    ↓
-7. 启动对账器 (Reconciler.Start)
+8. 同步执行首次完整对账
    ↓
-8. 启动订单清理器 (OrderCleaner.Start)
+9. 同步启动主动风控
+   ├── 加载足量已完结历史 K 线
+   ├── 启动实时 K 线流
+   └── 所有监控交易对收到实时数据后进入 READY
    ↓
-9. 启动风控监控 (RiskMonitor.Start)
-   ├── 加载历史K线
-   ├── 启动K线流
-   └── 实时检测成交量异常
+10. 启动统一交易门禁 (tradingGateRuntime)
+    ├── 订单流、风控、对账、价格新鲜度全部健康才放行
+    ├── 首次放行立即执行 AdjustOrders
+    └── 任一条件恶化立即停新单、撤买单，恢复前强制对账
+    ↓
+11. 启动订单清理、只读面板与状态日志
+```
+
+### 退出流程
+
+```
+SIGINT / SIGTERM
    ↓
-10. 价格驱动交易循环
-    ├── 监听价格变化
-    ├── 风控检查
-    └── 调整订单窗口 (AdjustOrders)
+永久关闭交易门禁并等待协调器退出
+   ↓
+cancel_on_exit=true ? 全撤并反复查询直至远端挂单为空 : 明确保留远端挂单
+   ↓
+Shutdown 订单执行器，取消后台上下文
+   ↓
+停止价格流、订单流、风控 K 线流和只读面板
 ```
 
 ### 价格流
@@ -191,16 +208,20 @@ periodicPriceSender (定期推送)
     ↓
 priceChangeCh (channel)
     ↓
-main.go 监听协程
+tradingGateRuntime 串行协调器
     ↓
-风控检查 (RiskMonitor.IsTriggered)
-    ├── ❌ 触发 → 撤销所有买单，暂停交易
-    └── ✅ 正常 → SuperPositionManager.AdjustOrders()
+联合健康检查（订单流 / 风控 / 对账 / 价格新鲜度）
+    ├── ❌ 任一异常 → 停新单、撤买单、等待恢复对账
+    └── ✅ 全部健康 → SuperPositionManager.AdjustOrders()
 ```
 
 ### 订单流
 ```
 Exchange WebSocket (订单更新)
+    ↓
+各交易所适配器校验连接代际、订阅确认、交易对与订单字段
+    ├── ❌ 解码或字段异常 → DEGRADED、重连、门禁关闭
+    └── ✅ 有效 OpenSQT 订单
     ↓
 main.go 回调函数
     ↓
@@ -209,9 +230,9 @@ main.go 回调函数
 position.OrderUpdate
     ↓
 SuperPositionManager.OnOrderUpdate()
-    ├── 匹配槽位 (通过 ClientOrderID 或 OrderID)
+    ├── 匹配槽位（严格通过 ClientOrderID）
     ├── 更新槽位状态
-    ├── FILLED → 创建卖单
+    ├── FILLED → 释放槽位，下一次 AdjustOrders 创建对向单
     └── CANCELED → 重置槽位
 ```
 
@@ -283,6 +304,16 @@ type IExchange interface {
     GetQuoteAsset() string
 }
 ```
+
+#### Binance 安全边界
+
+- 初始化时同步服务器时间，并拒绝非 `TRADING`、非 `PERPETUAL` 合约。
+- 价格按 `tickSize` 量化（买价向下、卖价向上），数量按 `stepSize` 向下量化，同时校验 `minQty`、`maxQty` 与 `minNotional`。
+- 仅允许单向持仓；卖单必须 `reduceOnly`，所有策略订单必须为 `LIMIT + GTX`。
+- 503、超时、断连、异常 2xx、重复 ClientOrderID 和创建订单响应超限，都按原 ClientOrderID 查询确认；结果未知时禁止盲重试。
+- 用户订单流握手后才进入 READY；listenKey 过期、保活失败、JSON/字段异常会立即 DEGRADED、重连并触发恢复对账。
+- REST 响应在进入 SDK 前有大小上限（普通接口 1 MiB，`exchangeInfo` 8 MiB）。
+- 全撤使用 Binance 原生接口，并查询确认远端挂单为空。
 
 #### 实现层级
 ```
@@ -424,11 +455,13 @@ type PriceMonitor struct {
    ↓
 2. updatePrice (收到价格推送)
    ↓
-3. latestPriceChange.Store (原子存储)
+3. lastPrice / lastPriceTime / latestPriceChange 原子更新
    ↓
 4. periodicPriceSender (定期发送到 channel)
    ↓
-5. main.go 监听 priceChangeCh
+5. tradingGateRuntime 读取价格事件并执行健康复检
+   ↓
+6. 门禁仍健康时调用 AdjustOrders
 ```
 
 #### 价格精度检测
@@ -445,7 +478,7 @@ if len(parts) == 2 {
 
 ### 4. Safety（安全与风控）
 
-#### 四大安全机制
+#### 核心安全机制
 
 ##### 4.1 启动前安全检查 (safety.go)
 ```go
@@ -457,11 +490,13 @@ CheckAccountSafety(
 ```
 
 **检查内容**:
-1. 账户余额充足性
-2. 杠杆倍数限制（最高10倍）
+1. 保证金币种余额充足性（Binance 严格使用合约 `marginAsset`）
+2. 杠杆倍数限制（最高 10 倍）
 3. 最大可持仓数计算
-4. 手续费率验证
-5. 盈利率 vs 手续费率
+4. Binance 账户实际 Maker 费率查询
+5. 网格价差 vs 双边手续费
+6. Binance `canTrade`、单向持仓模式与非负持仓检查
+7. 合约状态、`PERPETUAL` 类型及 PRICE_FILTER / LOT_SIZE / MIN_NOTIONAL 校验
 
 **公式**:
 ```
@@ -481,11 +516,12 @@ type RiskMonitor struct {
 ```
 
 **监控逻辑**:
-1. 实时监听多个币种的K线（如BTC、ETH）
-2. 计算成交量移动平均
-3. 检测当前成交量是否超过阈值（默认3倍）
-4. 触发风控 → 撤销所有买单，暂停交易
-5. 恢复条件：多数币种恢复正常（默认3/5）
+1. 启动时为每个监控交易对加载足量已完结历史 K 线
+2. 实时监听多个币种的 K 线（如 BTC、ETH），按时间戳去重更新
+3. 计算成交量移动平均并检测异常倍数
+4. 历史数据不足、实时流未握手或数据陈旧时保持 fail-closed
+5. 触发风控 → 统一门禁停新单并撤销所有买单
+6. 达到恢复阈值后仍需通过完整对账，才可恢复交易
 
 **配置示例**:
 ```yaml
@@ -510,12 +546,15 @@ type Reconciler struct {
 
 **对账内容**:
 1. 交易所持仓 vs 本地持仓
-2. 交易所未完成订单 vs 本地订单
-3. 槽位状态修复
+2. 交易所策略挂单 ID 集合 vs 本地活跃订单 ID 集合
+3. 下单提交中的 PENDING 窗口识别，避免瞬时误报
+4. 任一不一致立即使交易门禁失效；不在对账器内静默改写槽位
 
 **对账周期**:
-- 默认每5分钟（可配置）
-- 风控触发时暂停对账日志
+- 默认每 60 秒（可配置）
+- 启动放行前同步执行一次
+- 订单流异常恢复后强制执行一次
+- 风控期间仍继续对账，仅降低普通日志噪声
 
 ##### 4.4 订单清理 (order_cleaner.go)
 ```go
@@ -532,53 +571,55 @@ type OrderCleaner struct {
 3. 批量撤销最旧的订单（默认10个/批）
 4. 重置对应槽位状态
 
+##### 4.5 统一交易门禁 (trading_gate.go)
+
+新单只有在以下条件同时成立时才允许提交：
+
+- 订单流为 READY
+- 风控数据已就绪且未触发
+- 最近一次完整对账健康
+- 唯一价格流已有正价格且更新时间未陈旧
+- 每次真正进入交易所 `PlaceOrder` 前再次同步复检以上条件
+
+任一条件恶化时，门禁会先取消执行器中的在途下单，再撤销全部买单并使对账失效。订单流恢复后必须重新核对真实持仓与挂单；只有对账通过才重新放行，并立即按最新价格调整订单窗口。
+
 ---
 
 ### 5. Order Executor（订单执行器）
 
 #### 核心功能
 - **限流**: 25单/秒，突发30（可配置）
-- **重试**: 自动重试失败订单
+- **交易门禁**: 启动、异常恢复和停机期间可原子停止新单
+- **有界请求**: 下单、撤单与重试等待均可由上下文取消
+- **分类重试**: 仅重试明确可安全重试的失败
 - **严格 PostOnly**: 所有网格单只做 Maker，被拒后只重试，绝不降级为普通单
+- **UNKNOWN 传播**: 结果未知时不释放槽位、不换 ClientOrderID 盲目重下
 
 #### 执行流程
 ```go
 PlaceOrder(req *OrderRequest) (*Order, error) {
-    // 1. 限流等待
-    rateLimiter.Wait()
-    
-    // 2. 重试循环（最多5次）
-    for i := 0; i <= 5; i++ {
-        req.PostOnly = true
-        order, err := exchange.PlaceOrder(ctx, req)
-        
-        // 3. PostOnly错误检测
-        if isPostOnlyError(err) {
-            // 价格会立即成交，保持 PostOnly 并重试
-            continue
-        }
-        
-        // 4. 其他错误重试
-        if err != nil {
-            time.Sleep(orderRetryDelay)
-            continue
-        }
-        
-        return order, nil
+    requireNewOrderGateOpen()
+    rateLimiter.Wait(ctx)
+    req.PostOnly = true
+    order, err := exchange.PlaceOrder(requestTimeoutCtx, req)
+    if resultIsUnknown(err) {
+        return nil, err // 上层关门并对账，禁止换 ID 重下
     }
+    if safelyRetryable(err) {
+        waitWithContext(ctx, orderRetryDelay)
+        // 使用同一槽位请求继续受控重试
+    }
+    return order, err
 }
 ```
 
-#### 批量下单优化
+Binance 适配器还会在 503、超时、断连、异常 2xx 或重复 ClientOrderID 后，以**原始 ClientOrderID**查询订单；明确不存在时才使用同一 ID 重试。
+
+#### 批量下单错误传播
 ```go
-BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool) {
-    // 调用交易所批量API（Bitget原生支持）
-    // 或循环调用单个API（Binance/Gate）
-    
-    results, marginError := exchange.BatchPlaceOrders(ctx, orders)
-    
-    // marginError: 是否有保证金不足错误
-    return results, marginError
+BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool, error) {
+    // 返回已确认订单、保证金错误标记以及首个未解决错误。
+    // position 层保留未知结果对应槽位，错误继续上传给统一门禁。
 }
 ```
 
@@ -615,7 +656,7 @@ main.go
 // position/super_position_manager.go
 type OrderExecutorInterface interface {
     PlaceOrder(req *OrderRequest) (*Order, error)
-    BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool)
+    BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool, error)
     BatchCancelOrders(orderIDs []int64) error
 }
 
@@ -672,14 +713,14 @@ ex.StartOrderStream(ctx, func(updateInterface interface{}) {
 
 ### Goroutine 列表
 ```
-main.go 启动的协程:
-1. priceMonitor.Start()          # 价格 WebSocket
-2. ex.StartOrderStream()         # 订单 WebSocket
-3. riskMonitor.Start()           # 风控 K线 WebSocket
-4. reconciler.Start()            # 定期对账（每5分钟）
-5. orderCleaner.Start()          # 定期清理（每60秒）
-6. 价格变化监听 (main goroutine) # 监听 priceChangeCh
-7. 定期打印状态                  # 每1分钟
+主要后台任务:
+1. PriceMonitor                 # 唯一价格 WebSocket + 定期价格事件
+2. Exchange OrderStream Manager # 私有订单流、连接代际、保活与重连
+3. RiskMonitor                  # 风控 K 线流、陈旧检测与报告
+4. tradingGateRuntime           # 健康观察、价格调整、周期/恢复对账
+5. OrderCleaner                 # 定期清理旧订单
+6. Dashboard                    # 只读监控（启用时）
+7. 定期状态日志
 ```
 
 ### Channel 列表
@@ -689,12 +730,15 @@ main.go 启动的协程:
    容量: 10
    作用: 价格变化推送
 
-2. priceCh (订阅者)
-   类型: chan PriceChange
-   容量: 10
-   作用: 价格订阅（多个订阅者）
+2. tradingGateRuntime.wake
+   类型: chan struct{}
+   容量: 1
+   作用: 合并健康状态变化，唤醒串行协调器
 
-3. sigChan (main)
+3. 交易所订单流生命周期 channel
+   作用: 握手结果、连接完成、凭据失效和流错误通知
+
+4. sigChan (main)
    类型: chan os.Signal
    容量: 1
    作用: 退出信号
@@ -752,22 +796,39 @@ main.go 启动的协程:
 第1层: 启动前检查 (safety.CheckAccountSafety)
   ├── 余额充足性
   ├── 杠杆倍数限制
-  └── 手续费率验证
+  ├── 实际 Maker 手续费率验证
+  └── Binance 账户/合约规格校验
 
 第2层: 主动风控 (RiskMonitor)
+  ├── 历史/实时 K 线完整性与陈旧检测
   ├── K线成交量异常检测
   ├── 多币种联动监控
   └── 自动撤销买单
 
-第3层: 订单清理 (OrderCleaner)
+第3层: 统一交易门禁 (tradingGateRuntime)
+  ├── 订单流 / 风控 / 对账 / 价格联合判定
+  ├── 异常立即停止新单并撤买单
+  └── 恢复前强制对账
+
+第4层: 订单执行安全 (ExchangeOrderExecutor + BinanceAdapter)
+  ├── 严格 PostOnly、限流与有界请求
+  ├── UNKNOWN 结果按原 ClientOrderID 确认
+  └── 不盲重试、不提前释放槽位
+
+第5层: 订单清理 (OrderCleaner)
   ├── 未完成订单数量限制
   └── 定期清理旧订单
 
-第4层: 持仓对账 (Reconciler)
-  ├── 本地 vs 交易所对账
-  └── 槽位状态修复
+第6层: 持仓与挂单对账 (Reconciler)
+  ├── 本地 vs 交易所持仓
+  └── 本地 vs 交易所策略挂单 ID
 
-第5层: 人工干预
+第7层: 优雅停机
+  ├── 先永久关闭新单门禁
+  ├── cancel_on_exit=true 时全撤并确认远端为空
+  └── 停执行器后再停止各 WebSocket
+
+第8层: 人工干预
   ├── SIGINT/SIGTERM 优雅退出
   └── cancel_on_exit 配置
 ```
@@ -778,17 +839,21 @@ main.go 启动的协程:
     ↓
 RiskMonitor.IsTriggered() = true
     ↓
-main.go 价格监听协程检测
+tradingGateRuntime 健康观察器检测
+    ↓
+ExchangeOrderExecutor.StopNewOrders()
     ↓
 superPositionManager.CancelAllBuyOrders()
     ↓
-暂停交易（跳过 AdjustOrders）
+Reconciler.Invalidate()
     ↓
 等待恢复条件满足
     ↓
 RiskMonitor.IsTriggered() = false
     ↓
-恢复自动交易
+同步完整对账通过
+    ↓
+重新放行并立即 AdjustOrders
 ```
 
 ### 保证金管理
@@ -838,7 +903,7 @@ trading:
   min_order_value: 6.0
   buy_window_size: 100
   sell_window_size: 100
-  reconcile_interval: 5
+  reconcile_interval: 60
   order_cleanup_threshold: 100
   cleanup_batch_size: 10
   margin_lock_duration_seconds: 10
@@ -846,7 +911,7 @@ trading:
 
 system:
   log_level: "INFO"
-  cancel_on_exit: true
+  cancel_on_exit: true  # 默认全撤并确认；false 会显式保留远端挂单
 
 risk_control:
   enabled: true
@@ -938,5 +1003,5 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 
 **官网**:
 - Website: www.OpenSQT.com
-- Version: v3.4.11
-- Last Updated: 2026-08-20
+- Version: v3.5.0
+- Last Updated: 2026-08-25

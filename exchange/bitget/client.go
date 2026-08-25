@@ -38,6 +38,17 @@ type BitgetResponse struct {
 	ReqTime int64           `json:"requestTime"`
 }
 
+type APIError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("bitget API 错误: code=%s, msg=%s (状态码: %d)",
+		e.Code, e.Message, e.StatusCode)
+}
+
 // DoRequest 发送 HTTP 请求（带签名）
 func (c *Client) DoRequest(ctx context.Context, method, path string, body interface{}) (*BitgetResponse, error) {
 	var bodyBytes []byte
@@ -88,8 +99,12 @@ func (c *Client) DoRequest(ctx context.Context, method, path string, body interf
 		return nil, fmt.Errorf("解析响应失败: %w, 响应体: %s", err, string(respBody))
 	}
 
-	if bitgetResp.Code != "00000" {
-		return nil, fmt.Errorf("bitget API 错误: code=%s, msg=%s", bitgetResp.Code, bitgetResp.Msg)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices || bitgetResp.Code != "00000" {
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Code:       bitgetResp.Code,
+			Message:    bitgetResp.Msg,
+		}
 	}
 
 	return &bitgetResp, nil

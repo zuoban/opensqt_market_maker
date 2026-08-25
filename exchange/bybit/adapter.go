@@ -3,6 +3,7 @@ package bybit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc64"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"opensqt/exchange/exchangeerr"
 	"opensqt/logger"
 )
 
@@ -195,7 +197,7 @@ func (b *BybitAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Orde
 
 	resp, err := b.client.DoSignedRequest(ctx, "POST", "/v5/order/create", nil, body)
 	if err != nil {
-		return nil, err
+		return nil, classifyBybitPlacementError(err)
 	}
 
 	var result struct {
@@ -203,7 +205,16 @@ func (b *BybitAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Orde
 		OrderLinkID string `json:"orderLinkId"`
 	}
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return nil, fmt.Errorf("解析 Bybit 下单响应失败: %w", err)
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("解析 Bybit 下单响应失败: %w", err))
+	}
+	if strings.TrimSpace(result.OrderID) == "" {
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("Bybit 下单响应缺少 orderId"))
+	}
+	if req.ClientOrderID != "" && result.OrderLinkID != req.ClientOrderID {
+		return nil, exchangeerr.WrapOrderPlacementUnknown(
+			fmt.Errorf("Bybit 下单响应 orderLinkId=%q，与请求 %q 不一致", result.OrderLinkID, req.ClientOrderID))
 	}
 
 	return &Order{
@@ -220,6 +231,26 @@ func (b *BybitAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Orde
 		CreatedAt:     time.Now(),
 		UpdateTime:    resp.Time,
 	}, nil
+}
+
+func classifyBybitPlacementError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode >= 500 {
+			return exchangeerr.WrapOrderPlacementUnknown(err)
+		}
+		return err
+	}
+	message := err.Error()
+	// 这些错误发生在请求发送前，或是交易所明确返回的业务拒绝。
+	if strings.Contains(message, "序列化 Bybit 请求体失败") ||
+		strings.Contains(message, "创建 Bybit 请求失败") {
+		return err
+	}
+	return exchangeerr.WrapOrderPlacementUnknown(err)
 }
 
 func (b *BybitAdapter) BatchPlaceOrders(ctx context.Context, orders []*OrderRequest) ([]*Order, bool) {

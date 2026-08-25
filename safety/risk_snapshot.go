@@ -30,6 +30,7 @@ type SymbolRiskSnapshot struct {
 // RiskSnapshot 风控监视器只读快照
 type RiskSnapshot struct {
 	Enabled            bool                 `json:"enabled"`
+	Ready              bool                 `json:"ready"`
 	Triggered          bool                 `json:"triggered"`
 	LastMsg            string               `json:"lastMsg"`
 	Interval           string               `json:"interval"`
@@ -223,12 +224,15 @@ func (r *RiskMonitor) Snapshot() RiskSnapshot {
 	}
 
 	r.mu.RLock()
-	triggered := r.triggered
+	ready := !r.cfg.RiskControl.Enabled || r.ready
+	marketTriggered := r.triggered
+	triggered := marketTriggered || (r.cfg.RiskControl.Enabled && !r.ready)
 	lastMsg := r.lastMsg
 	r.mu.RUnlock()
 
 	snap := RiskSnapshot{
 		Enabled:            r.cfg.RiskControl.Enabled,
+		Ready:              ready,
 		Triggered:          triggered,
 		LastMsg:            lastMsg,
 		Interval:           r.cfg.RiskControl.Interval,
@@ -240,7 +244,7 @@ func (r *RiskMonitor) Snapshot() RiskSnapshot {
 	}
 
 	for _, symbol := range r.cfg.RiskControl.MonitorSymbols {
-		m := r.metricsForSymbol(symbol, triggered)
+		m := r.metricsForSymbol(symbol, marketTriggered)
 		snap.Symbols = append(snap.Symbols, m.toSnapshot(symbol))
 	}
 	return snap

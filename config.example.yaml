@@ -9,7 +9,7 @@ exchanges:
   #币安 开户邀请码【OPENSQT】开户链接：https://accounts.maxweb.chat/register?ref=OPENSQT
     api_key: "YOUR_API_KEY"
     secret_key: "YOUR_API_SECRET"
-    fee_rate: 0.0000  # USDT 合约手续费率 0.02%
+    fee_rate: 0.0002  # USDT 合约 Maker 手续费率 0.02%（实际费率以账户为准）
   
   bitget:
   #BITGET 用我链接开户每笔交易省20%手续费 邀请码【opensqt】开户链接：https://partner.hdmune.cn/bg/mtm6553a
