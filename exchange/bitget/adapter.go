@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -348,11 +349,12 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 	// 只请求1次，不重试
 	resp, err := b.client.DoRequest(ctx, "POST", "/api/v2/mix/order/place-order", body)
 	if err != nil {
+		classified := classifyBitgetPlacementError(err)
 		// 检查错误类型
 		if strings.Contains(err.Error(), "insufficient balance") || strings.Contains(err.Error(), "40007") {
-			return nil, fmt.Errorf("保证金不足: %w", err)
+			return nil, fmt.Errorf("保证金不足: %w", classified)
 		}
-		return nil, classifyBitgetPlacementError(err)
+		return nil, classified
 	}
 
 	// 解析响应
@@ -399,19 +401,63 @@ func classifyBitgetPlacementError(err error) error {
 		return nil
 	}
 	var apiErr *APIError
-	if errors.As(err, &apiErr) {
+	if errors.As(err, &apiErr) && apiErr != nil {
 		if apiErr.StatusCode >= 500 {
 			return exchangeerr.WrapOrderPlacementUnknown(err)
 		}
-		return err
+		if apiErr.StatusCode == http.StatusRequestTimeout ||
+			apiErr.StatusCode == http.StatusConflict ||
+			apiErr.Code == "50000" ||
+			exchangeerr.LooksLikeAmbiguousOrderPlacementFailure(apiErr.Code, apiErr.Message) ||
+			isBitgetDuplicateClientOrderIDError(apiErr) {
+			return exchangeerr.WrapOrderPlacementUnknown(err)
+		}
+		if (apiErr.StatusCode >= 400 && apiErr.StatusCode < 500) ||
+			(apiErr.StatusCode >= 200 && apiErr.StatusCode < 300) {
+			return exchangeerr.WrapOrderPlacementRejected(err)
+		}
+		return exchangeerr.WrapOrderPlacementUnknown(err)
 	}
 	message := err.Error()
+	if hasBitgetDuplicateClientOrderIDMessage(message) {
+		return exchangeerr.WrapOrderPlacementUnknown(err)
+	}
 	// 本地构造失败和明确 API 业务拒绝都能证明订单未被接受。
 	if strings.Contains(message, "序列化请求体失败") ||
 		strings.Contains(message, "创建请求失败") {
-		return err
+		return exchangeerr.WrapOrderPlacementRejected(err)
 	}
 	return exchangeerr.WrapOrderPlacementUnknown(err)
+}
+
+func isBitgetDuplicateClientOrderIDError(err *APIError) bool {
+	if err == nil {
+		return false
+	}
+	// Bitget 合约 API 曾使用这两个业务码表示 clientOid 重复。
+	switch strings.TrimSpace(err.Code) {
+	case "40786", "45034":
+		return true
+	}
+	return hasBitgetDuplicateClientOrderIDMessage(err.Code + " " + err.Message)
+}
+
+func hasBitgetDuplicateClientOrderIDMessage(message string) bool {
+	message = strings.ToLower(message)
+	duplicate := strings.Contains(message, "duplicate") ||
+		strings.Contains(message, "already used") ||
+		strings.Contains(message, "already been used") ||
+		strings.Contains(message, "has been used") ||
+		strings.Contains(message, "already in use") ||
+		strings.Contains(message, "already exists") ||
+		strings.Contains(message, "not unique")
+	identifier := strings.Contains(message, "clientoid") ||
+		strings.Contains(message, "client oid") ||
+		strings.Contains(message, "clientid") ||
+		strings.Contains(message, "client id") ||
+		strings.Contains(message, "orderid") ||
+		strings.Contains(message, "order id")
+	return duplicate && identifier
 }
 
 // BatchPlaceOrders 批量下单

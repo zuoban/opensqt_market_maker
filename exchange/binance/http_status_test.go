@@ -100,6 +100,36 @@ func TestStatusAwareTransportRejectsOversizedExchangeInfoResponse(t *testing.T) 
 	}
 }
 
+func TestStatusAwareTransportPreservesAmbiguousCreateOrderStatus(t *testing.T) {
+	for _, status := range []int{
+		http.StatusRequestTimeout,
+		http.StatusConflict,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			transport := &statusAwareTransport{base: boundedTransportFunc(func(*http.Request) (*http.Response, error) {
+				return responseWithBody(status, 0), nil
+			})}
+			req, err := http.NewRequest(http.MethodPost, "https://fapi.binance.com"+createOrderEndpoint, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			resp, err := transport.RoundTrip(req)
+			if resp != nil {
+				t.Fatalf("RoundTrip() response = %+v, want nil", resp)
+			}
+			var statusErr *httpStatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != status {
+				t.Fatalf("RoundTrip() error = %v, want httpStatusError status %d", err, status)
+			}
+		})
+	}
+}
+
 func TestPlaceOrderOversizedResponseConfirmsByClientOrderID(t *testing.T) {
 	const brokerID = "x-zdfVM8vYgrid-order-1"
 	var postCalls, queryCalls atomic.Int32

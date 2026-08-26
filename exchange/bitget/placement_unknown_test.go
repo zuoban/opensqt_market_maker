@@ -47,8 +47,8 @@ func TestPlaceOrderExplicitAPIRejectionIsDefinite(t *testing.T) {
 	_, err := adapter.PlaceOrder(context.Background(), &OrderRequest{
 		Symbol: "BTCUSDT", Side: SideBuy, Type: OrderTypeLimit, Price: 100, Quantity: 0.01,
 	})
-	if err == nil || errors.Is(err, exchangeerr.ErrOrderPlacementUnknown) {
-		t.Fatalf("PlaceOrder() error = %v, want definite API rejection", err)
+	if !exchangeerr.IsOrderPlacementRejected(err) {
+		t.Fatalf("PlaceOrder() error = %v, want ErrOrderPlacementRejected", err)
 	}
 }
 
@@ -69,5 +69,59 @@ func TestPlaceOrderServerErrorIsUnknown(t *testing.T) {
 	})
 	if !errors.Is(err, exchangeerr.ErrOrderPlacementUnknown) {
 		t.Fatalf("PlaceOrder() error = %v, want ErrOrderPlacementUnknown", err)
+	}
+	if exchangeerr.IsOrderPlacementRejected(err) {
+		t.Fatalf("PlaceOrder() error = %v, server error must not be definite rejection", err)
+	}
+}
+
+func TestPlaceOrderLocalRequestConstructionErrorIsDefinite(t *testing.T) {
+	client := NewClient("test-key", "test-secret", "test-passphrase")
+	client.baseURL = "://invalid"
+	adapter := &BitgetAdapter{
+		client: client, symbol: "BTCUSDT", productType: "usdt-futures",
+		volumePlace: 3, pricePlace: 2, posMode: "one_way_mode",
+	}
+
+	_, err := adapter.PlaceOrder(context.Background(), &OrderRequest{
+		Symbol: "BTCUSDT", Side: SideBuy, Type: OrderTypeLimit, Price: 100, Quantity: 0.01,
+	})
+	if !exchangeerr.IsOrderPlacementRejected(err) {
+		t.Fatalf("PlaceOrder() error = %v, want local ErrOrderPlacementRejected", err)
+	}
+}
+
+func TestClassifyPlacementErrorNeverRejectsAmbiguousStatusOrTransportFailure(t *testing.T) {
+	for _, status := range []int{408, 409, 500, 502, 503, 504} {
+		err := classifyBitgetPlacementError(&APIError{StatusCode: status, Code: "50000"})
+		if !errors.Is(err, exchangeerr.ErrOrderPlacementUnknown) || exchangeerr.IsOrderPlacementRejected(err) {
+			t.Fatalf("status %d classified as %v, want UNKNOWN only", status, err)
+		}
+	}
+
+	err := classifyBitgetPlacementError(errors.New("请求失败: connection reset"))
+	if !errors.Is(err, exchangeerr.ErrOrderPlacementUnknown) || exchangeerr.IsOrderPlacementRejected(err) {
+		t.Fatalf("transport error classified as %v, want UNKNOWN only", err)
+	}
+
+	err = classifyBitgetPlacementError(&APIError{
+		StatusCode: http.StatusOK,
+		Code:       "40786",
+		Message:    "Duplicate clientOid",
+	})
+	if !errors.Is(err, exchangeerr.ErrOrderPlacementUnknown) || exchangeerr.IsOrderPlacementRejected(err) {
+		t.Fatalf("duplicate clientOid classified as %v, want UNKNOWN only", err)
+	}
+	err = classifyBitgetPlacementError(errors.New("clientOid has already been used"))
+	if !errors.Is(err, exchangeerr.ErrOrderPlacementUnknown) || exchangeerr.IsOrderPlacementRejected(err) {
+		t.Fatalf("duplicate clientOid message classified as %v, want UNKNOWN only", err)
+	}
+	err = classifyBitgetPlacementError(&APIError{
+		StatusCode: http.StatusOK,
+		Code:       "50000",
+		Message:    "server timeout",
+	})
+	if !errors.Is(err, exchangeerr.ErrOrderPlacementUnknown) || exchangeerr.IsOrderPlacementRejected(err) {
+		t.Fatalf("ambiguous business error classified as %v, want UNKNOWN only", err)
 	}
 }

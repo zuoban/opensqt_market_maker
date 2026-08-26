@@ -12,6 +12,7 @@ import (
 	"opensqt/exchange"
 	"opensqt/logger"
 	"opensqt/monitor"
+	"opensqt/order"
 	"opensqt/safety"
 )
 
@@ -525,8 +526,12 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 			return fmt.Errorf("开启新下单门禁失败: %w", err)
 		}
 		if err := r.position.AdjustOrders(r.price.GetLastPrice()); err != nil {
-			r.disableForRecovery(fmt.Errorf("首次订单调整失败: %w", err), true)
-			return fmt.Errorf("门禁放行后的首次订单调整失败: %w", err)
+			if order.IsDefiniteOrderRejection(err) {
+				logger.Warn("⚠️ 门禁放行后的首次订单调整包含明确未受理订单，保留已确认订单并继续交易: %v", err)
+			} else {
+				r.disableForRecovery(fmt.Errorf("首次订单调整失败: %w", err), true)
+				return fmt.Errorf("门禁放行后的首次订单调整失败: %w", err)
+			}
 		}
 		if !r.gate.StillEnabled(generation) {
 			return nil
@@ -544,6 +549,10 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 
 	if priceChanged {
 		if err := r.position.AdjustOrders(r.price.GetLastPrice()); err != nil {
+			if order.IsDefiniteOrderRejection(err) {
+				logger.Warn("⚠️ 实时订单调整包含明确未受理订单，保留已确认订单并继续交易: %v", err)
+				return nil
+			}
 			r.disableForRecovery(fmt.Errorf("实时订单调整失败: %w", err), true)
 			return fmt.Errorf("实时订单调整失败: %w", err)
 		}

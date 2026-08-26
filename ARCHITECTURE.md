@@ -1,7 +1,7 @@
 # OpenSQT 做市商系统架构说明
 
-> **版本**: v3.5.0
-> **最近更新**: 2026-08-25
+> **版本**: v3.5.1
+> **最近更新**: 2026-08-26
 > **目的**: 说明当前运行架构、交易安全边界与扩展约束
 
 ---
@@ -583,6 +583,8 @@ type OrderCleaner struct {
 
 任一条件恶化时，门禁会先取消执行器中的在途下单，再撤销全部买单并使对账失效。订单流恢复后必须重新核对真实持仓与挂单；只有对账通过才重新放行，并立即按最新价格调整订单窗口。
 
+交易所明确返回“订单未受理”的业务拒绝不属于健康条件恶化。此类失败只收敛对应槽位并进入短冷却；下单结果 UNKNOWN、无法安全归类的错误、订单状态无法收敛或上述健康条件异常时，才进入全局恢复路径。
+
 ---
 
 ### 5. Order Executor（订单执行器）
@@ -592,7 +594,8 @@ type OrderCleaner struct {
 - **交易门禁**: 启动、异常恢复和停机期间可原子停止新单
 - **有界请求**: 下单、撤单与重试等待均可由上下文取消
 - **分类重试**: 仅重试明确可安全重试的失败
-- **严格 PostOnly**: 所有网格单只做 Maker，被拒后只重试，绝不降级为普通单
+- **严格 PostOnly**: 所有网格单只做 Maker；明确会吃单时不做同价重试，等待槽位冷却后按最新价格重算，绝不降级为普通单
+- **明确拒绝局部收敛**: 交易所已确认未受理的订单只释放对应槽位并短暂冷却，不关闭全局门禁、不撤销其它买单
 - **UNKNOWN 传播**: 结果未知时不释放槽位、不换 ClientOrderID 盲目重下
 
 #### 执行流程
@@ -605,6 +608,9 @@ PlaceOrder(req *OrderRequest) (*Order, error) {
     if resultIsUnknown(err) {
         return nil, err // 上层关门并对账，禁止换 ID 重下
     }
+    if definitelyRejected(err) {
+        return nil, OrderRejectedError{Cause: err} // 局部释放，不触发全局撤买
+    }
     if safelyRetryable(err) {
         waitWithContext(ctx, orderRetryDelay)
         // 使用同一槽位请求继续受控重试
@@ -613,13 +619,14 @@ PlaceOrder(req *OrderRequest) (*Order, error) {
 }
 ```
 
-Binance 适配器还会在 503、超时、断连、异常 2xx 或重复 ClientOrderID 后，以**原始 ClientOrderID**查询订单；明确不存在时才使用同一 ID 重试。
+Binance 适配器还会在创建订单返回 HTTP 408/409/5xx、超时、断连、异常 2xx 或重复 ClientOrderID 后，以**原始 ClientOrderID**查询订单；明确不存在时才使用同一 ID 重试。其他交易所遇到 408/409 或重复 ClientOrderID 类响应时也必须保留为 UNKNOWN，不得当作“远端无订单”释放槽位。
 
 #### 批量下单错误传播
 ```go
 BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool, error) {
-    // 返回已确认订单、保证金错误标记以及首个未解决错误。
-    // position 层保留未知结果对应槽位，错误继续上传给统一门禁。
+    // 返回已确认订单、保证金错误标记及保留分类的聚合错误。
+    // position 层释放明确失败槽位、保留 UNKNOWN reservation；
+    // 统一门禁把 UNKNOWN、无法安全归类和状态不一致视为恢复事件。
 }
 ```
 
@@ -869,9 +876,11 @@ if marginError {
     manager.marginLockUntil = time.Now().Add(marginLockDuration)
 }
 
-// 后续下单检查
+// 后续下单检查：保证金锁只暂停新增 BUY，已有买单保持，
+// ReduceOnly SELL 仍可继续提交。
 if manager.insufficientMargin && time.Now().Before(manager.marginLockUntil) {
-    return // 保证金锁定中，跳过下单
+    skipNewBuyOrders()
+    continueReduceOnlySellOrders()
 }
 ```
 
@@ -1003,5 +1012,5 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 
 **官网**:
 - Website: www.OpenSQT.com
-- Version: v3.5.0
-- Last Updated: 2026-08-25
+- Version: v3.5.1
+- Last Updated: 2026-08-26

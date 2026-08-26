@@ -251,6 +251,37 @@ func isPostOnlyError(err error) bool {
 		strings.Contains(errStr, "ORDER_POC_IMMEDIATE")
 }
 
+func classifyDefiniteOrderRejection(err error) (OrderRejectionKind, bool) {
+	if err == nil {
+		return "", false
+	}
+	// UNKNOWN 的安全优先级最高。即使错误文本同时带有保证金、PostOnly
+	// 等字样，也不能把可能已经落库的请求降级成“明确未受理”。
+	if errors.Is(err, exchange.ErrOrderPlacementUnknown) {
+		return "", false
+	}
+	if isPostOnlyError(err) {
+		return OrderRejectionPostOnly, true
+	}
+	if isMarginError(err) {
+		return OrderRejectionMargin, true
+	}
+	if hasErrorCode(err, -4061) {
+		return OrderRejectionPositionMode, true
+	}
+	if hasErrorCode(err, -1021) {
+		return OrderRejectionTimestamp, true
+	}
+	errStr := strings.ToLower(err.Error())
+	if hasErrorCode(err, -1003) || strings.Contains(errStr, "rate limit") {
+		return OrderRejectionRateLimit, true
+	}
+	if exchange.IsOrderPlacementRejected(err) {
+		return OrderRejectionExchangeRejected, true
+	}
+	return "", false
+}
+
 func markSubmissionUnknown(req *OrderRequest) {
 	if req != nil && req.OnSubmissionUnknown != nil {
 		req.OnSubmissionUnknown()
@@ -286,7 +317,6 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 
 	const maxRetries = 5 // 首次尝试失败后最多再重试5次
 	var lastErr error
-	postOnlyFailCount := 0
 
 	for i := 0; i <= maxRetries; i++ {
 		if !oe.newOrdersEnabled.Load() {
@@ -394,12 +424,11 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			return nil, unknownSubmissionError(req, "下单结果无法确认，禁止自动重试", err)
 		}
 
-		// 判断错误类型
-		errStr := strings.ToLower(err.Error())
-		if hasErrorCode(err, -4061) {
-			// 持仓模式不匹配：双向持仓 vs 单向持仓
-			return nil, fmt.Errorf("持仓模式不匹配: %w", err)
-		} else if hasErrorCode(err, -1003) || strings.Contains(errStr, "rate limit") {
+		// 明确业务拒绝可以安全地告诉上层“远端没有生成订单”。限流保留
+		// 既有退避重试；PostOnly 同价重试没有意义，首次拒绝即返回。
+		rejectionKind, definitelyRejected := classifyDefiniteOrderRejection(err)
+		if rejectionKind == OrderRejectionRateLimit {
+			lastErr = NewOrderRejectedError(rejectionKind, err)
 			// 速率限制，等待后重试
 			logger.Warn("⚠️ 触发速率限制，等待后重试...")
 			if i < maxRetries {
@@ -408,24 +437,17 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 				}
 			}
 			continue
-		} else if isPostOnlyError(err) {
-			// PostOnly 被拒表示该价格会立即成交。严格 Maker 模式下只重试，绝不降级为普通单。
-			postOnlyFailCount++
-			logger.Warn("⚠️ [%s] PostOnly被拒(%d/%d): %s %.2f，严格Maker模式不会降级",
-				oe.exchange.GetName(), postOnlyFailCount, maxRetries+1, req.Side, req.Price)
-
-			if i < maxRetries {
-				if err := waitWithContext(placeCtx, oe.orderRetryDelay); err != nil {
-					return nil, oe.placementContextError("PostOnly 重试等待被取消", err)
-				}
+		}
+		if definitelyRejected {
+			rejectedErr := NewOrderRejectedError(rejectionKind, err)
+			switch rejectionKind {
+			case OrderRejectionPostOnly:
+				logger.Warn("⚠️ [%s] PostOnly被拒: %s %.2f，严格Maker模式不降级且不做同价重试",
+					oe.exchange.GetName(), req.Side, req.Price)
+			case OrderRejectionPositionMode:
+				return nil, fmt.Errorf("持仓模式不匹配: %w", rejectedErr)
 			}
-			continue
-		} else if isMarginError(err) {
-			// 保证金不足，不重试
-			return nil, err
-		} else if hasErrorCode(err, -1021) {
-			// 时间戳不同步，不重试
-			return nil, err
+			return nil, rejectedErr
 		}
 
 		// 其他错误，短暂等待后重试
@@ -445,9 +467,17 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 func (oe *ExchangeOrderExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool, error) {
 	placedOrders := make([]*Order, 0, len(orders))
 	hasMarginError := false
+	skipRemainingBuys := false
 	var placementErrors []error
 
 	for _, orderReq := range orders {
+		// 一次明确的保证金拒绝足以暂停本批剩余 BUY；继续扫描是为了让
+		// 非标准调用顺序中的 ReduceOnly SELL 仍有机会提交。
+		if skipRemainingBuys && strings.EqualFold(orderReq.Side, "BUY") {
+			logger.Warn("⏭️ [%s] 本批已出现保证金不足，跳过后续买单 %.2f",
+				oe.exchange.GetName(), orderReq.Price)
+			continue
+		}
 		order, err := oe.PlaceOrder(orderReq)
 		if err != nil {
 			if errors.Is(err, ErrOrderSubmissionStale) {
@@ -458,20 +488,36 @@ func (oe *ExchangeOrderExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Or
 			logger.Warn("⚠️ [%s] 下单失败 %.2f %s: %v",
 				oe.exchange.GetName(), orderReq.Price, orderReq.Side, err)
 
-			// 检查是否是保证金不足错误
-			if isMarginError(err) {
+			// UNKNOWN、门禁和上下文错误必须无条件向上传播。错误文本即使
+			// 同时含有 insufficient，也不能被保证金分支吞掉，否则槽位会
+			// 保持 PENDING 而门禁却不会进入对账恢复。
+			mustStopBatch := errors.Is(err, exchange.ErrOrderPlacementUnknown) ||
+				errors.Is(err, ErrTradingHealthGuardRejected) ||
+				errors.Is(err, ErrNewOrdersStopped) || errors.Is(err, ErrOrderExecutorStopped) ||
+				errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+			marginFailure := isMarginError(err)
+			if marginFailure {
 				hasMarginError = true
 				logger.Error("❌ [保证金不足] 订单 %.2f %s 因保证金不足失败", orderReq.Price, orderReq.Side)
-			} else {
+				if !mustStopBatch {
+					skipRemainingBuys = true
+				}
+			}
+			if !marginFailure || mustStopBatch {
 				placementErrors = append(placementErrors,
 					fmt.Errorf("订单 %.12g %s 提交失败: %w", orderReq.Price, orderReq.Side, err))
 			}
 
 			// 结果未知或门禁已关闭时必须立即停止本批次，避免继续扩大不确定状态。
-			if errors.Is(err, exchange.ErrOrderPlacementUnknown) ||
-				errors.Is(err, ErrTradingHealthGuardRejected) ||
-				errors.Is(err, ErrNewOrdersStopped) || errors.Is(err, ErrOrderExecutorStopped) ||
-				errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if mustStopBatch {
+				break
+			}
+			// 单笔限流重试已经耗尽时对整个批次施加背压，避免后续每个订单
+			// 再分别消耗完整的重试预算。PostOnly 等其它明确拒绝仍可逐单继续。
+			var rejected *OrderRejectedError
+			if IsDefiniteOrderRejection(err) && errors.As(err, &rejected) &&
+				rejected.Kind == OrderRejectionRateLimit {
+				logger.Warn("⚠️ [%s] 限流重试已耗尽，停止提交本批剩余订单", oe.exchange.GetName())
 				break
 			}
 			continue

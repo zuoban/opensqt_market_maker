@@ -632,40 +632,114 @@ func placementRequest() *OrderRequest {
 	}
 }
 
-func TestPlaceOrder503ConfirmsByExactClientOrderID(t *testing.T) {
+func TestPlaceOrderLocalValidationFailuresAreDefiniteRejections(t *testing.T) {
+	t.Run("contract spec missing", func(t *testing.T) {
+		adapter := &BinanceAdapter{}
+		_, err := adapter.PlaceOrder(context.Background(), placementRequest())
+		if !exchangeerr.IsOrderPlacementRejected(err) {
+			t.Fatalf("PlaceOrder() error = %v, want ErrOrderPlacementRejected", err)
+		}
+	})
+
+	t.Run("invalid normalized order", func(t *testing.T) {
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			http.Error(w, "must not be called", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		adapter := testAdapter(t, server.URL, "USDT")
+		req := placementRequest()
+		req.Quantity = 0
+		_, err := adapter.PlaceOrder(context.Background(), req)
+		if !exchangeerr.IsOrderPlacementRejected(err) {
+			t.Fatalf("PlaceOrder() error = %v, want ErrOrderPlacementRejected", err)
+		}
+		if requests.Load() != 0 {
+			t.Fatalf("local validation sent %d HTTP requests, want 0", requests.Load())
+		}
+	})
+}
+
+func TestPlaceOrderAmbiguousHTTPStatusConfirmsByExactClientOrderIDWithoutDuplicateSubmission(t *testing.T) {
 	const brokerID = "x-zdfVM8vYgrid-order-1"
+	for _, status := range []int{
+		http.StatusRequestTimeout,
+		http.StatusConflict,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			var postCalls, queryCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != createOrderEndpoint {
+					http.NotFound(w, r)
+					return
+				}
+				if r.Method == http.MethodPost {
+					postCalls.Add(1)
+					if err := r.ParseForm(); err != nil {
+						t.Errorf("ParseForm() error = %v", err)
+					}
+					if got := r.FormValue("newClientOrderId"); got != brokerID {
+						t.Errorf("newClientOrderId = %q, want %q", got, brokerID)
+					}
+					// 使用不在 UNKNOWN 白名单内的 API 错误码，验证 HTTP 5xx 语义优先。
+					writeJSON(t, w, status, map[string]any{"code": -1102, "msg": "gateway rejected response"})
+					return
+				}
+				queryCalls.Add(1)
+				if got := r.URL.Query().Get("origClientOrderId"); got != brokerID {
+					t.Errorf("origClientOrderId = %q, want %q", got, brokerID)
+				}
+				writeJSON(t, w, http.StatusOK, orderFixture(42, brokerID))
+			}))
+			defer server.Close()
+
+			adapter := testAdapter(t, server.URL, "USDT")
+			order, err := adapter.PlaceOrder(context.Background(), placementRequest())
+			if err != nil {
+				t.Fatalf("PlaceOrder() error = %v", err)
+			}
+			if order.OrderID != 42 || order.ClientOrderID != brokerID {
+				t.Fatalf("order = %+v", order)
+			}
+			if postCalls.Load() != 1 || queryCalls.Load() != 1 {
+				t.Fatalf("calls = post:%d query:%d, want 1/1", postCalls.Load(), queryCalls.Load())
+			}
+		})
+	}
+}
+
+func TestPlaceOrderExplicit4xxIsDefiniteRejectionWithoutConfirmation(t *testing.T) {
 	var postCalls, queryCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/fapi/v1/order" {
-			http.NotFound(w, r)
-			return
-		}
 		if r.Method == http.MethodPost {
 			postCalls.Add(1)
-			if err := r.ParseForm(); err != nil {
-				t.Errorf("ParseForm() error = %v", err)
-			}
-			if got := r.FormValue("newClientOrderId"); got != brokerID {
-				t.Errorf("newClientOrderId = %q", got)
-			}
-			writeJSON(t, w, http.StatusServiceUnavailable, map[string]any{"code": -1000, "msg": "Service Unavailable"})
+			writeJSON(t, w, http.StatusBadRequest, map[string]any{
+				"code": -1102,
+				"msg":  "mandatory parameter was not sent",
+			})
 			return
 		}
 		queryCalls.Add(1)
-		if got := r.URL.Query().Get("origClientOrderId"); got != brokerID {
-			t.Errorf("origClientOrderId = %q", got)
-		}
-		writeJSON(t, w, http.StatusOK, orderFixture(42, brokerID))
+		http.NotFound(w, r)
 	}))
 	defer server.Close()
 
 	adapter := testAdapter(t, server.URL, "USDT")
-	order, err := adapter.PlaceOrder(context.Background(), placementRequest())
-	if err != nil {
-		t.Fatalf("PlaceOrder() error = %v", err)
+	_, err := adapter.PlaceOrder(context.Background(), placementRequest())
+	if !exchangeerr.IsOrderPlacementRejected(err) {
+		t.Fatalf("PlaceOrder() error = %v, want ErrOrderPlacementRejected", err)
 	}
-	if order.OrderID != 42 || order.ClientOrderID != brokerID || postCalls.Load() != 1 || queryCalls.Load() != 1 {
-		t.Fatalf("order=%+v calls=post:%d query:%d", order, postCalls.Load(), queryCalls.Load())
+	if errors.Is(err, exchangeerr.ErrOrderPlacementUnknown) {
+		t.Fatalf("PlaceOrder() error = %v, explicit 4xx must not be UNKNOWN", err)
+	}
+	if postCalls.Load() != 1 || queryCalls.Load() != 0 {
+		t.Fatalf("calls = post:%d query:%d, want 1/0", postCalls.Load(), queryCalls.Load())
 	}
 }
 

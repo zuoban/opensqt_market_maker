@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc64"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -238,19 +239,75 @@ func classifyBybitPlacementError(err error) error {
 		return nil
 	}
 	var apiErr *APIError
-	if errors.As(err, &apiErr) {
+	if errors.As(err, &apiErr) && apiErr != nil {
 		if apiErr.StatusCode >= 500 {
 			return exchangeerr.WrapOrderPlacementUnknown(err)
 		}
-		return err
+		if apiErr.StatusCode == http.StatusRequestTimeout ||
+			apiErr.StatusCode == http.StatusConflict ||
+			isBybitAmbiguousPlacementCode(apiErr.RetCode) ||
+			exchangeerr.LooksLikeAmbiguousOrderPlacementFailure(apiErr.Message) ||
+			isBybitDuplicateClientOrderIDError(apiErr) {
+			return exchangeerr.WrapOrderPlacementUnknown(err)
+		}
+		if (apiErr.StatusCode >= 400 && apiErr.StatusCode < 500) ||
+			(apiErr.StatusCode >= 200 && apiErr.StatusCode < 300) {
+			return exchangeerr.WrapOrderPlacementRejected(err)
+		}
+		return exchangeerr.WrapOrderPlacementUnknown(err)
 	}
 	message := err.Error()
+	if hasBybitDuplicateClientOrderIDMessage(message) {
+		return exchangeerr.WrapOrderPlacementUnknown(err)
+	}
 	// 这些错误发生在请求发送前，或是交易所明确返回的业务拒绝。
 	if strings.Contains(message, "序列化 Bybit 请求体失败") ||
 		strings.Contains(message, "创建 Bybit 请求失败") {
-		return err
+		return exchangeerr.WrapOrderPlacementRejected(err)
 	}
 	return exchangeerr.WrapOrderPlacementUnknown(err)
+}
+
+func isBybitAmbiguousPlacementCode(code int) bool {
+	// Bybit 在 HTTP 200 内用业务码表示服务端/下单超时，
+	// 这些结果不能用作“订单未创建”的证明。
+	switch code {
+	case 10000, 10016, 170007, 170146:
+		return true
+	default:
+		return false
+	}
+}
+
+func isBybitDuplicateClientOrderIDError(err *APIError) bool {
+	if err == nil {
+		return false
+	}
+	// 10014: Invalid duplicate request；110072: OrderLinkedID is duplicate。
+	switch err.RetCode {
+	case 10014, 110072:
+		return true
+	}
+	return hasBybitDuplicateClientOrderIDMessage(err.Message)
+}
+
+func hasBybitDuplicateClientOrderIDMessage(message string) bool {
+	message = strings.ToLower(message)
+	duplicate := strings.Contains(message, "duplicate") ||
+		strings.Contains(message, "already used") ||
+		strings.Contains(message, "already been used") ||
+		strings.Contains(message, "has been used") ||
+		strings.Contains(message, "already in use") ||
+		strings.Contains(message, "already exists") ||
+		strings.Contains(message, "not unique")
+	identifier := strings.Contains(message, "orderlinkid") ||
+		strings.Contains(message, "orderlinkedid") ||
+		strings.Contains(message, "order link id") ||
+		strings.Contains(message, "clientid") ||
+		strings.Contains(message, "client id") ||
+		strings.Contains(message, "orderid") ||
+		strings.Contains(message, "order id")
+	return duplicate && identifier
 }
 
 func (b *BybitAdapter) BatchPlaceOrders(ctx context.Context, orders []*OrderRequest) ([]*Order, bool) {

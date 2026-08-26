@@ -9,7 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"opensqt/config"
 	"opensqt/exchange"
+	"opensqt/monitor"
+	"opensqt/order"
 	"opensqt/safety"
 )
 
@@ -496,5 +499,216 @@ func TestTradingGateKeepsWithdrawalRequiredWhenRemoteCancelIsUncertain(t *testin
 	}
 	if runtime.reconciler.IsHealthy() {
 		t.Fatal("reconciler became healthy after uncertain cancellation")
+	}
+}
+
+type healthyTradingGateExchange struct {
+	exchange.IExchange
+}
+
+func (e *healthyTradingGateExchange) GetName() string { return "test" }
+
+func (e *healthyTradingGateExchange) IsOrderStreamReady() bool { return true }
+
+func (e *healthyTradingGateExchange) GetOrderStreamState() string { return "READY" }
+
+func (e *healthyTradingGateExchange) StartPriceStream(
+	_ context.Context,
+	_ string,
+	callback func(float64),
+) error {
+	callback(100)
+	return nil
+}
+
+type emptyTradingGateReconcileExchange struct{}
+
+func (e *emptyTradingGateReconcileExchange) GetPositions(context.Context, string) (interface{}, error) {
+	return nil, nil
+}
+
+func (e *emptyTradingGateReconcileExchange) GetOpenOrders(context.Context, string) (interface{}, error) {
+	return nil, nil
+}
+
+func (e *emptyTradingGateReconcileExchange) GetBaseAsset() string { return "BTC" }
+
+type emptyTradingGateReconcilePosition struct {
+	reconcileCount int64
+}
+
+func (p *emptyTradingGateReconcilePosition) IterateSlots(func(float64, interface{}) bool) {}
+func (p *emptyTradingGateReconcilePosition) GetTotalBuyQty() float64                      { return 0 }
+func (p *emptyTradingGateReconcilePosition) GetTotalSellQty() float64                     { return 0 }
+func (p *emptyTradingGateReconcilePosition) GetReconcileCount() int64                     { return p.reconcileCount }
+func (p *emptyTradingGateReconcilePosition) IncrementReconcileCount()                     { p.reconcileCount++ }
+func (p *emptyTradingGateReconcilePosition) UpdateLastReconcileTime(time.Time)            {}
+func (p *emptyTradingGateReconcilePosition) GetSymbol() string                            { return "BTCUSDT" }
+func (p *emptyTradingGateReconcilePosition) GetPriceInterval() float64                    { return 1 }
+
+type adjustmentTradingPosition struct {
+	adjustErr   error
+	adjustCalls int
+	cancelCalls int
+}
+
+func (p *adjustmentTradingPosition) CancelAllBuyOrders() error {
+	p.cancelCalls++
+	return nil
+}
+
+func (p *adjustmentTradingPosition) AdjustOrders(float64) error {
+	p.adjustCalls++
+	return p.adjustErr
+}
+
+func (p *adjustmentTradingPosition) GetSymbol() string { return "BTCUSDT" }
+
+func newHealthyTradingGateTestRuntime(
+	t *testing.T,
+	positionManager tradingPositionManager,
+) (*tradingGateRuntime, *serializedOrderGate, *recordingNewOrderGate) {
+	t.Helper()
+
+	ex := &healthyTradingGateExchange{}
+	priceMonitor := monitor.NewPriceMonitor(ex, "BTCUSDT", 1_000)
+	if err := priceMonitor.Start(); err != nil {
+		t.Fatalf("price monitor Start() error = %v", err)
+	}
+	t.Cleanup(priceMonitor.Stop)
+
+	cfg := &config.Config{}
+	riskMonitor := safety.NewRiskMonitor(cfg, ex)
+	if err := riskMonitor.Start(context.Background()); err != nil {
+		t.Fatalf("risk monitor Start() error = %v", err)
+	}
+
+	reconciler := safety.NewReconciler(
+		cfg,
+		&emptyTradingGateReconcileExchange{},
+		&emptyTradingGateReconcilePosition{},
+	)
+	reconciler.SetPauseChecker(func() bool { return true })
+	if err := reconciler.Reconcile(); err != nil {
+		t.Fatalf("initial Reconcile() error = %v", err)
+	}
+
+	executor := &recordingNewOrderGate{}
+	gate := newSerializedOrderGate(executor)
+	runtime := newTradingGateRuntime(
+		gate,
+		ex,
+		priceMonitor,
+		riskMonitor,
+		reconciler,
+		positionManager,
+		minimumPriceStaleAfter,
+		time.Minute,
+	)
+	return runtime, gate, executor
+}
+
+func definiteAdjustmentRejection() error {
+	return fmt.Errorf("batch placement failed: %w", errors.Join(
+		order.NewOrderRejectedError(order.OrderRejectionPostOnly, errors.New("maker would take")),
+		order.NewOrderRejectedError(order.OrderRejectionMargin, errors.New("insufficient margin")),
+	))
+}
+
+func TestTradingGateInitialDefiniteRejectionKeepsGateEnabled(t *testing.T) {
+	positionManager := &adjustmentTradingPosition{adjustErr: definiteAdjustmentRejection()}
+	runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
+
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("evaluate() error = %v, want nil for definite rejection", err)
+	}
+	if !gate.Enabled() {
+		t.Fatal("gate was disabled by a definite initial order rejection")
+	}
+	if runtime.withdrawRequired.Load() || runtime.needsReconcile.Load() {
+		t.Fatalf("definite rejection entered recovery: withdraw=%v reconcile=%v",
+			runtime.withdrawRequired.Load(), runtime.needsReconcile.Load())
+	}
+	if !runtime.reconciler.IsHealthy() {
+		t.Fatal("definite rejection invalidated the reconciler")
+	}
+	if positionManager.adjustCalls != 1 || positionManager.cancelCalls != 0 {
+		t.Fatalf("position calls = adjust:%d cancel:%d, want adjust:1 cancel:0",
+			positionManager.adjustCalls, positionManager.cancelCalls)
+	}
+	enableCalls, stopCalls := executor.counts()
+	if enableCalls != 1 || stopCalls != 0 {
+		t.Fatalf("executor calls = enable:%d stop:%d, want enable:1 stop:0", enableCalls, stopCalls)
+	}
+}
+
+func TestTradingGateRealtimeDefiniteRejectionKeepsGateEnabled(t *testing.T) {
+	positionManager := &adjustmentTradingPosition{adjustErr: definiteAdjustmentRejection()}
+	runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
+	if _, err := gate.Enable(); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+
+	if err := runtime.evaluate(context.Background(), true); err != nil {
+		t.Fatalf("evaluate() error = %v, want nil for definite rejection", err)
+	}
+	if !gate.Enabled() || runtime.withdrawRequired.Load() || runtime.needsReconcile.Load() {
+		t.Fatalf("definite rejection changed gate state: enabled=%v withdraw=%v reconcile=%v",
+			gate.Enabled(), runtime.withdrawRequired.Load(), runtime.needsReconcile.Load())
+	}
+	if !runtime.reconciler.IsHealthy() {
+		t.Fatal("definite rejection invalidated the reconciler")
+	}
+	if positionManager.adjustCalls != 1 || positionManager.cancelCalls != 0 {
+		t.Fatalf("position calls = adjust:%d cancel:%d, want adjust:1 cancel:0",
+			positionManager.adjustCalls, positionManager.cancelCalls)
+	}
+	enableCalls, stopCalls := executor.counts()
+	if enableCalls != 1 || stopCalls != 0 {
+		t.Fatalf("executor calls = enable:%d stop:%d, want enable:1 stop:0", enableCalls, stopCalls)
+	}
+}
+
+func TestTradingGateRealtimeUnknownAndOrdinaryErrorsEnterRecovery(t *testing.T) {
+	unknownErr := fmt.Errorf("gateway response lost: %w", exchange.ErrOrderPlacementUnknown)
+	ordinaryErr := errors.New("local state update failed")
+
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "placement unknown", err: unknownErr},
+		{name: "ordinary error", err: ordinaryErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			positionManager := &adjustmentTradingPosition{adjustErr: tt.err}
+			runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
+			if _, err := gate.Enable(); err != nil {
+				t.Fatalf("Enable() error = %v", err)
+			}
+
+			err := runtime.evaluate(context.Background(), true)
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("evaluate() error = %v, want wrapped %v", err, tt.err)
+			}
+			if gate.Enabled() {
+				t.Fatal("gate remained enabled after a non-definite adjustment failure")
+			}
+			if !runtime.withdrawRequired.Load() || !runtime.needsReconcile.Load() {
+				t.Fatalf("recovery flags = withdraw:%v reconcile:%v, want both true",
+					runtime.withdrawRequired.Load(), runtime.needsReconcile.Load())
+			}
+			if runtime.reconciler.IsHealthy() {
+				t.Fatal("reconciler remained healthy after a non-definite adjustment failure")
+			}
+			if positionManager.adjustCalls != 1 || positionManager.cancelCalls != 0 {
+				t.Fatalf("position calls = adjust:%d cancel:%d, want adjust:1 cancel:0",
+					positionManager.adjustCalls, positionManager.cancelCalls)
+			}
+			enableCalls, stopCalls := executor.counts()
+			if enableCalls != 1 || stopCalls != 1 {
+				t.Fatalf("executor calls = enable:%d stop:%d, want enable:1 stop:1", enableCalls, stopCalls)
+			}
+		})
 	}
 }

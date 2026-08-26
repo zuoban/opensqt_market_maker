@@ -11,6 +11,32 @@ import (
 	"time"
 )
 
+type APIError struct {
+	StatusCode int
+	Label      string
+	Message    string
+	Response   string
+}
+
+func (e *APIError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	switch e.Label {
+	case "USER_NOT_FOUND":
+		return fmt.Sprintf("Gate.io 合约账户未激活: %s。请先在 Gate.io 网站将资金转入 USDT 永续合约账户", e.Message)
+	case "INVALID_SIGNATURE":
+		return fmt.Sprintf("Gate.io API 签名错误: %s。请检查 API Key 和 Secret Key 是否正确", e.Message)
+	case "INVALID_KEY":
+		return fmt.Sprintf("Gate.io API Key 无效: %s。请检查配置文件中的 api_key", e.Message)
+	}
+	if e.Label != "" || e.Message != "" {
+		return fmt.Sprintf("Gate.io API 错误: [%s] %s (状态码: %d)",
+			e.Label, e.Message, e.StatusCode)
+	}
+	return fmt.Sprintf("Gate.io API 错误: 状态码=%d, 响应=%s", e.StatusCode, e.Response)
+}
+
 // Client Gate.io HTTP 客户端
 type Client struct {
 	httpClient *http.Client
@@ -82,20 +108,13 @@ func (c *Client) DoRequest(ctx context.Context, method, path, queryString string
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var gateResp GateResponse
 		if err := json.Unmarshal(respBody, &gateResp); err == nil {
-			// 针对特定错误提供更友好的提示
-			switch gateResp.Label {
-			case "USER_NOT_FOUND":
-				return nil, fmt.Errorf("Gate.io 合约账户未激活: %s。请先在 Gate.io 网站将资金转入 USDT 永续合约账户", gateResp.Message)
-			case "INVALID_SIGNATURE":
-				return nil, fmt.Errorf("Gate.io API 签名错误: %s。请检查 API Key 和 Secret Key 是否正确", gateResp.Message)
-			case "INVALID_KEY":
-				return nil, fmt.Errorf("Gate.io API Key 无效: %s。请检查配置文件中的 api_key", gateResp.Message)
-			default:
-				return nil, fmt.Errorf("Gate.io API 错误: [%s] %s (状态码: %d)",
-					gateResp.Label, gateResp.Message, resp.StatusCode)
+			return nil, &APIError{
+				StatusCode: resp.StatusCode,
+				Label:      gateResp.Label,
+				Message:    gateResp.Message,
 			}
 		}
-		return nil, fmt.Errorf("Gate.io API 错误: 状态码=%d, 响应=%s", resp.StatusCode, string(respBody))
+		return nil, &APIError{StatusCode: resp.StatusCode, Response: string(respBody)}
 	}
 
 	return respBody, nil

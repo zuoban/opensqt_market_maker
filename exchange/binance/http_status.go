@@ -32,7 +32,7 @@ func (e *responseBodyTooLargeError) Error() string {
 }
 
 // httpStatusError 保留 go-binance SDK 默认会丢弃的 HTTP 状态码。
-// Binance 对下单接口返回 503 时，执行结果可能是 UNKNOWN，不能直接重下。
+// Binance 创建订单接口的 408/409 和所有 5xx 都可能是 UNKNOWN，不能直接重下。
 type httpStatusError struct {
 	StatusCode int
 	Status     string
@@ -63,7 +63,12 @@ func (t *statusAwareTransport) RoundTrip(req *http.Request) (*http.Response, err
 			return nil, err
 		}
 	}
-	if resp.StatusCode != http.StatusServiceUnavailable {
+	isCreateOrderAmbiguousStatus := req.Method == http.MethodPost && req.URL.Path == createOrderEndpoint &&
+		(resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusConflict ||
+			(resp.StatusCode >= http.StatusInternalServerError && resp.StatusCode <= 599))
+	// 保留原有的全端点 503 处理，并确保创建订单接口的歧义状态不会
+	// 被 SDK 降格成缺少 HTTP 状态上下文的 common.APIError。
+	if resp.StatusCode != http.StatusServiceUnavailable && !isCreateOrderAmbiguousStatus {
 		return resp, nil
 	}
 

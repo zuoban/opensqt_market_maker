@@ -258,11 +258,13 @@ func (b *BinanceAdapter) fetchExchangeInfo(ctx context.Context) error {
 // PlaceOrder 下单
 func (b *BinanceAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Order, error) {
 	if b.contractSpec == nil {
-		return nil, fmt.Errorf("Binance 合约规格未初始化")
+		return nil, exchangeerr.WrapOrderPlacementRejected(
+			fmt.Errorf("Binance 合约规格未初始化"))
 	}
 	normalized, err := b.contractSpec.normalizeOrder(req)
 	if err != nil {
-		return nil, fmt.Errorf("Binance 订单参数无效: %w", err)
+		return nil, exchangeerr.WrapOrderPlacementRejected(
+			fmt.Errorf("Binance 订单参数无效: %w", err))
 	}
 
 	// 根据 PostOnly 参数选择 TimeInForce
@@ -323,6 +325,12 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Or
 		}
 		duplicateClientOrderID := isDuplicateClientOrderIDError(createErr)
 		if !invalidSuccessResponse && !isUnknownPlacementResult(createErr) && !duplicateClientOrderID {
+			// 创建订单的 HTTP 5xx 已由 status-aware transport 保留并在上方
+			// 进入 UNKNOWN；走到这里的 SDK APIError 是交易所明确业务拒绝。
+			var apiErr *common.APIError
+			if errors.As(createErr, &apiErr) && apiErr != nil {
+				return nil, exchangeerr.WrapOrderPlacementRejected(createErr)
+			}
 			return nil, createErr
 		}
 		if clientOrderID == "" {
@@ -443,7 +451,9 @@ func isUnknownPlacementResult(err error) bool {
 	}
 
 	var statusErr *httpStatusError
-	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusServiceUnavailable {
+	if errors.As(err, &statusErr) && statusErr != nil &&
+		(statusErr.StatusCode == http.StatusRequestTimeout || statusErr.StatusCode == http.StatusConflict ||
+			(statusErr.StatusCode >= http.StatusInternalServerError && statusErr.StatusCode <= 599)) {
 		return true
 	}
 	var bodyLimitErr *responseBodyTooLargeError

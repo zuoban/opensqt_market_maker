@@ -2,7 +2,9 @@ package gate
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -248,11 +250,12 @@ func (g *GateAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest) 
 	// 发送下单请求
 	futuresOrder, err := g.client.PlaceOrder(ctx, g.settle, order)
 	if err != nil {
+		classified := classifyGatePlacementError(err)
 		// 检查是否保证金不足
 		if strings.Contains(err.Error(), "insufficient") || strings.Contains(err.Error(), "balance") {
-			return nil, fmt.Errorf("保证金不足: %w", err)
+			return nil, fmt.Errorf("保证金不足: %w", classified)
 		}
-		return nil, classifyGatePlacementError(err)
+		return nil, classified
 	}
 	if futuresOrder == nil || futuresOrder.ID <= 0 {
 		return nil, exchangeerr.WrapOrderPlacementUnknown(
@@ -290,18 +293,62 @@ func classifyGatePlacementError(err error) error {
 	if err == nil {
 		return nil
 	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr != nil {
+		if apiErr.StatusCode >= 500 {
+			return exchangeerr.WrapOrderPlacementUnknown(err)
+		}
+		if apiErr.StatusCode == http.StatusRequestTimeout ||
+			apiErr.StatusCode == http.StatusConflict ||
+			exchangeerr.LooksLikeAmbiguousOrderPlacementFailure(apiErr.Label, apiErr.Message) ||
+			isGateDuplicateClientOrderIDError(apiErr) {
+			return exchangeerr.WrapOrderPlacementUnknown(err)
+		}
+		if apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			return exchangeerr.WrapOrderPlacementRejected(err)
+		}
+		return exchangeerr.WrapOrderPlacementUnknown(err)
+	}
 	message := err.Error()
-	// 本地构造失败、认证/账户错误和明确的 4xx 响应都能证明未受理。
+	if hasGateDuplicateClientOrderIDMessage(message) {
+		return exchangeerr.WrapOrderPlacementUnknown(err)
+	}
+	// 本地构造失败发生在 HTTP 请求进入网络边界之前，能够证明未受理。
 	if strings.Contains(message, "序列化请求体失败") ||
-		strings.Contains(message, "创建请求失败") ||
-		strings.Contains(message, "合约账户未激活") ||
-		strings.Contains(message, "API 签名错误") ||
-		strings.Contains(message, "API Key 无效") ||
-		strings.Contains(message, "状态码: 4") ||
-		strings.Contains(message, "状态码=4") {
-		return err
+		strings.Contains(message, "创建请求失败") {
+		return exchangeerr.WrapOrderPlacementRejected(err)
 	}
 	return exchangeerr.WrapOrderPlacementUnknown(err)
+}
+
+func isGateDuplicateClientOrderIDError(err *APIError) bool {
+	if err == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(err.Label)) {
+	case "DUPLICATE_REQUEST", "DUPLICATE_ORDER", "ORDER_EXISTS", "REPEATED_CREATION":
+		return true
+	}
+	return hasGateDuplicateClientOrderIDMessage(err.Label + " " + err.Message)
+}
+
+func hasGateDuplicateClientOrderIDMessage(message string) bool {
+	message = strings.ToLower(message)
+	duplicate := strings.Contains(message, "duplicate") ||
+		strings.Contains(message, "already used") ||
+		strings.Contains(message, "already been used") ||
+		strings.Contains(message, "has been used") ||
+		strings.Contains(message, "already in use") ||
+		strings.Contains(message, "already exists") ||
+		strings.Contains(message, "not unique")
+	// Gate 的 text 字段就是调用方提供的 client order ID。
+	identifier := strings.Contains(message, "clientid") ||
+		strings.Contains(message, "client id") ||
+		strings.Contains(message, "orderid") ||
+		strings.Contains(message, "order id") ||
+		strings.Contains(message, "order text") ||
+		strings.Contains(message, "client text")
+	return duplicate && identifier
 }
 
 // BatchPlaceOrders 批量下单

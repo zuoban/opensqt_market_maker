@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"math"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -196,11 +197,7 @@ func (b *BackpackAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*O
 
 	respBody, err := b.client.DoSignedRequest(ctx, "POST", "/api/v1/order", "orderExecute", nil, body, map[string]string{"X-BROKER-ID": backpackBroker})
 	if err != nil {
-		var apiErr *APIError
-		if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
-			return nil, err
-		}
-		return nil, exchangeerr.WrapOrderPlacementUnknown(err)
+		return nil, classifyBackpackPlacementError(err)
 	}
 
 	var response orderResponse
@@ -221,6 +218,65 @@ func (b *BackpackAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*O
 	}
 
 	return b.convertOrderResponse(&response, req.Symbol), nil
+}
+
+func classifyBackpackPlacementError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr != nil {
+		if apiErr.StatusCode == http.StatusRequestTimeout ||
+			apiErr.StatusCode == http.StatusConflict ||
+			exchangeerr.LooksLikeAmbiguousOrderPlacementFailure(apiErr.Code, apiErr.Message) ||
+			isBackpackDuplicateClientOrderIDError(apiErr) {
+			return exchangeerr.WrapOrderPlacementUnknown(err)
+		}
+		if apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			return exchangeerr.WrapOrderPlacementRejected(err)
+		}
+		return exchangeerr.WrapOrderPlacementUnknown(err)
+	}
+
+	message := err.Error()
+	if hasBackpackDuplicateClientOrderIDMessage(message) {
+		return exchangeerr.WrapOrderPlacementUnknown(err)
+	}
+	// 这些错误发生在 HTTP 请求进入网络边界之前，能够证明远端未创建订单。
+	if strings.Contains(message, "序列化 Backpack 请求体失败") ||
+		strings.Contains(message, "创建 Backpack 请求失败") {
+		return exchangeerr.WrapOrderPlacementRejected(err)
+	}
+	return exchangeerr.WrapOrderPlacementUnknown(err)
+}
+
+func isBackpackDuplicateClientOrderIDError(err *APIError) bool {
+	if err == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(err.Code)) {
+	case "DUPLICATE_CLIENT_ID", "CLIENT_ID_ALREADY_USED", "CLIENT_ID_NOT_UNIQUE":
+		return true
+	}
+	return hasBackpackDuplicateClientOrderIDMessage(err.Code + " " + err.Message)
+}
+
+func hasBackpackDuplicateClientOrderIDMessage(message string) bool {
+	message = strings.ToLower(message)
+	duplicate := strings.Contains(message, "duplicate") ||
+		strings.Contains(message, "already used") ||
+		strings.Contains(message, "already been used") ||
+		strings.Contains(message, "has been used") ||
+		strings.Contains(message, "already in use") ||
+		strings.Contains(message, "already exists") ||
+		strings.Contains(message, "not unique")
+	identifier := strings.Contains(message, "clientid") ||
+		strings.Contains(message, "client id") ||
+		strings.Contains(message, "clientoid") ||
+		strings.Contains(message, "client oid") ||
+		strings.Contains(message, "orderid") ||
+		strings.Contains(message, "order id")
+	return duplicate && identifier
 }
 
 func (b *BackpackAdapter) BatchPlaceOrders(ctx context.Context, orders []*OrderRequest) ([]*Order, bool) {
