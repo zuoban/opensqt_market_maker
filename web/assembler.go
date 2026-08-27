@@ -22,6 +22,7 @@ type Snapshot struct {
 	Kline     KlineView                 `json:"kline"`
 	Position  position.PositionSnapshot `json:"position"`
 	Risk      safety.RiskSnapshot       `json:"risk"`
+	Margin    safety.MarginSnapshot     `json:"margin"`
 	Account   AccountView               `json:"account"`
 	Logs      []logger.LogEntry         `json:"logs"`
 }
@@ -61,6 +62,7 @@ type assembler struct {
 	price   *monitor.PriceMonitor
 	pos     *position.SuperPositionManager
 	risk    *safety.RiskMonitor
+	margin  *safety.MarginMonitor
 	account *AccountCache
 }
 
@@ -87,6 +89,9 @@ func (a *assembler) Build() *Snapshot {
 	}
 	if a.risk != nil {
 		snap.Risk = a.risk.Snapshot()
+	}
+	if a.margin != nil {
+		snap.Margin = a.margin.Snapshot()
 	}
 	if a.price != nil {
 		last := a.price.GetLastPrice()

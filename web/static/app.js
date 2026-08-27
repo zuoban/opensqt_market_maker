@@ -3,6 +3,7 @@
         module.exports = {
             buildKlineGridModel,
             buildHourlyFillModel,
+            buildMarginUsageModel,
             centeredScrollLeft,
             formatRelativeTime
         };
@@ -252,9 +253,11 @@
         const pos = snapshot.position || {};
         const risk = snapshot.risk || {};
         const acc = snapshot.account || {};
+        const margin = snapshot.margin || {};
         const price = snapshot.price || {};
         const dec = pos.priceDecimals ?? 2;
-        const quote = acc.quoteAsset || "USDT";
+        const quote = margin.quoteAsset || acc.quoteAsset || "USDT";
+        const marginModel = buildMarginUsageModel(margin, quote);
 
         setText($("pair"), (app.exchange || "—") + " · " + (app.symbol || pos.symbol || "—"));
         const priceNode = $("lastPrice");
@@ -276,12 +279,13 @@
         );
 
         const triggered = Boolean(risk.triggered);
+        const marginTriggered = marginModel.triggered;
         const riskPill = $("riskPill");
-        setText(riskPill.querySelector("span") || riskPill, !risk.enabled
-            ? "风控关闭"
-            : (triggered ? "风控已触发 · 暂停买单" : "风控正常"));
-        riskPill.classList.toggle("hot", triggered);
-        riskPill.classList.toggle("ok", Boolean(risk.enabled) && !triggered);
+        setText(riskPill.querySelector("span") || riskPill, marginTriggered
+            ? (triggered ? "双重限制 · 已停单" : "保证金限制 · 已停单")
+            : (!risk.enabled ? "市场风控关闭" : (triggered ? "风控已触发 · 暂停买单" : "风控正常")));
+        riskPill.classList.toggle("hot", triggered || marginTriggered);
+        riskPill.classList.toggle("ok", Boolean(risk.enabled) && !triggered && !marginTriggered);
 
         const realized = pos.realizedPnl != null ? pos.realizedPnl : 0;
         const mark = Number(price.last || pos.lastPrice);
@@ -330,18 +334,26 @@
             metric("累计买 / 卖", fmt(pos.totalBuyQty, 4) + " / " + fmt(pos.totalSellQty, 4)),
             metric("最近对账", formatTime(pos.lastReconcileTime)),
             metric("保证金锁", pos.marginLocked ? fmt(pos.marginLockRemainingSec, 0) + "s" : "未锁定", pos.marginLocked ? "warn" : ""),
+            metric(
+                "保证金占用上限",
+                marginModel.limitPercent == null ? "等待配置" : fmt(marginModel.limitPercent, 2) + "%",
+                marginModel.limitPercent == null ? "warn" : "",
+                "持仓 + 挂单冻结"
+            ),
             metric("网格 / 间距", fmt(pos.gridPrice, dec) + " / " + fmt(pos.priceInterval, dec)),
             metric("每单金额", fmt(pos.orderQuantity || app.orderQuantity) + " " + quote),
             metric("窗口 买 / 卖", (pos.buyWindowSize || 0) + " / " + (pos.sellWindowSize || 0))
         ];
 
         updateSection("primary-kpis", primaryItems, () => renderMetrics($("kpis"), primaryItems));
+        updateSection("margin-usage", { margin, quote }, () => renderMarginUsage(marginModel));
         updateSection("strategy-kpis", strategyItems, () => renderMetrics($("strategyKpis"), strategyItems));
         $("strategySummary").textContent =
             "已运行 " + uptimeText +
             " · 网格 " + fmt(pos.gridPrice, dec) +
             " · 间距 " + fmt(pos.priceInterval, dec) +
-            " · 每单 " + fmt(pos.orderQuantity || app.orderQuantity) + " " + quote;
+            " · 每单 " + fmt(pos.orderQuantity || app.orderQuantity) + " " + quote +
+            (marginModel.limitPercent == null ? "" : " · 保证金上限 " + fmt(marginModel.limitPercent, 2) + "%");
 
         updateSection("market-chart", {
             kline: snapshot.kline || {},
@@ -362,6 +374,135 @@
             quantityDecimals: pos.quantityDecimals,
             quote
         }, () => renderTables(pos, quote));
+    }
+
+    function finiteOrNull(value) {
+        if (value === undefined || value === null || value === "") return null;
+        const number = Number(value);
+        return Number.isFinite(number) ? number : null;
+    }
+
+    function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+    }
+
+    // Pure view model: the backend guard is the only source of trigger truth.
+    // In particular, usagePercent > limitPercent must never trigger UI state here.
+    function buildMarginUsageModel(margin, fallbackQuoteAsset) {
+        const source = margin || {};
+        const usageRaw = finiteOrNull(source.usagePercent);
+        const limitPercent = finiteOrNull(source.limitPercent);
+        const usedRaw = finiteOrNull(source.usedMargin);
+        const marginBalance = finiteOrNull(source.marginBalance);
+        const availableBalance = finiteOrNull(source.availableBalance);
+        const configuredReady = Boolean(source.ready);
+        const staleFlag = Boolean(source.stale);
+        const triggered = Boolean(source.triggered);
+        const error = source.error == null ? "" : String(source.error).trim();
+        const usagePercent = usageRaw == null ? null : Math.max(0, usageRaw);
+        const usedMargin = usedRaw == null ? null : Math.max(0, usedRaw);
+        const ready = configuredReady && usagePercent != null && limitPercent != null;
+        // A zero-value Go snapshot is stale but has never held a successful reading.
+        // MarginMonitor only accepts a positive margin balance, so it is a reliable
+        // discriminator between "last known reading" and "not initialized yet".
+        const hasPriorReading = marginBalance != null && marginBalance > 0 && usagePercent != null;
+        const stale = staleFlag && hasPriorReading;
+        const showReading = usagePercent != null && (ready || stale || triggered);
+        const showAmounts = ready || stale || triggered;
+        const quoteAsset = String(source.quoteAsset || fallbackQuoteAsset || "USDT").trim() || "USDT";
+
+        let state = "normal";
+        let statusText = "容量正常";
+        let noteText = "持仓 + 挂单冻结 · 状态由服务端交易守卫判定";
+        if (triggered) {
+            state = "triggered";
+            statusText = "限制已锁存 · 已停单";
+            noteText = "持仓 + 挂单冻结已超过配置上限；已请求全撤，限制在本次运行中保持锁存。";
+        } else if (stale) {
+            state = "stale";
+            statusText = "账户读数待更新";
+            noteText = "当前显示上次成功读数；触发状态仍以服务端交易守卫为准。";
+        } else if (!ready) {
+            state = "waiting";
+            statusText = error ? "保证金读取异常" : "等待读数";
+            noteText = error
+                ? "保证金读取失败；未就绪时不会把 0% 当作有效占用。"
+                : "等待账户保证金读数；未就绪时不会把 0% 当作有效占用。";
+        }
+
+        if (error) noteText += " 守卫报告：" + error;
+
+        return {
+            ready,
+            stale,
+            triggered,
+            state,
+            statusText,
+            noteText,
+            usagePercent,
+            limitPercent,
+            usedMargin,
+            marginBalance,
+            availableBalance,
+            quoteAsset,
+            updatedAt: source.updatedAt || null,
+            showReading,
+            showAmounts,
+            fillPercent: showReading ? clamp(usagePercent, 0, 100) : 0,
+            fillScale: showReading ? clamp(usagePercent / 100, 0, 1) : 0,
+            limitPosition: limitPercent == null ? null : clamp(limitPercent, 0, 100),
+            limitAtStart: limitPercent != null && limitPercent < 24
+        };
+    }
+
+    function renderMarginUsage(model) {
+        const root = $("marginCapacity");
+        if (!root) return;
+
+        ["is-normal", "is-waiting", "is-stale", "is-triggered"].forEach((name) => root.classList.remove(name));
+        root.classList.add("is-" + model.state);
+        root.style.setProperty("--margin-fill-scale", String(model.fillScale));
+        root.style.setProperty("--margin-limit-position", String(model.limitPosition == null ? 100 : model.limitPosition));
+
+        const status = $("marginCapacityStatus");
+        setText(status.querySelector("span") || status, model.statusText);
+        setText($("marginUsageValue"), model.showReading ? fmt(model.usagePercent, 2) + "%" : "—");
+        setText($("marginLimitFlag"), model.limitPercent == null ? "上限 —" : "上限 " + fmt(model.limitPercent, 2) + "%");
+        setText($("marginUsedAmount"), marginAmountText(model.usedMargin, model.quoteAsset, model.showAmounts));
+        setText($("marginBalanceAmount"), marginAmountText(model.marginBalance, model.quoteAsset, model.showAmounts));
+        setText($("marginAvailableAmount"), marginAmountText(model.availableBalance, model.quoteAsset, model.showAmounts));
+
+        const limit = $("marginLimit");
+        limit.hidden = model.limitPosition == null;
+        limit.classList.toggle("is-low", model.limitAtStart);
+
+        const track = $("marginTrack");
+        if (model.showReading) {
+            track.setAttribute("aria-valuenow", String(Number(model.fillPercent.toFixed(2))));
+            track.setAttribute(
+                "aria-valuetext",
+                "保证金占用 " + fmt(model.usagePercent, 2) + "%" +
+                (model.limitPercent == null ? "" : "，上限 " + fmt(model.limitPercent, 2) + "%") +
+                "，" + model.statusText
+            );
+        } else {
+            track.removeAttribute("aria-valuenow");
+            track.setAttribute(
+                "aria-valuetext",
+                model.statusText + (model.limitPercent == null ? "" : "，上限 " + fmt(model.limitPercent, 2) + "%")
+            );
+        }
+
+        let note = model.noteText;
+        if (model.updatedAt) {
+            const updated = formatTime(model.updatedAt);
+            if (updated !== "—") note += " · 更新 " + updated;
+        }
+        setText($("marginCapacityNote"), note);
+    }
+
+    function marginAmountText(value, quoteAsset, visible) {
+        return visible && value != null ? fmt(value, 2) + " " + quoteAsset : "—";
     }
 
     function metric(label, value, className, hint, hintClassName) {

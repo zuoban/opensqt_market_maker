@@ -107,6 +107,85 @@ func TestInvalidEnvType(t *testing.T) {
 	}
 }
 
+func TestMaxMarginUsagePercentFromYAML(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    float64
+		wantErr bool
+	}{
+		{name: "default", want: 100},
+		{name: "valid", value: "65.5", want: 65.5},
+		{name: "zero", value: "0", wantErr: true},
+		{name: "negative", value: "-1", wantErr: true},
+		{name: "over 100", value: "100.01", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := envTestYAML
+			if tt.value != "" {
+				body += "  max_margin_usage_percent: " + tt.value + "\n"
+			}
+			cfg, err := LoadConfig(writeTempYAML(t, body))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected validation error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Trading.MaxMarginUsagePercent != tt.want {
+				t.Fatalf("max margin usage percent = %v, want %v", cfg.Trading.MaxMarginUsagePercent, tt.want)
+			}
+		})
+	}
+}
+
+func TestMaxMarginUsagePercentRejectsExplicitZeroFromYAMLMerge(t *testing.T) {
+	body := `
+trading_defaults: &trading_defaults
+  max_margin_usage_percent: 0
+app:
+  current_exchange: "bitget"
+exchanges:
+  bitget:
+    api_key: "yaml-key"
+    secret_key: "yaml-secret"
+trading:
+  <<: *trading_defaults
+  symbol: "ETHUSDT"
+  order_quantity: 30
+  buy_window_size: 10
+`
+	if _, err := LoadConfig(writeTempYAML(t, body)); err == nil {
+		t.Fatal("expected merged explicit zero to fail validation")
+	}
+}
+
+func TestMaxMarginUsagePercentFromEnv(t *testing.T) {
+	t.Setenv("OPENSQT_TRADING_MAX_MARGIN_USAGE_PERCENT", "72.5")
+	cfg, err := LoadConfig(writeTempYAML(t, envTestYAML+"  max_margin_usage_percent: 80\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Trading.MaxMarginUsagePercent != 72.5 {
+		t.Fatalf("max margin usage percent = %v", cfg.Trading.MaxMarginUsagePercent)
+	}
+}
+
+func TestInvalidMaxMarginUsagePercentFromEnv(t *testing.T) {
+	for _, value := range []string{"0", "-1", "100.01", "NaN"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("OPENSQT_TRADING_MAX_MARGIN_USAGE_PERCENT", value)
+			if _, err := LoadConfig(writeTempYAML(t, envTestYAML)); err == nil {
+				t.Fatalf("expected validation error for %q", value)
+			}
+		})
+	}
+}
+
 func TestParseDotEnv(t *testing.T) {
 	kv, err := parseDotEnv(`
 # comment

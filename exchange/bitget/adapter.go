@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -796,9 +797,15 @@ func (b *BitgetAdapter) GetAccount(ctx context.Context) (*Account, error) {
 		return nil, fmt.Errorf("解析账户信息失败: %w", err)
 	}
 
-	// 转换为通用格式
-	available, _ := strconv.ParseFloat(data.Available, 64)
-	equity, _ := strconv.ParseFloat(data.Equity, 64)
+	// 转换为通用格式。余额参与交易额度判断，解析失败时必须关闭交易，不能静默回退为 0。
+	equity, err := parseFiniteAccountFloat("accountEquity", data.Equity)
+	if err != nil {
+		return nil, fmt.Errorf("解析 Bitget 账户余额失败: %w", err)
+	}
+	available, err := parseFiniteAccountFloat("available", data.Available)
+	if err != nil {
+		return nil, fmt.Errorf("解析 Bitget 账户余额失败: %w", err)
+	}
 
 	// 🔥 强制检查保证金模式：必须是全仓模式
 	if data.MarginMode != "crossed" {
@@ -819,7 +826,8 @@ func (b *BitgetAdapter) GetAccount(ctx context.Context) (*Account, error) {
 		posModeDesc = "单向持仓"
 	}
 
-	logger.Info("ℹ️ [Bitget 账户] 保证金模式: crossed(全仓), 持仓模式: %s, 杠杆倍数: %dx, 可用余额: %.2f %s",
+	// 保证金守卫会高频读取账户；账户细节仅写 DEBUG，避免每 2 秒污染运行日志。
+	logger.Debug("ℹ️ [Bitget 账户] 保证金模式: crossed(全仓), 持仓模式: %s, 杠杆倍数: %dx, 可用余额: %.2f %s",
 		posModeDesc, accountLeverage, available, data.MarginCoin)
 
 	return &Account{
@@ -830,6 +838,21 @@ func (b *BitgetAdapter) GetAccount(ctx context.Context) (*Account, error) {
 		PosMode:            data.PosMode,
 		AccountLeverage:    accountLeverage, // 添加账户级别的杠杆倍数
 	}, nil
+}
+
+func parseFiniteAccountFloat(field, value string) (float64, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, fmt.Errorf("账户字段 %s 缺失", field)
+	}
+	parsed, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return 0, fmt.Errorf("账户字段 %s=%q 不是有效数字: %w", field, value, err)
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("账户字段 %s=%q 不是有限数字", field, value)
+	}
+	return parsed, nil
 }
 
 // GetPositions 获取持仓信息

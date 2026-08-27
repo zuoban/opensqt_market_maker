@@ -585,6 +585,308 @@ main { display: block; }
 
 @keyframes shimmer { to { background-position: -220% 0; } }
 
+.margin-capacity {
+    --margin-fill-scale: 0;
+    --margin-limit-position: 100;
+    position: relative;
+    margin-top: 10px;
+    padding: 14px 16px 12px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background:
+        linear-gradient(90deg, rgba(46, 230, 166, 0.045), transparent 42%),
+        linear-gradient(165deg, rgba(17, 24, 27, 0.94), rgba(8, 12, 14, 0.96));
+    box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.margin-capacity::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 2px;
+    background: var(--primary);
+}
+
+.margin-capacity.is-waiting::before,
+.margin-capacity.is-stale::before { background: var(--warn); }
+
+.margin-capacity.is-triggered {
+    border-color: rgba(255, 109, 102, 0.42);
+    background:
+        linear-gradient(90deg, rgba(255, 109, 102, 0.09), transparent 48%),
+        linear-gradient(165deg, rgba(27, 18, 19, 0.98), rgba(10, 12, 14, 0.98));
+}
+
+.margin-capacity.is-triggered::before { background: var(--danger); }
+
+.margin-capacity-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+}
+
+.margin-capacity-title > span {
+    display: block;
+    color: var(--primary);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.13em;
+}
+
+.is-waiting .margin-capacity-title > span,
+.is-stale .margin-capacity-title > span { color: var(--warn); }
+
+.is-triggered .margin-capacity-title > span { color: var(--danger); }
+
+.margin-capacity-title h3 {
+    margin: 3px 0 0;
+    color: var(--ink-strong);
+    font-family: var(--font-display);
+    font-size: 17px;
+    font-weight: 760;
+    letter-spacing: 0.02em;
+    line-height: 1.15;
+}
+
+.margin-capacity-status {
+    display: inline-flex;
+    min-height: 32px;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    color: var(--positive);
+    background: rgba(62, 224, 164, 0.07);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.025em;
+}
+
+.margin-capacity-status i {
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 10px currentColor;
+}
+
+.is-waiting .margin-capacity-status,
+.is-stale .margin-capacity-status {
+    color: var(--warn);
+    border-color: rgba(240, 193, 90, 0.34);
+    background: rgba(240, 193, 90, 0.08);
+}
+
+.is-triggered .margin-capacity-status {
+    color: var(--danger);
+    border-color: rgba(255, 109, 102, 0.44);
+    background: rgba(255, 109, 102, 0.1);
+    animation: risk-pulse 1.2s ease-in-out infinite;
+}
+
+.margin-capacity-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1.65fr) minmax(360px, 1fr);
+    gap: 18px;
+    align-items: end;
+    margin-top: 12px;
+}
+
+.margin-gauge { min-width: 0; }
+
+.margin-readout {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+}
+
+.margin-readout > span {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+}
+
+.margin-readout strong {
+    color: var(--ink-strong);
+    font-family: var(--font-mono);
+    font-size: clamp(20px, 2vw, 26px);
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-weight: 650;
+    letter-spacing: -0.035em;
+    line-height: 1;
+}
+
+.is-stale .margin-readout strong,
+.is-waiting .margin-readout strong { color: var(--warn); }
+
+.is-triggered .margin-readout strong { color: var(--danger); }
+
+.margin-track-wrap { min-width: 0; padding-top: 25px; }
+
+.margin-track {
+    position: relative;
+    height: 18px;
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    background: rgba(4, 7, 8, 0.82);
+    box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.44);
+}
+
+.margin-track-grid {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    border-radius: 3px;
+    background: repeating-linear-gradient(
+        90deg,
+        transparent 0,
+        transparent calc(10% - 1px),
+        rgba(154, 186, 176, 0.12) calc(10% - 1px),
+        rgba(154, 186, 176, 0.12) 10%
+    );
+}
+
+.margin-fill {
+    position: absolute;
+    inset: 2px;
+    border-radius: 2px;
+    background: linear-gradient(90deg, rgba(46, 230, 166, 0.62), var(--primary));
+    box-shadow: 0 0 16px rgba(46, 230, 166, 0.28);
+    transform: scaleX(var(--margin-fill-scale));
+    transform-origin: left center;
+    transition: transform 220ms ease-out, background-color var(--ease), box-shadow var(--ease);
+}
+
+.is-stale .margin-fill {
+    background: linear-gradient(90deg, rgba(240, 193, 90, 0.52), var(--warn));
+    box-shadow: 0 0 14px rgba(240, 193, 90, 0.24);
+}
+
+.is-triggered .margin-fill {
+    background: linear-gradient(90deg, rgba(255, 109, 102, 0.58), var(--danger));
+    box-shadow: 0 0 18px rgba(255, 109, 102, 0.34);
+}
+
+.margin-limit {
+    position: absolute;
+    z-index: 3;
+    top: -5px;
+    bottom: -5px;
+    left: calc(var(--margin-limit-position) * 1%);
+    width: 1px;
+    border-left: 1px dashed var(--cyan);
+    pointer-events: none;
+}
+
+.margin-limit::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: -3px;
+    width: 5px;
+    height: 5px;
+    background: var(--cyan);
+    transform: rotate(45deg);
+}
+
+.margin-limit-flag {
+    position: absolute;
+    right: 6px;
+    bottom: calc(100% + 5px);
+    padding: 3px 6px;
+    border: 1px solid rgba(94, 198, 255, 0.32);
+    border-radius: 4px;
+    color: var(--cyan);
+    background: rgba(7, 12, 14, 0.96);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.margin-limit.is-low .margin-limit-flag { right: auto; left: 6px; }
+
+.margin-scale {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 5px;
+    color: var(--muted-soft);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-variant-numeric: tabular-nums;
+}
+
+.margin-facts {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+    margin: 0;
+}
+
+.margin-facts > div {
+    min-width: 0;
+    padding: 9px 10px;
+    border-left: 1px solid var(--line-strong);
+    background: rgba(255, 255, 255, 0.018);
+}
+
+.margin-facts dt {
+    color: var(--muted-soft);
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+}
+
+.margin-facts dd {
+    margin: 4px 0 0;
+    overflow-wrap: anywhere;
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
+.margin-capacity-note {
+    min-height: 17px;
+    margin: 8px 0 0;
+    color: var(--muted-soft);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1.5;
+}
+
+.is-triggered .margin-capacity-note { color: #ffaaa5; }
+
+@media (max-width: 980px) {
+    .margin-capacity-body { grid-template-columns: 1fr; gap: 10px; }
+}
+
+@media (max-width: 680px) {
+    .margin-capacity { padding: 13px 12px 11px; }
+    .margin-capacity-head { align-items: flex-start; flex-direction: column; gap: 8px; }
+    .margin-capacity-status { align-self: stretch; justify-content: center; min-height: 36px; }
+    .margin-capacity-body { margin-top: 10px; }
+    .margin-facts > div { padding: 8px; }
+    .margin-facts dd { font-size: 11px; }
+}
+
+@media (max-width: 390px) {
+    .margin-facts { grid-template-columns: 1fr; }
+    .margin-facts > div { display: flex; justify-content: space-between; gap: 12px; }
+    .margin-facts dd { margin-top: 0; text-align: right; }
+}
+
 .strategy-panel {
     margin-top: 10px;
     overflow: hidden;
@@ -2146,9 +2448,13 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .panel,
     .kpi,
     .mast,
+    .margin-capacity,
+    .margin-track,
     .risk-item { border: 1px solid CanvasText; }
 
     .pill i,
     .lg::before,
+    .margin-capacity-status i,
+    .margin-limit::after,
     .risk-item::before { forced-color-adjust: none; }
 }

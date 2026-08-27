@@ -23,6 +23,9 @@ func TestDashboardDefaults(t *testing.T) {
 	if c.Dashboard.PushIntervalMS != 400 {
 		t.Fatalf("push = %d", c.Dashboard.PushIntervalMS)
 	}
+	if c.Trading.MaxMarginUsagePercent != 100 {
+		t.Fatalf("max margin usage percent = %v", c.Trading.MaxMarginUsagePercent)
+	}
 	c.Dashboard.PushIntervalMS = 50
 	if err := c.applyDashboardDefaults(); err != nil {
 		t.Fatal(err)

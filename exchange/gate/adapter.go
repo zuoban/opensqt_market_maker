@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -542,10 +543,24 @@ func (g *GateAdapter) GetAccount(ctx context.Context) (*Account, error) {
 	}
 	g.wsManager.SetUserID(futuresAcc.User)
 
-	// 解析余额
-	total, _ := strconv.ParseFloat(futuresAcc.Total, 64)
-	available, _ := strconv.ParseFloat(futuresAcc.Available, 64)
-	unrealisedPnl, _ := strconv.ParseFloat(futuresAcc.UnrealisedPnl, 64)
+	// 余额参与交易额度判断，解析失败时必须关闭交易，不能静默回退为 0。
+	total, err := parseFiniteAccountFloat("total", futuresAcc.Total)
+	if err != nil {
+		return nil, fmt.Errorf("解析 Gate.io 账户余额失败: %w", err)
+	}
+	unrealisedPnl, err := parseFiniteAccountFloat("unrealised_pnl", futuresAcc.UnrealisedPnl)
+	if err != nil {
+		return nil, fmt.Errorf("解析 Gate.io 账户余额失败: %w", err)
+	}
+	available, err := parseFiniteAccountFloat("available", futuresAcc.Available)
+	if err != nil {
+		return nil, fmt.Errorf("解析 Gate.io 账户余额失败: %w", err)
+	}
+	totalMarginBalance := total + unrealisedPnl
+	if math.IsNaN(totalMarginBalance) || math.IsInf(totalMarginBalance, 0) {
+		return nil, fmt.Errorf("解析 Gate.io 账户余额失败: totalMarginBalance 由 total=%q 与 unrealised_pnl=%q 计算后不是有限数字",
+			futuresAcc.Total, futuresAcc.UnrealisedPnl)
+	}
 
 	posMode := "single"
 	if futuresAcc.InDualMode {
@@ -573,12 +588,27 @@ func (g *GateAdapter) GetAccount(ctx context.Context) (*Account, error) {
 	account := &Account{
 		TotalWalletBalance: total,
 		AvailableBalance:   available,
-		TotalMarginBalance: total + unrealisedPnl,
+		TotalMarginBalance: totalMarginBalance,
 		AccountLeverage:    leverage,
 		PosMode:            posMode,
 	}
 
 	return account, nil
+}
+
+func parseFiniteAccountFloat(field, value string) (float64, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, fmt.Errorf("账户字段 %s 缺失", field)
+	}
+	parsed, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return 0, fmt.Errorf("账户字段 %s=%q 不是有效数字: %w", field, value, err)
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("账户字段 %s=%q 不是有限数字", field, value)
+	}
+	return parsed, nil
 }
 
 // GetPositions 获取持仓信息

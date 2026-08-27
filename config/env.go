@@ -75,6 +75,12 @@ func applyEnvOverrides(cfg *Config) error {
 	if err := setFloat(&t.MinOrderValue, "OPENSQT_TRADING_MIN_ORDER_VALUE"); err != nil {
 		return err
 	}
+	if _, ok := lookupEnv("OPENSQT_TRADING_MAX_MARGIN_USAGE_PERCENT"); ok {
+		if err := setFloat(&t.MaxMarginUsagePercent, "OPENSQT_TRADING_MAX_MARGIN_USAGE_PERCENT"); err != nil {
+			return err
+		}
+		t.maxMarginUsagePercentSet = true
+	}
 	if err := setInt(&t.BuyWindowSize, "OPENSQT_TRADING_BUY_WINDOW_SIZE"); err != nil {
 		return err
 	}

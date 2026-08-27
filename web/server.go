@@ -29,6 +29,7 @@ type Options struct {
 	Price     *monitor.PriceMonitor
 	Position  *position.SuperPositionManager
 	Risk      *safety.RiskMonitor
+	Margin    *safety.MarginMonitor
 	Exchange  exchange.IExchange
 }
 
@@ -110,6 +111,7 @@ func New(opt Options) *Server {
 			price:   opt.Price,
 			pos:     opt.Position,
 			risk:    opt.Risk,
+			margin:  opt.Margin,
 			account: cache,
 		},
 	}

@@ -22,10 +22,8 @@ type IExchange interface {
 	// BatchCancelOrders 批量取消订单
 	BatchCancelOrders(ctx context.Context, symbol string, orderIDs []int64) error
 
-	// CancelAllOrders 取消所有订单（退出时使用）
-	// 各交易所根据自己的能力实现：
-	// - Bitget: 使用一键全撤API
-	// - Gate.io/Binance: 查询所有未完成订单后批量撤销
+	// CancelAllOrders 取消指定交易对的全部订单（退出或安全停单时使用）。
+	// 实现不得把撤单范围扩大到同账户的其它交易对。
 	CancelAllOrders(ctx context.Context, symbol string) error
 
 	// GetOrder 查询订单

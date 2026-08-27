@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const {
     buildKlineGridModel,
     buildHourlyFillModel,
+    buildMarginUsageModel,
     centeredScrollLeft,
     formatRelativeTime
 } = require("./static/app.js");
@@ -82,6 +83,130 @@ test("event stream follows execution tape at the end of the dashboard", () => {
     assert.ok(logs > fills);
     assert.ok(mainEnd > logs);
     assert.ok(html.indexOf("03 / EXECUTION TAPE") < html.indexOf("04 / EVENT STREAM"));
+});
+
+test("margin capacity surface exposes status, exact amounts and an accessible gauge", () => {
+    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
+    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
+
+    assert.match(html, /id="marginCapacity"/);
+    assert.match(html, /持仓 \+ 挂单冻结/);
+    assert.match(html, /id="marginCapacityStatus"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.match(html, /id="marginTrack"[^>]*role="progressbar"/);
+    assert.match(html, /id="marginUsedAmount"/);
+    assert.match(html, /id="marginBalanceAmount"/);
+    assert.match(html, /id="marginAvailableAmount"/);
+    assert.match(cssBlock(css, ".margin-fill"), /transform:\s*scaleX\(var\(--margin-fill-scale\)\)/);
+    assert.match(cssBlock(css, ".margin-facts"), /grid-template-columns:\s*repeat\(3,/);
+});
+
+test("margin usage model keeps backend trigger state authoritative", () => {
+    const model = buildMarginUsageModel({
+        ready: true,
+        triggered: false,
+        usagePercent: 72.5,
+        limitPercent: 60,
+        usedMargin: 1450,
+        marginBalance: 2000,
+        availableBalance: 550,
+        quoteAsset: "USDT",
+        updatedAt: "2026-08-27T10:00:00Z"
+    });
+
+    assert.equal(model.ready, true);
+    assert.equal(model.state, "normal");
+    assert.equal(model.triggered, false);
+    assert.equal(model.statusText, "容量正常");
+    assert.equal(model.fillPercent, 72.5);
+    assert.equal(model.fillScale, 0.725);
+    assert.equal(model.limitPosition, 60);
+    assert.equal(model.usedMargin, 1450);
+    assert.equal(model.quoteAsset, "USDT");
+});
+
+test("margin usage model reports a latched stop-and-cancel-request state", () => {
+    const model = buildMarginUsageModel({
+        ready: true,
+        triggered: true,
+        stale: true,
+        usagePercent: 64.25,
+        limitPercent: 60,
+        usedMargin: 1285,
+        marginBalance: 2000,
+        availableBalance: 715,
+        quoteAsset: "USDC"
+    });
+
+    assert.equal(model.state, "triggered");
+    assert.equal(model.statusText, "限制已锁存 · 已停单");
+    assert.match(model.noteText, /已请求全撤/);
+    assert.match(model.noteText, /本次运行中保持锁存/);
+    assert.equal(model.showReading, true);
+    assert.equal(model.showAmounts, true);
+    assert.equal(model.quoteAsset, "USDC");
+});
+
+test("margin usage model distinguishes waiting and stale readings from valid zero", () => {
+    const uninitialized = buildMarginUsageModel({
+        ready: false,
+        stale: true,
+        usagePercent: 0,
+        limitPercent: 50,
+        usedMargin: 0,
+        marginBalance: 0,
+        availableBalance: 0
+    }, "USDT");
+    assert.equal(uninitialized.state, "waiting");
+    assert.equal(uninitialized.stale, false);
+    assert.equal(uninitialized.showReading, false);
+
+    const waiting = buildMarginUsageModel({
+        ready: false,
+        triggered: false,
+        usagePercent: 0,
+        limitPercent: 50,
+        usedMargin: 0,
+        marginBalance: 0,
+        availableBalance: 0,
+        error: "account unavailable"
+    }, "USDT");
+    assert.equal(waiting.state, "waiting");
+    assert.equal(waiting.ready, false);
+    assert.equal(waiting.showReading, false);
+    assert.equal(waiting.showAmounts, false);
+    assert.equal(waiting.statusText, "保证金读取异常");
+    assert.match(waiting.noteText, /account unavailable/);
+
+    const stale = buildMarginUsageModel({
+        ready: false,
+        stale: true,
+        usagePercent: 18.75,
+        limitPercent: 50,
+        usedMargin: 375,
+        marginBalance: 2000,
+        availableBalance: 1625
+    }, "USDT");
+    assert.equal(stale.state, "stale");
+    assert.equal(stale.showReading, true);
+    assert.equal(stale.showAmounts, true);
+    assert.equal(stale.statusText, "账户读数待更新");
+});
+
+test("margin gauge clamps visual geometry without changing exact readings", () => {
+    const model = buildMarginUsageModel({
+        ready: true,
+        usagePercent: 132.4,
+        limitPercent: 12,
+        usedMargin: 1324,
+        marginBalance: 1000,
+        availableBalance: 0
+    });
+
+    assert.equal(model.usagePercent, 132.4);
+    assert.equal(model.fillPercent, 100);
+    assert.equal(model.fillScale, 1);
+    assert.equal(model.limitPosition, 12);
+    assert.equal(model.limitAtStart, true);
 });
 
 test("mobile order and log windows keep native vertical scrolling", () => {

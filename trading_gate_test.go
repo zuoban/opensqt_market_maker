@@ -17,17 +17,19 @@ import (
 )
 
 func TestTradingGateHealthCanTradeTruthTable(t *testing.T) {
-	for mask := 0; mask < 32; mask++ {
+	for mask := 0; mask < 128; mask++ {
 		health := tradingGateHealth{
 			OrderStreamReady: mask&(1<<0) != 0,
 			RiskReady:        mask&(1<<1) != 0,
 			RiskTriggered:    mask&(1<<2) != 0,
-			ReconcilerReady:  mask&(1<<3) != 0,
-			PriceFresh:       mask&(1<<4) != 0,
+			MarginReady:      mask&(1<<3) != 0,
+			MarginTriggered:  mask&(1<<4) != 0,
+			ReconcilerReady:  mask&(1<<5) != 0,
+			PriceFresh:       mask&(1<<6) != 0,
 		}
 		want := health.OrderStreamReady && health.RiskReady && !health.RiskTriggered &&
-			health.ReconcilerReady && health.PriceFresh
-		t.Run(fmt.Sprintf("mask_%05b", mask), func(t *testing.T) {
+			health.MarginReady && !health.MarginTriggered && health.ReconcilerReady && health.PriceFresh
+		t.Run(fmt.Sprintf("mask_%07b", mask), func(t *testing.T) {
 			if got := health.CanTrade(); got != want {
 				t.Fatalf("CanTrade() = %v, want %v, health=%+v", got, want, health)
 			}
@@ -40,7 +42,7 @@ func TestTradingGateHealthReasons(t *testing.T) {
 		OrderStreamState: "DEGRADED",
 		RiskTriggered:    true,
 	}
-	want := []string{"订单流=DEGRADED", "风控未就绪", "风控已触发", "对账不健康", "价格流陈旧"}
+	want := []string{"订单流=DEGRADED", "风控未就绪", "风控已触发", "保证金守卫未就绪", "对账不健康", "价格流陈旧"}
 	if got := health.Reasons(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("Reasons() = %v, want %v", got, want)
 	}
@@ -219,6 +221,7 @@ func TestNewTradingGateRuntimeInstallsSubmissionHealthGuard(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		nil,
 		&safety.Reconciler{},
 		nil,
 		time.Second,
@@ -234,6 +237,7 @@ func TestSubmissionHealthErrorFailsClosedForEveryCondition(t *testing.T) {
 		OrderStreamReady: true,
 		OrderStreamState: "READY",
 		RiskReady:        true,
+		MarginReady:      true,
 		ReconcilerReady:  true,
 		PriceFresh:       true,
 	}
@@ -250,6 +254,8 @@ func TestSubmissionHealthErrorFailsClosedForEveryCondition(t *testing.T) {
 		{name: "order stream", mutate: func(h *tradingGateHealth) { h.OrderStreamReady = false }, want: "订单流"},
 		{name: "risk not ready", mutate: func(h *tradingGateHealth) { h.RiskReady = false }, want: "风控未就绪"},
 		{name: "risk triggered", mutate: func(h *tradingGateHealth) { h.RiskTriggered = true }, want: "风控已触发"},
+		{name: "margin not ready", mutate: func(h *tradingGateHealth) { h.MarginReady = false }, want: "保证金守卫未就绪"},
+		{name: "margin triggered", mutate: func(h *tradingGateHealth) { h.MarginTriggered = true }, want: "保证金限制已触发"},
 		{name: "reconciler", mutate: func(h *tradingGateHealth) { h.ReconcilerReady = false }, want: "对账不健康"},
 		{name: "price", mutate: func(h *tradingGateHealth) { h.PriceFresh = false }, want: "价格流陈旧"},
 		{name: "recovery reconcile", mutate: func(*tradingGateHealth) {}, needsReconcile: true, want: "等待恢复对账"},
@@ -283,6 +289,7 @@ func TestSubmissionHealthGuardSynchronouslyEntersRecoveryState(t *testing.T) {
 	health := tradingGateHealth{
 		OrderStreamState: "DEGRADED",
 		RiskReady:        true,
+		MarginReady:      true,
 		ReconcilerReady:  true,
 		PriceFresh:       true,
 	}
@@ -310,6 +317,7 @@ func TestSubmissionHealthGuardSynchronouslyEntersRecoveryState(t *testing.T) {
 		OrderStreamReady: true,
 		OrderStreamState: "READY",
 		RiskReady:        true,
+		MarginReady:      true,
 		ReconcilerReady:  true,
 		PriceFresh:       true,
 	}
@@ -423,6 +431,23 @@ func TestCancelAllOrdersAndConfirmRetriesUntilRemoteEmpty(t *testing.T) {
 	}
 }
 
+func TestCancelAllOrdersAndConfirmStableResetsEmptySequenceAfterQueryError(t *testing.T) {
+	ex := &cancelConfirmExchangeFake{
+		queryErrors: []error{nil, errors.New("temporary query error")},
+		openOrders:  [][]*exchange.Order{nil, nil, nil, nil, nil},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := cancelAllOrdersAndConfirmStable(ctx, ex, "BTCUSDT", 3); err != nil {
+		t.Fatalf("cancelAllOrdersAndConfirmStable() error = %v", err)
+	}
+	cancelCalls, queryCalls := ex.counts()
+	if cancelCalls != 5 || queryCalls != 5 {
+		t.Fatalf("calls = cancel:%d query:%d, want 5/5 after stability reset", cancelCalls, queryCalls)
+	}
+}
+
 func TestCancelAllOrdersAndConfirmTimeoutIncludesLastErrors(t *testing.T) {
 	cancelErr := errors.New("cancel unavailable")
 	queryErr := errors.New("query unavailable")
@@ -461,6 +486,236 @@ func TestCancelAllOrdersAndConfirmRejectsInvalidDependencies(t *testing.T) {
 	}
 	if err := cancelAllOrdersAndConfirm(context.Background(), nil, "BTCUSDT"); err == nil {
 		t.Fatal("nil exchange did not fail")
+	}
+}
+
+type marginCancelRuntimeExchange struct {
+	exchange.IExchange
+	remote *cancelConfirmExchangeFake
+}
+
+func (e *marginCancelRuntimeExchange) CancelAllOrders(ctx context.Context, symbol string) error {
+	return e.remote.CancelAllOrders(ctx, symbol)
+}
+
+func (e *marginCancelRuntimeExchange) GetOpenOrders(ctx context.Context, symbol string) ([]*exchange.Order, error) {
+	return e.remote.GetOpenOrders(ctx, symbol)
+}
+
+func (e *marginCancelRuntimeExchange) IsOrderStreamReady() bool {
+	provider, ok := e.IExchange.(exchange.OrderStreamHealthProvider)
+	return ok && provider.IsOrderStreamReady()
+}
+
+func (e *marginCancelRuntimeExchange) GetOrderStreamState() string {
+	provider, ok := e.IExchange.(exchange.OrderStreamHealthProvider)
+	if !ok {
+		return "HEALTH_UNAVAILABLE"
+	}
+	return provider.GetOrderStreamState()
+}
+
+func TestMarginLimitEscalatesToFullCancelWhenGateAlreadyClosed(t *testing.T) {
+	executor := &recordingNewOrderGate{}
+	gate := newSerializedOrderGate(executor)
+	runtime := &tradingGateRuntime{
+		gate:       gate,
+		reconciler: &safety.Reconciler{},
+		wake:       make(chan struct{}, 1),
+	}
+	runtime.withdrawRequired.Store(true)
+
+	runtime.handleMarginLimit(safety.MarginSnapshot{
+		Triggered:    true,
+		UsagePercent: 61,
+		LimitPercent: 60,
+	})
+
+	if gate.Enabled() {
+		t.Fatal("already-closed gate became enabled")
+	}
+	if !runtime.cancelAllRequired.Load() || runtime.withdrawRequired.Load() || !runtime.needsReconcile.Load() {
+		t.Fatalf("withdrawal flags = all:%v buy:%v reconcile:%v",
+			runtime.cancelAllRequired.Load(), runtime.withdrawRequired.Load(), runtime.needsReconcile.Load())
+	}
+	_, stopCalls := executor.counts()
+	if stopCalls != 0 {
+		t.Fatalf("already-closed gate stopped executor %d times, want 0", stopCalls)
+	}
+}
+
+func TestMarginLimitStopsEnabledGateImmediately(t *testing.T) {
+	executor := &recordingNewOrderGate{}
+	gate := newSerializedOrderGate(executor)
+	if _, err := gate.Enable(); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &tradingGateRuntime{
+		gate:       gate,
+		reconciler: &safety.Reconciler{},
+		wake:       make(chan struct{}, 1),
+	}
+
+	runtime.handleMarginLimit(safety.MarginSnapshot{Triggered: true, UsagePercent: 61, LimitPercent: 60})
+	if gate.Enabled() || !runtime.cancelAllRequired.Load() {
+		t.Fatalf("margin trigger did not close and escalate: enabled=%v all=%v",
+			gate.Enabled(), runtime.cancelAllRequired.Load())
+	}
+	_, stopCalls := executor.counts()
+	if stopCalls != 1 {
+		t.Fatalf("stop calls = %d, want 1", stopCalls)
+	}
+}
+
+func TestMarginLimitClearsStaleFullCancelRequestAfterCompletion(t *testing.T) {
+	runtime := &tradingGateRuntime{
+		gate:       newSerializedOrderGate(&recordingNewOrderGate{}),
+		reconciler: &safety.Reconciler{},
+		wake:       make(chan struct{}, 1),
+	}
+	// 模拟旧 handler 在全撤完成后才落地 CAS 的过期状态。
+	runtime.marginCancelDone.Store(true)
+	runtime.cancelAllRequired.Store(true)
+
+	runtime.handleMarginLimit(safety.MarginSnapshot{
+		Triggered:    true,
+		UsagePercent: 61,
+		LimitPercent: 60,
+	})
+
+	if !runtime.marginCancelDone.Load() || runtime.cancelAllRequired.Load() {
+		t.Fatalf("latched cancellation state = done:%v required:%v, want true/false",
+			runtime.marginCancelDone.Load(), runtime.cancelAllRequired.Load())
+	}
+}
+
+func TestProcessMarginFullCancelConfirmsRemoteEmptyAndLatches(t *testing.T) {
+	remote := &cancelConfirmExchangeFake{
+		openOrders: [][]*exchange.Order{
+			{{OrderID: 1}, {OrderID: 2}},
+			nil,
+		},
+	}
+	runtime := &tradingGateRuntime{
+		exchange:   &marginCancelRuntimeExchange{remote: remote},
+		position:   &adjustmentTradingPosition{},
+		reconciler: &safety.Reconciler{},
+	}
+	runtime.cancelAllRequired.Store(true)
+	runtime.withdrawRequired.Store(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := runtime.processMarginFullCancel(ctx); err != nil {
+		t.Fatalf("processMarginFullCancel() error = %v", err)
+	}
+	if runtime.cancelAllRequired.Load() || runtime.withdrawRequired.Load() || !runtime.marginCancelDone.Load() {
+		t.Fatalf("final flags = all:%v buy:%v done:%v",
+			runtime.cancelAllRequired.Load(), runtime.withdrawRequired.Load(), runtime.marginCancelDone.Load())
+	}
+	cancelCalls, queryCalls := remote.counts()
+	if cancelCalls != 4 || queryCalls != 4 {
+		t.Fatalf("remote calls = cancel:%d query:%d, want 4/4", cancelCalls, queryCalls)
+	}
+
+	// 锁存完成后重复健康观察不得重新武装全撤。
+	runtime.handleMarginLimit(safety.MarginSnapshot{Triggered: true, UsagePercent: 0, LimitPercent: 60})
+	if runtime.cancelAllRequired.Load() {
+		t.Fatal("latched margin limit re-armed full cancellation")
+	}
+}
+
+func TestProcessMarginFullCancelKeepsRequirementOnTimeout(t *testing.T) {
+	remote := &cancelConfirmExchangeFake{
+		openOrders: [][]*exchange.Order{{{OrderID: 7}}},
+	}
+	runtime := &tradingGateRuntime{
+		exchange:   &marginCancelRuntimeExchange{remote: remote},
+		position:   &adjustmentTradingPosition{},
+		reconciler: &safety.Reconciler{},
+	}
+	runtime.cancelAllRequired.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err := runtime.processMarginFullCancel(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("processMarginFullCancel() error = %v, want deadline", err)
+	}
+	if !runtime.cancelAllRequired.Load() || runtime.marginCancelDone.Load() {
+		t.Fatalf("failed cancellation flags = all:%v done:%v",
+			runtime.cancelAllRequired.Load(), runtime.marginCancelDone.Load())
+	}
+}
+
+func TestMarginLateOrderAuditCancelsResidualAndExtendsWindow(t *testing.T) {
+	remote := &cancelConfirmExchangeFake{
+		openOrders: [][]*exchange.Order{
+			{{OrderID: 9}},
+			nil,
+		},
+	}
+	now := time.Unix(1_800_000_000, 0)
+	runtime := &tradingGateRuntime{
+		exchange:         &marginCancelRuntimeExchange{remote: remote},
+		position:         &adjustmentTradingPosition{},
+		marginAuditUntil: now.Add(time.Second),
+	}
+	runtime.marginCancelDone.Store(true)
+
+	if err := runtime.auditLateMarginOrders(context.Background(), now); err != nil {
+		t.Fatalf("auditLateMarginOrders() error = %v", err)
+	}
+	cancelCalls, queryCalls := remote.counts()
+	if cancelCalls != 1 || queryCalls != 2 {
+		t.Fatalf("remote calls = cancel:%d query:%d, want 1/2", cancelCalls, queryCalls)
+	}
+	if want := now.Add(marginAuditWindow); !runtime.marginAuditUntil.Equal(want) {
+		t.Fatalf("audit until = %s, want %s", runtime.marginAuditUntil, want)
+	}
+}
+
+func TestMarginLateOrderAuditQueriesOnlyWhenDueAndSkipsEmptyCancel(t *testing.T) {
+	remote := &cancelConfirmExchangeFake{}
+	now := time.Unix(1_800_000_000, 0)
+	runtime := &tradingGateRuntime{
+		exchange:         &marginCancelRuntimeExchange{remote: remote},
+		position:         &adjustmentTradingPosition{},
+		marginAuditUntil: now.Add(marginAuditWindow),
+	}
+	runtime.marginCancelDone.Store(true)
+
+	if err := runtime.auditLateMarginOrders(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.auditLateMarginOrders(context.Background(), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.auditLateMarginOrders(context.Background(), now.Add(marginAuditInterval)); err != nil {
+		t.Fatal(err)
+	}
+	cancelCalls, queryCalls := remote.counts()
+	if cancelCalls != 0 || queryCalls != 2 {
+		t.Fatalf("remote calls = cancel:%d query:%d, want 0/2", cancelCalls, queryCalls)
+	}
+}
+
+func TestMarginLateOrderAuditStopsAfterWindow(t *testing.T) {
+	remote := &cancelConfirmExchangeFake{}
+	now := time.Unix(1_800_000_000, 0)
+	runtime := &tradingGateRuntime{
+		exchange:         &marginCancelRuntimeExchange{remote: remote},
+		position:         &adjustmentTradingPosition{},
+		marginAuditUntil: now,
+	}
+	runtime.marginCancelDone.Store(true)
+
+	if err := runtime.auditLateMarginOrders(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	cancelCalls, queryCalls := remote.counts()
+	if cancelCalls != 0 || queryCalls != 0 {
+		t.Fatalf("expired audit made remote calls = cancel:%d query:%d", cancelCalls, queryCalls)
 	}
 }
 
@@ -564,6 +819,68 @@ func (p *adjustmentTradingPosition) AdjustOrders(float64) error {
 
 func (p *adjustmentTradingPosition) GetSymbol() string { return "BTCUSDT" }
 
+type staticMarginGateMonitor struct {
+	mu        sync.RWMutex
+	ready     bool
+	triggered bool
+	snapshot  safety.MarginSnapshot
+}
+
+func (m *staticMarginGateMonitor) IsReady() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ready
+}
+
+func (m *staticMarginGateMonitor) IsTriggered() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.triggered
+}
+
+func (m *staticMarginGateMonitor) Snapshot() safety.MarginSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	snap := m.snapshot
+	snap.Ready = m.ready
+	snap.Triggered = m.triggered
+	return snap
+}
+
+func (m *staticMarginGateMonitor) setUsagePercent(usage float64) {
+	m.mu.Lock()
+	m.snapshot.UsagePercent = usage
+	m.mu.Unlock()
+}
+
+type concurrentTradingPosition struct {
+	mu          sync.Mutex
+	adjustCalls int
+	cancelCalls int
+}
+
+func (p *concurrentTradingPosition) CancelAllBuyOrders() error {
+	p.mu.Lock()
+	p.cancelCalls++
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *concurrentTradingPosition) AdjustOrders(float64) error {
+	p.mu.Lock()
+	p.adjustCalls++
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *concurrentTradingPosition) GetSymbol() string { return "BTCUSDT" }
+
+func (p *concurrentTradingPosition) counts() (adjust, cancel int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.adjustCalls, p.cancelCalls
+}
+
 func newHealthyTradingGateTestRuntime(
 	t *testing.T,
 	positionManager tradingPositionManager,
@@ -600,12 +917,145 @@ func newHealthyTradingGateTestRuntime(
 		ex,
 		priceMonitor,
 		riskMonitor,
+		&staticMarginGateMonitor{ready: true},
 		reconciler,
 		positionManager,
 		minimumPriceStaleAfter,
 		time.Minute,
 	)
 	return runtime, gate, executor
+}
+
+func TestTradingGateStartContinuesDormantAfterInitialMarginFullCancel(t *testing.T) {
+	positionManager := &concurrentTradingPosition{}
+	runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
+	margin := &staticMarginGateMonitor{
+		ready:     true,
+		triggered: true,
+		snapshot: safety.MarginSnapshot{
+			UsagePercent: 61,
+			LimitPercent: 60,
+		},
+	}
+	remote := &cancelConfirmExchangeFake{openOrders: [][]*exchange.Order{nil}}
+	runtime.margin = margin
+	runtime.exchange = &marginCancelRuntimeExchange{
+		IExchange: runtime.exchange,
+		remote:    remote,
+	}
+
+	// 模拟 SetLimitHandler 对首轮已触发读数的同步补发。
+	runtime.handleMarginLimit(margin.Snapshot())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := runtime.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v, want dormant success", err)
+	}
+	defer runtime.Stop()
+
+	if gate.Enabled() {
+		t.Fatal("gate enabled after initial margin limit")
+	}
+	if !runtime.marginCancelDone.Load() || runtime.cancelAllRequired.Load() {
+		t.Fatalf("margin cancellation flags = done:%v required:%v, want true/false",
+			runtime.marginCancelDone.Load(), runtime.cancelAllRequired.Load())
+	}
+	select {
+	case <-runtime.done:
+		t.Fatal("runtime exited instead of continuing in dormant state")
+	default:
+	}
+	if enableCalls, stopCalls := executor.counts(); enableCalls != 0 || stopCalls != 0 {
+		t.Fatalf("executor calls = enable:%d stop:%d, want 0/0 before Stop", enableCalls, stopCalls)
+	}
+	if adjustCalls, cancelCalls := positionManager.counts(); adjustCalls != 0 || cancelCalls != 0 {
+		t.Fatalf("position calls = adjust:%d cancel-buy:%d, want 0/0", adjustCalls, cancelCalls)
+	}
+	if cancelCalls, queryCalls := remote.counts(); cancelCalls != marginCancelStableReads || queryCalls != marginCancelStableReads {
+		t.Fatalf("remote calls = cancel:%d query:%d, want %d/%d",
+			cancelCalls, queryCalls, marginCancelStableReads, marginCancelStableReads)
+	}
+
+	// 全撤释放挂单保证金后，账户比例可以回落，但 Triggered 锁存仍必须阻止重新挂单。
+	margin.setUsagePercent(10)
+	runtime.signal()
+	time.Sleep(2 * gateHealthPollInterval)
+	if gate.Enabled() {
+		t.Fatal("gate reopened after usage fell below the limit")
+	}
+	if enableCalls, _ := executor.counts(); enableCalls != 0 {
+		t.Fatalf("EnableNewOrders calls = %d, want 0", enableCalls)
+	}
+	if adjustCalls, _ := positionManager.counts(); adjustCalls != 0 {
+		t.Fatalf("AdjustOrders calls = %d, want 0", adjustCalls)
+	}
+}
+
+func TestTradingGateStartFailsWhenInitialMarginFullCancelIsUnconfirmed(t *testing.T) {
+	positionManager := &concurrentTradingPosition{}
+	runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
+	margin := &staticMarginGateMonitor{
+		ready:     true,
+		triggered: true,
+		snapshot: safety.MarginSnapshot{
+			UsagePercent: 61,
+			LimitPercent: 60,
+		},
+	}
+	remote := &cancelConfirmExchangeFake{
+		openOrders: [][]*exchange.Order{
+			{{OrderID: 7}},
+			nil,
+		},
+	}
+	runtime.margin = margin
+	runtime.exchange = &marginCancelRuntimeExchange{
+		IExchange: runtime.exchange,
+		remote:    remote,
+	}
+	runtime.handleMarginLimit(margin.Snapshot())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := runtime.Start(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Start() error = %v, want deadline from unconfirmed full cancellation", err)
+	}
+	if gate.Enabled() || runtime.marginCancelDone.Load() || !runtime.cancelAllRequired.Load() {
+		t.Fatalf("failed start state = enabled:%v done:%v required:%v, want false/false/true",
+			gate.Enabled(), runtime.marginCancelDone.Load(), runtime.cancelAllRequired.Load())
+	}
+	if enableCalls, _ := executor.counts(); enableCalls != 0 {
+		t.Fatalf("EnableNewOrders calls = %d, want 0", enableCalls)
+	}
+	if adjustCalls, _ := positionManager.counts(); adjustCalls != 0 {
+		t.Fatalf("AdjustOrders calls = %d, want 0", adjustCalls)
+	}
+}
+
+func TestTradingGateStartStillFailsForOtherInitialUnhealthyState(t *testing.T) {
+	positionManager := &concurrentTradingPosition{}
+	runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
+	runtime.margin = &staticMarginGateMonitor{}
+	remote := &cancelConfirmExchangeFake{openOrders: [][]*exchange.Order{nil}}
+	runtime.exchange = &marginCancelRuntimeExchange{
+		IExchange: runtime.exchange,
+		remote:    remote,
+	}
+
+	err := runtime.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "保证金守卫未就绪") {
+		t.Fatalf("Start() error = %v, want initial margin readiness failure", err)
+	}
+	if gate.Enabled() {
+		t.Fatal("gate enabled for an unrelated initial unhealthy state")
+	}
+	if enableCalls, stopCalls := executor.counts(); enableCalls != 0 || stopCalls != 1 {
+		t.Fatalf("executor calls = enable:%d stop:%d, want 0/1 rollback", enableCalls, stopCalls)
+	}
+	if adjustCalls, _ := positionManager.counts(); adjustCalls != 0 {
+		t.Fatalf("AdjustOrders calls = %d, want 0", adjustCalls)
+	}
 }
 
 func definiteAdjustmentRejection() error {

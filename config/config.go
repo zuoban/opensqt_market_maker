@@ -2,11 +2,51 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"os"
 
 	"gopkg.in/yaml.v3"
 )
+
+// TradingConfig 交易参数配置。
+type TradingConfig struct {
+	Symbol                   string  `yaml:"symbol"`
+	PriceInterval            float64 `yaml:"price_interval"`
+	OrderQuantity            float64 `yaml:"order_quantity"`           // 每单购买金额（USDT/USDC）
+	MinOrderValue            float64 `yaml:"min_order_value"`          // 最小订单价值（USDT），默认6U，小于此值不挂单
+	MaxMarginUsagePercent    float64 `yaml:"max_margin_usage_percent"` // 最大允许占用保证金百分比，默认100
+	BuyWindowSize            int     `yaml:"buy_window_size"`
+	SellWindowSize           int     `yaml:"sell_window_size"` // 卖单窗口大小
+	ReconcileInterval        int     `yaml:"reconcile_interval"`
+	OrderCleanupThreshold    int     `yaml:"order_cleanup_threshold"`      // 订单清理上限（默认100）
+	CleanupBatchSize         int     `yaml:"cleanup_batch_size"`           // 清理批次大小（默认10）
+	MarginLockDurationSec    int     `yaml:"margin_lock_duration_seconds"` // 保证金锁定时间（秒，默认10）
+	PositionSafetyCheck      int     `yaml:"position_safety_check"`        // 持仓安全性检查（默认100，最少能向下持有多少仓）
+	maxMarginUsagePercentSet bool
+	// 注意：price_decimals 和 quantity_decimals 已废弃，现在从交易所自动获取
+}
+
+// UnmarshalYAML 记录 max_margin_usage_percent 是否由用户显式配置，
+// 从而区分“未配置时使用默认值”和“显式配置 0（非法）”。
+func (c *TradingConfig) UnmarshalYAML(value *yaml.Node) error {
+	type plain TradingConfig
+	var decoded plain
+	if err := value.Decode(&decoded); err != nil {
+		return err
+	}
+	*c = TradingConfig(decoded)
+	// 用指针再次解码存在性，兼容 YAML merge/anchor 中显式配置的 0。
+	// 直接遍历当前 mapping 的 key 会漏掉通过 `<<` 合并进来的字段。
+	var presence struct {
+		MaxMarginUsagePercent *float64 `yaml:"max_margin_usage_percent"`
+	}
+	if err := value.Decode(&presence); err != nil {
+		return err
+	}
+	c.maxMarginUsagePercentSet = presence.MaxMarginUsagePercent != nil
+	return nil
+}
 
 // Config 做市商系统配置
 type Config struct {
@@ -18,20 +58,7 @@ type Config struct {
 	// 多交易所配置
 	Exchanges map[string]ExchangeConfig `yaml:"exchanges"`
 
-	Trading struct {
-		Symbol                string  `yaml:"symbol"`
-		PriceInterval         float64 `yaml:"price_interval"`
-		OrderQuantity         float64 `yaml:"order_quantity"`  // 每单购买金额（USDT/USDC）
-		MinOrderValue         float64 `yaml:"min_order_value"` // 最小订单价值（USDT），默认6U，小于此值不挂单
-		BuyWindowSize         int     `yaml:"buy_window_size"`
-		SellWindowSize        int     `yaml:"sell_window_size"` // 卖单窗口大小
-		ReconcileInterval     int     `yaml:"reconcile_interval"`
-		OrderCleanupThreshold int     `yaml:"order_cleanup_threshold"`      // 订单清理上限（默认100）
-		CleanupBatchSize      int     `yaml:"cleanup_batch_size"`           // 清理批次大小（默认10）
-		MarginLockDurationSec int     `yaml:"margin_lock_duration_seconds"` // 保证金锁定时间（秒，默认10）
-		PositionSafetyCheck   int     `yaml:"position_safety_check"`        // 持仓安全性检查（默认100，最少能向下持有多少仓）
-		// 注意：price_decimals 和 quantity_decimals 已废弃，现在从交易所自动获取
-	} `yaml:"trading"`
+	Trading TradingConfig `yaml:"trading"`
 
 	System struct {
 		LogLevel     string `yaml:"log_level"`
@@ -163,6 +190,13 @@ func (c *Config) Validate() error {
 	// 注意：price_decimals 和 quantity_decimals 已从配置中移除，现在从交易所自动获取
 	if c.Trading.MinOrderValue <= 0 {
 		c.Trading.MinOrderValue = 20.0 // 默认6U (币安通常最小5U)
+	}
+	if !c.Trading.maxMarginUsagePercentSet && c.Trading.MaxMarginUsagePercent == 0 {
+		c.Trading.MaxMarginUsagePercent = 100
+	}
+	if math.IsNaN(c.Trading.MaxMarginUsagePercent) || math.IsInf(c.Trading.MaxMarginUsagePercent, 0) ||
+		c.Trading.MaxMarginUsagePercent <= 0 || c.Trading.MaxMarginUsagePercent > 100 {
+		return fmt.Errorf("最大保证金占用比例必须大于0且不超过100 (trading.max_margin_usage_percent)")
 	}
 
 	// 设置默认时间间隔

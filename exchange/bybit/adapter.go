@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc64"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"opensqt/exchange/exchangeerr"
@@ -27,7 +29,7 @@ type BybitAdapter struct {
 	quantityDecimals int
 	baseAsset        string
 	quoteAsset       string
-	accountLeverage  int
+	accountLeverage  atomic.Int64
 }
 
 type orderIDMapper struct {
@@ -451,6 +453,19 @@ func (b *BybitAdapter) GetAccount(ctx context.Context) (*Account, error) {
 	if len(result.List) == 0 {
 		return nil, fmt.Errorf("Bybit 钱包信息为空")
 	}
+	item := result.List[0]
+	walletBalance, err := parseFiniteAccountFloat("totalWalletBalance", item.TotalWalletBalance)
+	if err != nil {
+		return nil, err
+	}
+	marginBalance, err := parseFiniteAccountFloat("totalMarginBalance", item.TotalMarginBalance)
+	if err != nil {
+		return nil, err
+	}
+	availableBalance, err := parseFiniteAccountFloat("totalAvailableBalance", item.TotalAvailableBalance)
+	if err != nil {
+		return nil, err
+	}
 
 	positions, err := b.GetPositions(ctx, b.symbol)
 	if err != nil {
@@ -464,13 +479,12 @@ func (b *BybitAdapter) GetAccount(ctx context.Context) (*Account, error) {
 			break
 		}
 	}
-	b.accountLeverage = leverage
+	b.accountLeverage.Store(int64(leverage))
 
-	item := result.List[0]
 	return &Account{
-		TotalWalletBalance: parseFloat(item.TotalWalletBalance),
-		TotalMarginBalance: parseFloat(item.TotalMarginBalance),
-		AvailableBalance:   parseFloat(item.TotalAvailableBalance),
+		TotalWalletBalance: walletBalance,
+		TotalMarginBalance: marginBalance,
+		AvailableBalance:   availableBalance,
 		Positions:          positions,
 		AccountLeverage:    leverage,
 	}, nil
@@ -746,6 +760,21 @@ func formatWithDecimals(value float64, decimals int) string {
 func parseFloat(value string) float64 {
 	parsed, _ := strconv.ParseFloat(value, 64)
 	return parsed
+}
+
+func parseFiniteAccountFloat(field, value string) (float64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("Bybit 账户字段 %s 缺失", field)
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("解析 Bybit 账户字段 %s 失败: %w", field, err)
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("Bybit 账户字段 %s 不是有限数值: %q", field, value)
+	}
+	return parsed, nil
 }
 
 func parseInt(value string) int {

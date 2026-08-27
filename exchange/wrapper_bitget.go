@@ -2,12 +2,24 @@ package exchange
 
 import (
 	"context"
+	"strings"
+
 	"opensqt/exchange/bitget"
 )
 
+// bitgetCancellationBackend 只暴露按交易对查询与撤单能力，避免 wrapper
+// 意外调用 Bitget 会波及同产品其它交易对的一键全撤接口。
+type bitgetCancellationBackend interface {
+	GetOpenOrders(ctx context.Context, symbol string) ([]*bitget.Order, error)
+	BatchCancelOrders(ctx context.Context, symbol string, orderIDs []int64) error
+}
+
+var _ bitgetCancellationBackend = (*bitget.BitgetAdapter)(nil)
+
 // bitgetWrapper 包装 Bitget 适配器以实现 IExchange 接口
 type bitgetWrapper struct {
-	adapter *bitget.BitgetAdapter
+	adapter             *bitget.BitgetAdapter
+	cancellationBackend bitgetCancellationBackend
 }
 
 func (w *bitgetWrapper) GetName() string {
@@ -99,11 +111,39 @@ func (w *bitgetWrapper) BatchCancelOrders(ctx context.Context, symbol string, or
 	return w.adapter.BatchCancelOrders(ctx, symbol, orderIDs)
 }
 
-// CancelAllOrders 撤销所有订单（Bitget实现）
-// 使用Bitget一键全撤API，更高效且可靠
+// CancelAllOrders 仅撤销指定交易对的全部未完成订单。
+// 禁止调用 Bitget 产品级一键全撤 API，否则会影响同产品下的其它交易对。
 func (w *bitgetWrapper) CancelAllOrders(ctx context.Context, symbol string) error {
-	// Bitget特有的一键全撤API，不需要查询订单列表
-	return w.adapter.CancelAllOrders(ctx)
+	backend := w.cancellationBackend
+	if backend == nil {
+		backend = w.adapter
+	}
+
+	openOrders, err := backend.GetOpenOrders(ctx, symbol)
+	if err != nil {
+		return err
+	}
+
+	orderIDs := make([]int64, 0, len(openOrders))
+	for _, order := range openOrders {
+		if order == nil || order.OrderID <= 0 || !sameBitgetSymbol(order.Symbol, symbol) {
+			continue
+		}
+		orderIDs = append(orderIDs, order.OrderID)
+	}
+	if len(orderIDs) == 0 {
+		return nil
+	}
+
+	return backend.BatchCancelOrders(ctx, symbol, orderIDs)
+}
+
+func sameBitgetSymbol(left, right string) bool {
+	normalize := func(symbol string) string {
+		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		return strings.TrimSuffix(symbol, "_UMCBL")
+	}
+	return normalize(left) != "" && normalize(left) == normalize(right)
 }
 
 func (w *bitgetWrapper) GetOrder(ctx context.Context, symbol string, orderID int64) (*Order, error) {

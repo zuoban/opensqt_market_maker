@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"reflect"
@@ -55,8 +57,9 @@ func main() {
 
 	logger.Info("✅ 配置加载成功: 交易对=%s, 窗口大小=%d, 当前交易所=%s",
 		cfg.Trading.Symbol, cfg.Trading.BuyWindowSize, cfg.App.CurrentExchange)
+	logger.Info("🧮 保证金占用上限: %.2f%%", cfg.Trading.MaxMarginUsagePercent)
 	if !cfg.System.CancelOnExit {
-		logger.Warn("⚠️ system.cancel_on_exit=false：进程退出后交易所挂单会被保留，请确认这是预期行为")
+		logger.Warn("⚠️ system.cancel_on_exit=false：普通退出会保留交易所挂单；保证金硬限制已锁存时仍会强制全撤")
 	}
 
 	// 2. 创建交易所实例（使用工厂模式）
@@ -273,68 +276,89 @@ func main() {
 		logger.Fatalf("❌ 主动风控未就绪，已拒绝启动交易")
 	}
 
+	// 从保证金守卫启动前就接管退出信号。这样启动首读已经超限、正在执行
+	// 安全全撤时收到 SIGINT/SIGTERM，也不会被默认信号处理直接打断。
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 保证金守卫是交易关键依赖，独立于可关闭、可失败的只读面板。
+	marginMonitor := safety.NewMarginMonitor(cfg, ex)
+	if err := marginMonitor.Start(ctx); err != nil {
+		logger.Fatalf("❌ 启动保证金守卫失败，已拒绝启动交易: %v", err)
+	}
+	if !marginMonitor.IsReady() {
+		logger.Fatalf("❌ 保证金守卫未就绪，已拒绝启动交易")
+	}
+
 	orderGate := newSerializedOrderGate(exchangeExecutor)
 	gateRuntime := newTradingGateRuntime(
 		orderGate,
 		ex,
 		priceMonitor,
 		riskMonitor,
+		marginMonitor,
 		reconciler,
 		superPositionManager,
 		configuredPriceStaleAfter(cfg.Timing.PriceSendInterval),
 		time.Duration(cfg.Trading.ReconcileInterval)*time.Second,
 	)
-	// 首次评估会在所有健康条件成立后放行，并立即执行第一次 AdjustOrders。
-	if err := gateRuntime.Start(ctx); err != nil {
-		logger.Fatalf("❌ 启动交易门禁失败，已拒绝启动交易: %v", err)
+	marginMonitor.SetLimitHandler(gateRuntime.handleMarginLimit)
+	shutdownRequested := consumePendingShutdownSignal(sigChan)
+	if shutdownRequested {
+		logger.Warn("⚠️ 交易门禁启动前已收到退出信号，跳过首次挂单并直接进入安全关闭")
+	} else {
+		// 首次评估会在所有健康条件成立后放行，并立即执行第一次 AdjustOrders。
+		if err := gateRuntime.Start(ctx); err != nil {
+			logger.Fatalf("❌ 启动交易门禁失败，已拒绝启动交易: %v", err)
+		}
 	}
 
-	// === 创建订单清理器（从仓位管理器剥离） ===
-	orderCleaner := safety.NewOrderCleaner(cfg, exchangeExecutor, superPositionManager)
-	// 启动订单清理协程
-	orderCleaner.Start(ctx)
-
-	// 启动只读监控面板（失败不影响交易）
+	// 启动只读监控面板（失败不影响交易）。预启动信号已入队时
+	// 不再创建任何运行期后台组件，保持执行器 fail-closed。
 	var dash *web.Server
-	if cfg.DashboardEnabled() {
-		dash = web.New(web.Options{
-			Cfg:       cfg,
-			Version:   Version,
-			StartedAt: programStartedAt,
-			Price:     priceMonitor,
-			Position:  superPositionManager,
-			Risk:      riskMonitor,
-			Exchange:  ex,
-		})
-		go func() {
-			if err := dash.Start(); err != nil {
-				logger.Error("❌ 监控面板启动失败: %v（交易继续运行）", err)
-			}
-		}()
-	}
+	if !shutdownRequested {
+		// === 创建订单清理器（从仓位管理器剥离） ===
+		orderCleaner := safety.NewOrderCleaner(cfg, exchangeExecutor, superPositionManager)
+		orderCleaner.Start(ctx)
 
-	// 13. 定期打印持仓和订单状态
-	go func() {
-		statusInterval := time.Duration(cfg.Timing.StatusPrintInterval) * time.Minute
-		ticker := time.NewTicker(statusInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// 风控触发时不打印状态
-				if !riskMonitor.IsTriggered() {
-					superPositionManager.PrintPositions()
+		if cfg.DashboardEnabled() {
+			dash = web.New(web.Options{
+				Cfg:       cfg,
+				Version:   Version,
+				StartedAt: programStartedAt,
+				Price:     priceMonitor,
+				Position:  superPositionManager,
+				Risk:      riskMonitor,
+				Margin:    marginMonitor,
+				Exchange:  ex,
+			})
+			go func() {
+				if err := dash.Start(); err != nil {
+					logger.Error("❌ 监控面板启动失败: %v（交易继续运行）", err)
+				}
+			}()
+		}
+
+		go func() {
+			statusInterval := time.Duration(cfg.Timing.StatusPrintInterval) * time.Minute
+			ticker := time.NewTicker(statusInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					// 风控触发时不打印状态
+					if !riskMonitor.IsTriggered() {
+						superPositionManager.PrintPositions()
+					}
 				}
 			}
-		}
-	}()
+		}()
 
-	// 14. 等待退出信号
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+		// 14. 等待退出信号
+		<-sigChan
+	}
 	signal.Stop(sigChan)
 
 	logger.Info("🛑 收到退出信号，开始优雅关闭...")
@@ -343,16 +367,27 @@ func main() {
 	logger.Info("⏹️ 正在关闭交易门禁...")
 	gateRuntime.Stop()
 
-	// 第二优先级：按显式配置决定是否全撤；默认开启并确认远端为空。
-	if cfg.System.CancelOnExit {
+	// 第二优先级：普通退出按显式配置决定是否全撤；保证金硬限制已经锁存时
+	// 必须完成其安全动作，不能被 cancel_on_exit=false 覆盖。
+	marginLimitTriggered := stopMarginMonitorAndReadTriggered(marginMonitor)
+	if shouldCancelOrdersOnShutdown(cfg.System.CancelOnExit, marginLimitTriggered) {
+		if marginLimitTriggered && !cfg.System.CancelOnExit {
+			logger.Warn("⚠️ 保证金限制已锁存，忽略 system.cancel_on_exit=false 并强制全撤")
+		}
 		logger.Info("🔄 正在撤销并确认所有订单...")
-		cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := cancelAllOrdersAndConfirm(cancelCtx, ex, cfg.Trading.Symbol); err != nil {
-			logger.Error("❌ 全撤确认失败: %v", err)
+		var cancelErr error
+		if marginLimitTriggered {
+			cancelErr = cleanupMarginOrdersOnShutdown(context.Background(), ex, cfg.Trading.Symbol)
+		} else {
+			cancelCtx, cancelTimeout := context.WithTimeout(context.Background(), startupCancelTimeout)
+			cancelErr = cancelAllOrdersAndConfirm(cancelCtx, ex, cfg.Trading.Symbol)
+			cancelTimeout()
+		}
+		if cancelErr != nil {
+			logger.Error("❌ 全撤确认失败: %v", cancelErr)
 		} else {
 			logger.Info("✅ 已确认远端挂单为空")
 		}
-		cancelTimeout()
 	} else {
 		logger.Warn("⚠️ 已按 system.cancel_on_exit=false 保留交易所挂单")
 	}
@@ -388,6 +423,146 @@ func main() {
 	logger.Close()
 
 	logger.Info("✅ 系统已安全退出 www.OpenSQT.com")
+}
+
+func shouldCancelOrdersOnShutdown(cancelOnExit, marginLimitTriggered bool) bool {
+	return cancelOnExit || marginLimitTriggered
+}
+
+func consumePendingShutdownSignal(signals <-chan os.Signal) bool {
+	select {
+	case <-signals:
+		return true
+	default:
+		return false
+	}
+}
+
+type shutdownMarginMonitor interface {
+	Stop()
+	IsTriggered() bool
+}
+
+// stopMarginMonitorAndReadTriggered 先等待在途账户刷新与 handler 全部退出，
+// 再读取不会继续变化的锁存状态。
+func stopMarginMonitorAndReadTriggered(monitor shutdownMarginMonitor) bool {
+	if monitor == nil {
+		return false
+	}
+	monitor.Stop()
+	return monitor.IsTriggered()
+}
+
+type shutdownAuditClock interface {
+	Now() time.Time
+	Wait(context.Context, time.Duration) error
+}
+
+type realShutdownAuditClock struct{}
+
+func (realShutdownAuditClock) Now() time.Time { return time.Now() }
+
+func (realShutdownAuditClock) Wait(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// cleanupMarginOrdersOnShutdown 在单一、绝对的 15 秒截止时间内完成
+// 初始稳定全撤和迟到订单复查，不因反复发现残单而无限延长停机。
+func cleanupMarginOrdersOnShutdown(
+	parent context.Context,
+	ex cancelAllOrdersExchange,
+	symbol string,
+) error {
+	if parent == nil {
+		return fmt.Errorf("保证金停机清理上下文不能为空")
+	}
+	if ex == nil {
+		return fmt.Errorf("保证金停机清理交易所不能为空")
+	}
+
+	clock := realShutdownAuditClock{}
+	deadline := clock.Now().Add(marginAuditWindow)
+	if parentDeadline, ok := parent.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	ctx, cancel := context.WithDeadline(parent, deadline)
+	defer cancel()
+	return cleanupMarginOrdersOnShutdownUntil(ctx, ex, symbol, clock, deadline)
+}
+
+func cleanupMarginOrdersOnShutdownUntil(
+	ctx context.Context,
+	ex cancelAllOrdersExchange,
+	symbol string,
+	clock shutdownAuditClock,
+	deadline time.Time,
+) error {
+	if ctx == nil {
+		return fmt.Errorf("保证金停机清理上下文不能为空")
+	}
+	if ex == nil {
+		return fmt.Errorf("保证金停机清理交易所不能为空")
+	}
+	if clock == nil || deadline.IsZero() {
+		return fmt.Errorf("保证金停机清理时钟未初始化")
+	}
+
+	if err := cancelAllOrdersAndConfirmStable(ctx, ex, symbol, marginCancelStableReads); err != nil {
+		return fmt.Errorf("保证金停机稳定全撤失败: %w", err)
+	}
+
+	nextAudit := clock.Now().Add(marginAuditInterval)
+	var lastAuditErr error
+	for {
+		now := clock.Now()
+		if !now.Before(deadline) {
+			return lastAuditErr
+		}
+
+		wakeAt := nextAudit
+		if wakeAt.After(deadline) {
+			wakeAt = deadline
+		}
+		if err := clock.Wait(ctx, wakeAt.Sub(now)); err != nil {
+			if !clock.Now().Before(deadline) && errors.Is(err, context.DeadlineExceeded) {
+				return lastAuditErr
+			}
+			return errors.Join(lastAuditErr, fmt.Errorf("保证金停机复查等待失败: %w", err))
+		}
+
+		now = clock.Now()
+		if !now.Before(deadline) {
+			return lastAuditErr
+		}
+		nextAudit = now.Add(marginAuditInterval)
+
+		openOrders, err := ex.GetOpenOrders(ctx, symbol)
+		if err != nil {
+			lastAuditErr = fmt.Errorf("保证金停机迟到订单复查失败: %w", err)
+			logger.Warn("⚠️ %v，将在截止时间前继续重试", lastAuditErr)
+			continue
+		}
+		if len(openOrders) == 0 {
+			lastAuditErr = nil
+			continue
+		}
+
+		logger.Warn("🚨 保证金停机复查发现 %d 个迟到挂单，再次执行当前交易对全撤", len(openOrders))
+		if err := cancelAllOrdersAndConfirm(ctx, ex, symbol); err != nil {
+			return fmt.Errorf("保证金停机迟到订单全撤失败: %w", err)
+		}
+		lastAuditErr = nil
+	}
 }
 
 // positionExchangeAdapter 适配器，将 exchange.IExchange 转换为 position.IExchange

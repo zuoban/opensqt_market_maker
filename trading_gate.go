@@ -17,11 +17,14 @@ import (
 )
 
 const (
-	minimumPriceStaleAfter = 30 * time.Second
-	gateHealthPollInterval = 200 * time.Millisecond
-	recoveryReconcileDelay = 5 * time.Second
-	cancelConfirmInterval  = 250 * time.Millisecond
-	startupCancelTimeout   = 10 * time.Second
+	minimumPriceStaleAfter  = 30 * time.Second
+	gateHealthPollInterval  = 200 * time.Millisecond
+	recoveryReconcileDelay  = 5 * time.Second
+	cancelConfirmInterval   = 250 * time.Millisecond
+	startupCancelTimeout    = 10 * time.Second
+	marginCancelStableReads = 3
+	marginAuditInterval     = 2 * time.Second
+	marginAuditWindow       = 15 * time.Second
 )
 
 var errTradingGateShuttingDown = errors.New("交易门禁正在关闭")
@@ -32,16 +35,19 @@ type tradingGateHealth struct {
 	OrderStreamState string
 	RiskReady        bool
 	RiskTriggered    bool
+	MarginReady      bool
+	MarginTriggered  bool
 	ReconcilerReady  bool
 	PriceFresh       bool
 }
 
 func (h tradingGateHealth) CanTrade() bool {
-	return h.OrderStreamReady && h.RiskReady && !h.RiskTriggered && h.ReconcilerReady && h.PriceFresh
+	return h.OrderStreamReady && h.RiskReady && !h.RiskTriggered && h.MarginReady &&
+		!h.MarginTriggered && h.ReconcilerReady && h.PriceFresh
 }
 
 func (h tradingGateHealth) Reasons() []string {
-	reasons := make([]string, 0, 5)
+	reasons := make([]string, 0, 7)
 	if !h.OrderStreamReady {
 		state := h.OrderStreamState
 		if state == "" {
@@ -54,6 +60,12 @@ func (h tradingGateHealth) Reasons() []string {
 	}
 	if h.RiskTriggered {
 		reasons = append(reasons, "风控已触发")
+	}
+	if !h.MarginReady {
+		reasons = append(reasons, "保证金守卫未就绪")
+	}
+	if h.MarginTriggered {
+		reasons = append(reasons, "保证金限制已触发")
 	}
 	if !h.ReconcilerReady {
 		reasons = append(reasons, "对账不健康")
@@ -118,6 +130,12 @@ type tradingPositionManager interface {
 	CancelAllBuyOrders() error
 	AdjustOrders(currentPrice float64) error
 	GetSymbol() string
+}
+
+type marginGateMonitor interface {
+	IsReady() bool
+	IsTriggered() bool
+	Snapshot() safety.MarginSnapshot
 }
 
 // serializedOrderGate 串行化 Enable/Stop 与停机，防止健康监控和价格协程交错后重新放单。
@@ -193,14 +211,17 @@ type tradingGateRuntime struct {
 	exchange   exchange.IExchange
 	price      *monitor.PriceMonitor
 	risk       *safety.RiskMonitor
+	margin     marginGateMonitor
 	reconciler *safety.Reconciler
 	position   tradingPositionManager
 
-	priceStaleAfter  time.Duration
-	reconcileEvery   time.Duration
-	wake             chan struct{}
-	needsReconcile   atomic.Bool
-	withdrawRequired atomic.Bool
+	priceStaleAfter   time.Duration
+	reconcileEvery    time.Duration
+	wake              chan struct{}
+	needsReconcile    atomic.Bool
+	withdrawRequired  atomic.Bool
+	cancelAllRequired atomic.Bool
+	marginCancelDone  atomic.Bool
 
 	lifecycleMu sync.Mutex
 	cancel      context.CancelFunc
@@ -208,6 +229,8 @@ type tradingGateRuntime struct {
 
 	// 以下字段仅由协调协程访问。
 	nextRecoveryReconcile time.Time
+	nextMarginAudit       time.Time
+	marginAuditUntil      time.Time
 	lastHealth            tradingGateHealth
 	hasLastHealth         bool
 }
@@ -217,6 +240,7 @@ func newTradingGateRuntime(
 	ex exchange.IExchange,
 	price *monitor.PriceMonitor,
 	risk *safety.RiskMonitor,
+	margin marginGateMonitor,
 	reconciler *safety.Reconciler,
 	positionManager tradingPositionManager,
 	priceStaleAfter time.Duration,
@@ -233,6 +257,7 @@ func newTradingGateRuntime(
 		exchange:        ex,
 		price:           price,
 		risk:            risk,
+		margin:          margin,
 		reconciler:      reconciler,
 		position:        positionManager,
 		priceStaleAfter: priceStaleAfter,
@@ -271,6 +296,36 @@ func (r *tradingGateRuntime) disableForRecovery(reason error, invalidate bool) b
 	return true
 }
 
+// handleMarginLimit 将撤单要求单调升级为 ALL。即使门禁已经因其它健康条件
+// 关闭，也必须保留这次全撤请求；全撤确认后本次运行仍保持锁存停单。
+func (r *tradingGateRuntime) handleMarginLimit(snap safety.MarginSnapshot) {
+	if r == nil {
+		return
+	}
+	if r.gate != nil {
+		r.gate.Disable()
+	}
+	r.withdrawRequired.Store(false)
+	r.needsReconcile.Store(true)
+	if r.marginCancelDone.Load() {
+		// done 一旦锁存，required 就不再有合法的 true 状态。
+		// 同时自愈旧健康观察可能遗留的过期请求。
+		r.cancelAllRequired.Store(false)
+	} else if r.cancelAllRequired.CompareAndSwap(false, true) {
+		// 全撤可能在上面的 done 读取与 CAS 之间完成。
+		// 成功结果一旦锁存，旧健康观察不得重新武装全撤。
+		if r.marginCancelDone.Load() {
+			r.cancelAllRequired.Store(false)
+		} else {
+			reason := fmt.Errorf("保证金占用 %.2f%% 超过限制 %.2f%%", snap.UsagePercent, snap.LimitPercent)
+			if r.reconciler != nil {
+				r.reconciler.Invalidate(reason)
+			}
+		}
+	}
+	r.signal()
+}
+
 // handleReconcileHealth 必须保持非阻塞；不健康时先在执行边界立即停新单。
 func (r *tradingGateRuntime) handleReconcileHealth(healthy bool, err error) {
 	if !healthy {
@@ -281,11 +336,19 @@ func (r *tradingGateRuntime) handleReconcileHealth(healthy bool, err error) {
 
 func (r *tradingGateRuntime) snapshot() tradingGateHealth {
 	orderReady, orderState := currentOrderStreamHealth(r.exchange)
+	marginReady := false
+	marginTriggered := false
+	if r.margin != nil {
+		marginReady = r.margin.IsReady()
+		marginTriggered = r.margin.IsTriggered()
+	}
 	return tradingGateHealth{
 		OrderStreamReady: orderReady,
 		OrderStreamState: orderState,
 		RiskReady:        r.risk.IsReady(),
 		RiskTriggered:    r.risk.IsTriggered(),
+		MarginReady:      marginReady,
+		MarginTriggered:  marginTriggered,
 		ReconcilerReady:  r.reconciler.IsHealthy(),
 		PriceFresh:       r.price.GetLastPrice() > 0 && priceIsFresh(r.price.GetLastPriceTime(), time.Now(), r.priceStaleAfter),
 	}
@@ -320,6 +383,14 @@ func (r *tradingGateRuntime) enforceSubmissionHealth(health tradingGateHealth, n
 		return nil
 	}
 	recoveryErr := fmt.Errorf("下单边界健康复检失败: %w", guardErr)
+	if health.MarginTriggered {
+		snap := safety.MarginSnapshot{Triggered: true}
+		if r.margin != nil {
+			snap = r.margin.Snapshot()
+		}
+		r.handleMarginLimit(snap)
+		return recoveryErr
+	}
 	r.disableForRecovery(recoveryErr, health.ReconcilerReady)
 	return recoveryErr
 }
@@ -328,10 +399,17 @@ func (r *tradingGateRuntime) enforceSubmissionHealth(health tradingGateHealth, n
 func (r *tradingGateRuntime) observeHealth(ctx context.Context) {
 	observe := func() {
 		health := r.snapshot()
+		if health.MarginTriggered {
+			snap := safety.MarginSnapshot{Triggered: true}
+			if r.margin != nil {
+				snap = r.margin.Snapshot()
+			}
+			r.handleMarginLimit(snap)
+		}
 		if !health.OrderStreamReady && r.needsReconcile.CompareAndSwap(false, true) {
 			r.reconciler.Invalidate(fmt.Errorf("订单流不健康: %s", health.OrderStreamState))
 		}
-		if !health.CanTrade() {
+		if !health.CanTrade() && !health.MarginTriggered {
 			r.disableForRecovery(
 				fmt.Errorf("交易健康恶化: %s", strings.Join(health.Reasons(), ", ")),
 				health.ReconcilerReady,
@@ -413,10 +491,17 @@ func (r *tradingGateRuntime) run(ctx context.Context, initialResult chan<- error
 		return
 	}
 	if !r.gate.Enabled() {
-		initialResult <- r.rollbackFailedStart(
-			fmt.Errorf("交易门禁初始条件不满足: %s", strings.Join(r.snapshot().Reasons(), ", ")),
-		)
-		return
+		health := r.snapshot()
+		marginDormant := health.MarginTriggered &&
+			r.marginCancelDone.Load() &&
+			!r.cancelAllRequired.Load()
+		if !marginDormant {
+			initialResult <- r.rollbackFailedStart(
+				fmt.Errorf("交易门禁初始条件不满足: %s", strings.Join(health.Reasons(), ", ")),
+			)
+			return
+		}
+		logger.Warn("⛔ 首轮账户读数已触发保证金限制，交易门禁保持关闭，程序以锁存停单态继续运行")
 	}
 	initialResult <- nil
 
@@ -474,6 +559,15 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 		return err
 	}
 
+	if r.cancelAllRequired.Load() {
+		if err := r.processMarginFullCancel(ctx); err != nil {
+			return err
+		}
+	}
+	if err := r.auditLateMarginOrders(ctx, time.Now()); err != nil {
+		return err
+	}
+
 	if r.withdrawRequired.Load() {
 		logger.Warn("🚨 交易健康恶化，停止新单并撤销全部买单")
 		if err := r.position.CancelAllBuyOrders(); err != nil {
@@ -495,6 +589,11 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 	}
 	r.lastHealth = health
 	r.hasLastHealth = true
+
+	if health.MarginTriggered {
+		r.handleMarginLimit(r.margin.Snapshot())
+		return nil
+	}
 
 	if r.needsReconcile.Load() && health.OrderStreamReady && !time.Now().Before(r.nextRecoveryReconcile) {
 		logger.Info("🔄 订单流恢复，放行前执行强制对账...")
@@ -543,7 +642,7 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 			)
 			return nil
 		}
-		logger.Info("✅ 订单流、风控、对账和价格均健康，交易门禁已放行")
+		logger.Info("✅ 订单流、风控、保证金、对账和价格均健康，交易门禁已放行")
 		return nil
 	}
 
@@ -560,17 +659,102 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 	return nil
 }
 
+func (r *tradingGateRuntime) processMarginFullCancel(ctx context.Context) error {
+	if r == nil || !r.cancelAllRequired.Load() {
+		return nil
+	}
+	if ctx == nil {
+		return fmt.Errorf("保证金限制全撤上下文不能为空")
+	}
+	if r.exchange == nil || r.position == nil {
+		return fmt.Errorf("保证金限制全撤依赖未初始化")
+	}
+
+	logger.Warn("🚨 保证金限制已触发，停止所有新单并撤销当前交易对全部挂单")
+	cancelCtx, cancel := context.WithTimeout(ctx, startupCancelTimeout)
+	err := cancelAllOrdersAndConfirmStable(cancelCtx, r.exchange, r.position.GetSymbol(), marginCancelStableReads)
+	cancel()
+	if err != nil {
+		cancelErr := fmt.Errorf("保证金限制全撤确认失败: %w", err)
+		r.needsReconcile.Store(true)
+		if r.reconciler != nil {
+			r.reconciler.Invalidate(cancelErr)
+		}
+		return cancelErr
+	}
+	r.marginCancelDone.Store(true)
+	r.cancelAllRequired.Store(false)
+	r.withdrawRequired.Store(false)
+	now := time.Now()
+	r.nextMarginAudit = now.Add(marginAuditInterval)
+	r.marginAuditUntil = now.Add(marginAuditWindow)
+	logger.Warn("⛔ 保证金限制已锁存，当前交易对远端挂单已确认为空；本次运行不会自动恢复挂单")
+	return ctx.Err()
+}
+
+// auditLateMarginOrders 在首次全撤后的有界窗口内低频检查迟到受理订单。
+// 空结果只消耗一次查询；只有发现残单才再次执行当前交易对全撤。
+func (r *tradingGateRuntime) auditLateMarginOrders(ctx context.Context, now time.Time) error {
+	if r == nil || !r.marginCancelDone.Load() || r.exchange == nil || r.position == nil {
+		return nil
+	}
+	if ctx == nil {
+		return fmt.Errorf("保证金限制迟到订单复查上下文不能为空")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if r.marginAuditUntil.IsZero() || !now.Before(r.marginAuditUntil) || now.Before(r.nextMarginAudit) {
+		return nil
+	}
+	r.nextMarginAudit = now.Add(marginAuditInterval)
+
+	auditCtx, cancel := context.WithTimeout(ctx, startupCancelTimeout)
+	defer cancel()
+	openOrders, err := r.exchange.GetOpenOrders(auditCtx, r.position.GetSymbol())
+	if err != nil {
+		return fmt.Errorf("保证金限制迟到订单复查失败: %w", err)
+	}
+	if len(openOrders) == 0 {
+		return nil
+	}
+
+	// 先延长窗口，确保本次撤单失败时后续仍会继续复查和重试。
+	r.marginAuditUntil = now.Add(marginAuditWindow)
+	logger.Warn("🚨 保证金限制锁存后发现 %d 个迟到挂单，再次执行当前交易对全撤", len(openOrders))
+	if err := cancelAllOrdersAndConfirm(auditCtx, r.exchange, r.position.GetSymbol()); err != nil {
+		return fmt.Errorf("保证金限制迟到订单全撤失败: %w", err)
+	}
+	return nil
+}
+
 // cancelAllOrdersAndConfirm 在上下文期限内持续全撤并查询，只有远端挂单确认为空才成功。
 func cancelAllOrdersAndConfirm(ctx context.Context, ex cancelAllOrdersExchange, symbol string) error {
+	return cancelAllOrdersAndConfirmStable(ctx, ex, symbol, 1)
+}
+
+// cancelAllOrdersAndConfirmStable 要求连续多次观测远端为空。保证金触发时
+// 执行器会取消在途下单，但交易所仍可能迟到受理已经发出的请求；连续全撤与
+// 空结果确认可以覆盖这段竞态窗口。
+func cancelAllOrdersAndConfirmStable(
+	ctx context.Context,
+	ex cancelAllOrdersExchange,
+	symbol string,
+	stableReads int,
+) error {
 	if ctx == nil {
 		return fmt.Errorf("全撤上下文不能为空")
 	}
 	if ex == nil {
 		return fmt.Errorf("全撤交易所不能为空")
 	}
+	if stableReads <= 0 {
+		stableReads = 1
+	}
 	var lastCancelErr error
 	var lastQueryErr error
 	remaining := -1
+	emptyReads := 0
 
 	for {
 		if err := ex.CancelAllOrders(ctx, symbol); err != nil {
@@ -579,11 +763,17 @@ func cancelAllOrdersAndConfirm(ctx context.Context, ex cancelAllOrdersExchange, 
 		openOrders, err := ex.GetOpenOrders(ctx, symbol)
 		if err != nil {
 			lastQueryErr = err
+			emptyReads = 0
 		} else {
 			lastQueryErr = nil
 			remaining = len(openOrders)
 			if remaining == 0 {
-				return nil
+				emptyReads++
+				if emptyReads >= stableReads {
+					return nil
+				}
+			} else {
+				emptyReads = 0
 			}
 		}
 

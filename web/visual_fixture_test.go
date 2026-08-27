@@ -121,8 +121,13 @@ func visualFixtureSnapshot() map[string]interface{} {
 				},
 			},
 		},
+		"margin": map[string]interface{}{
+			"ready": true, "triggered": false, "usagePercent": 42.32, "limitPercent": 60.0,
+			"usedMargin": 854.25, "marginBalance": 2018.47, "availableBalance": 1164.22,
+			"quoteAsset": "USDT", "updatedAt": time.Now(), "stale": false,
+		},
 		"account": map[string]interface{}{
-			"quoteAsset": "USDT", "available": 1864.22, "margin": 2018.47, "initialMarginReady": true,
+			"quoteAsset": "USDT", "available": 1164.22, "margin": 2018.47, "initialMarginReady": true,
 			"initialMargin": 2000.0, "marginChange": 18.47, "marginChangePct": 0.92, "unrealizedPnl": 11.65,
 		},
 		"logs": []map[string]interface{}{

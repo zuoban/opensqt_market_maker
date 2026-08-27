@@ -67,6 +67,44 @@
                     <div class="kpi loading-card" aria-hidden="true"><i></i><b></b></div>
                 </div>
 
+                <section class="margin-capacity is-waiting" id="marginCapacity"
+                    aria-labelledby="marginCapacityTitle" aria-describedby="marginCapacityNote">
+                    <div class="margin-capacity-head">
+                        <div class="margin-capacity-title">
+                            <span>CAPACITY GUARD / 保证金容量</span>
+                            <h3 id="marginCapacityTitle">持仓 + 挂单冻结</h3>
+                        </div>
+                        <div class="margin-capacity-status" id="marginCapacityStatus" role="status" aria-live="polite">
+                            <i aria-hidden="true"></i><span>等待读数</span>
+                        </div>
+                    </div>
+                    <div class="margin-capacity-body">
+                        <div class="margin-gauge">
+                            <div class="margin-readout">
+                                <span>占用比例</span>
+                                <strong id="marginUsageValue">—</strong>
+                            </div>
+                            <div class="margin-track-wrap">
+                                <div class="margin-track" id="marginTrack" role="progressbar"
+                                    aria-label="保证金占用比例" aria-valuemin="0" aria-valuemax="100">
+                                    <div class="margin-track-grid" aria-hidden="true"></div>
+                                    <div class="margin-fill" id="marginFill" aria-hidden="true"></div>
+                                    <div class="margin-limit" id="marginLimit" aria-hidden="true">
+                                        <span class="margin-limit-flag" id="marginLimitFlag">上限 —</span>
+                                    </div>
+                                </div>
+                                <div class="margin-scale" aria-hidden="true"><span>0%</span><span>50%</span><span>100%</span></div>
+                            </div>
+                        </div>
+                        <dl class="margin-facts">
+                            <div><dt>占用金额</dt><dd id="marginUsedAmount">—</dd></div>
+                            <div><dt>保证金余额</dt><dd id="marginBalanceAmount">—</dd></div>
+                            <div><dt>可用余额</dt><dd id="marginAvailableAmount">—</dd></div>
+                        </dl>
+                    </div>
+                    <p class="margin-capacity-note" id="marginCapacityNote">等待账户保证金读数；触发状态以服务端交易守卫为准。</p>
+                </section>
+
                 <details class="strategy-panel">
                     <summary>
                         <span class="strategy-title"><i aria-hidden="true"></i>策略与运行参数</span>

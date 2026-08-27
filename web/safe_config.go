@@ -9,6 +9,7 @@ type SafeAppConfig struct {
 	PriceInterval  float64  `json:"priceInterval"`
 	OrderQuantity  float64  `json:"orderQuantity"`
 	MinOrderValue  float64  `json:"minOrderValue"`
+	MaxMarginUsage float64  `json:"maxMarginUsagePercent"`
 	BuyWindowSize  int      `json:"buyWindowSize"`
 	SellWindowSize int      `json:"sellWindowSize"`
 	FeeRate        float64  `json:"feeRate"`
@@ -26,6 +27,7 @@ func safeAppView(cfg *config.Config) SafeAppConfig {
 		PriceInterval:  cfg.Trading.PriceInterval,
 		OrderQuantity:  cfg.Trading.OrderQuantity,
 		MinOrderValue:  cfg.Trading.MinOrderValue,
+		MaxMarginUsage: cfg.Trading.MaxMarginUsagePercent,
 		BuyWindowSize:  cfg.Trading.BuyWindowSize,
 		SellWindowSize: cfg.Trading.SellWindowSize,
 		RiskEnabled:    cfg.RiskControl.Enabled,

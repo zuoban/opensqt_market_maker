@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"opensqt/exchange/exchangeerr"
@@ -30,7 +31,7 @@ type BackpackAdapter struct {
 	quantityDecimals int
 	baseAsset        string
 	quoteAsset       string
-	accountLeverage  int
+	accountLeverage  atomic.Int64
 }
 
 type clientIDMapper struct {
@@ -114,7 +115,7 @@ func NewBackpackAdapter(cfg map[string]string, symbol string) (*BackpackAdapter,
 	adapter.wsManager = NewWebSocketManager(client, marketSymbol, symbol, idMapper, adapter.priceDecimals)
 
 	if account, err := adapter.GetAccount(ctx); err == nil {
-		adapter.accountLeverage = account.AccountLeverage
+		adapter.accountLeverage.Store(int64(account.AccountLeverage))
 	}
 
 	return adapter, nil
@@ -394,6 +395,14 @@ func (b *BackpackAdapter) GetAccount(ctx context.Context) (*Account, error) {
 	if err := json.Unmarshal(collateralBody, &collateralResp); err != nil {
 		return nil, fmt.Errorf("解析 Backpack 抵押品信息失败: %w", err)
 	}
+	netEquity, err := parseFiniteAccountFloat("netEquity", collateralResp.NetEquity)
+	if err != nil {
+		return nil, err
+	}
+	availableEquity, err := parseFiniteAccountFloat("netEquityAvailable", collateralResp.NetEquityAvailable)
+	if err != nil {
+		return nil, err
+	}
 
 	positions, err := b.GetPositions(ctx, b.symbol)
 	if err != nil {
@@ -402,14 +411,18 @@ func (b *BackpackAdapter) GetAccount(ctx context.Context) (*Account, error) {
 
 	leverage := int(math.Round(parseFloat(accountResp.LeverageLimit)))
 	if leverage <= 0 {
-		leverage = b.accountLeverage
+		leverage = int(b.accountLeverage.Load())
 	}
-	b.accountLeverage = leverage
+	b.accountLeverage.Store(int64(leverage))
 
 	return &Account{
-		TotalWalletBalance: parseFloat(collateralResp.NetEquity),
-		TotalMarginBalance: parseFloat(collateralResp.NetEquityLocked),
-		AvailableBalance:   parseFloat(collateralResp.NetEquityAvailable),
+		TotalWalletBalance: netEquity,
+		// netEquity 是账户总净值，netEquityLocked 只是其中已锁定的部分。
+		// 通用 Account 的 TotalMarginBalance 必须与其它交易所一样表示
+		// 可用余额的总分母，否则用 (margin-available)/margin 计算占用率
+		// 会把锁定额误当总额，甚至得到负数。
+		TotalMarginBalance: netEquity,
+		AvailableBalance:   availableEquity,
 		Positions:          positions,
 		AccountLeverage:    leverage,
 	}, nil
@@ -433,6 +446,7 @@ func (b *BackpackAdapter) GetPositions(ctx context.Context, symbol string) ([]*P
 		return nil, fmt.Errorf("解析 Backpack 持仓失败: %w", err)
 	}
 
+	leverage := int(b.accountLeverage.Load())
 	positions := make([]*Position, 0, len(response))
 	for _, item := range response {
 		displaySymbol := symbol
@@ -445,7 +459,7 @@ func (b *BackpackAdapter) GetPositions(ctx context.Context, symbol string) ([]*P
 			EntryPrice:     parseFloat(item.EntryPrice),
 			MarkPrice:      parseFloat(item.MarkPrice),
 			UnrealizedPNL:  parseFloat(item.PnlUnrealized),
-			Leverage:       b.accountLeverage,
+			Leverage:       leverage,
 			MarginType:     "cross",
 			IsolatedMargin: 0,
 		})
@@ -765,6 +779,21 @@ func formatWithDecimals(value float64, decimals int) string {
 func parseFloat(value string) float64 {
 	parsed, _ := strconv.ParseFloat(value, 64)
 	return parsed
+}
+
+func parseFiniteAccountFloat(field, value string) (float64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("Backpack 账户字段 %s 缺失", field)
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("解析 Backpack 账户字段 %s 失败: %w", field, err)
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return 0, fmt.Errorf("Backpack 账户字段 %s 不是有限数值: %q", field, value)
+	}
+	return parsed, nil
 }
 
 func parseInt64(value string) int64 {

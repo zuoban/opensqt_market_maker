@@ -137,11 +137,14 @@ opensqt_platform/
      symbol: "ETHUSDT"       # 交易对
      price_interval: 2       # 网格间距 (价格)
      order_quantity: 30      # 每格投入金额 (USDT)
+     max_margin_usage_percent: 80 # 最大保证金占用比例，范围 (0,100]，默认100
      buy_window_size: 10     # 买单挂单数量
      sell_window_size: 10    # 卖单挂单数量
    ```
 
-也可以只使用 `.env`（例如 `OPENSQT_EXCHANGES_BINANCE_API_KEY`），不必提供 `config.yaml`。若两者都有，非空环境变量优先。完整变量列表见 [.env.example](.env.example)。
+保证金占用比例按 `(保证金余额 - 可用余额) / 保证金余额 × 100%` 计算，既包含持仓占用，也包含未成交挂单冻结。超过 `max_margin_usage_percent` 后，程序会锁存停止新单，并撤销该交易对的全部挂单；即使占用比例随后下降，本次运行也不会自动恢复，需人工确认账户状态后重启。首次账户读数已经超限时，确认全撤后程序会以停单态继续运行，方便从只读面板观察；首次全撤后的 15 秒内还会每 2 秒复查一次迟到挂单。限制已经锁存时，即使配置了 `system.cancel_on_exit: false`，退出过程仍会强制全撤，并在固定 15 秒窗口内复查迟到挂单。
+
+也可以只使用 `.env`（例如 `OPENSQT_EXCHANGES_BINANCE_API_KEY`），不必提供 `config.yaml`。若两者都有，非空环境变量优先。保证金限制对应环境变量为 `OPENSQT_TRADING_MAX_MARGIN_USAGE_PERCENT`；完整变量列表见 [.env.example](.env.example)。
 
 ### 运行 (Usage)
 
