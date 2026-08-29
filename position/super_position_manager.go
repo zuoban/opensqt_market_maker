@@ -810,11 +810,9 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 
 			// 候选收集后持仓可能已被终态修正。名义价值和提交数量都必须使用
 			// 当前锁内值，不能沿用候选快照。
-			minValue := spm.config.Trading.MinOrderValue
-			if minValue <= 0 {
-				minValue = 6.0
-			}
-			if sellPrice*currentQty < minValue {
+			// 已有持仓必须尽量挂出 ReduceOnly 卖单。数量精度四舍五入后名义价值
+			// 可能略低于 min_order_value，若因此跳过，槽位会永久有仓却补不出对向单。
+			if spm.reduceOnlyNotionalTooSmall(sellPrice, currentQty) {
 				slot.mu.Unlock()
 				continue
 			}
@@ -903,9 +901,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				continue
 			}
 
-			quantity := spm.config.Trading.OrderQuantity / price
-			// 使用从交易所获取的数量精度
-			quantity = roundPrice(quantity, spm.quantityDecimals)
+			quantity := spm.gridBuyQuantity(price)
+			if quantity <= 0 {
+				slot.mu.Unlock()
+				continue
+			}
 
 			// 生成 ClientOrderID
 			clientOID := spm.generateClientOrderID(price, "BUY")
@@ -2405,10 +2405,79 @@ func (spm *SuperPositionManager) allocateMakerSafeSellPrice(
 	}
 }
 
+func (spm *SuperPositionManager) minOrderNotional() float64 {
+	if spm != nil && spm.config != nil && spm.config.Trading.MinOrderValue > 0 {
+		return spm.config.Trading.MinOrderValue
+	}
+	return 6.0
+}
+
+func (spm *SuperPositionManager) quantityStep() float64 {
+	decimals := 0
+	if spm != nil && spm.quantityDecimals > 0 {
+		decimals = spm.quantityDecimals
+	}
+	return math.Pow10(-decimals)
+}
+
+// gridBuyQuantity 按固定报价金额计算买入数量。四舍五入后若名义价值低于
+// min_order_value，则向上取整，避免成交后因卖单门槛把槽位卡死。
+func (spm *SuperPositionManager) gridBuyQuantity(price float64) float64 {
+	if spm == nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return 0
+	}
+	orderNotional := 0.0
+	if spm.config != nil {
+		orderNotional = spm.config.Trading.OrderQuantity
+	}
+	minValue := spm.minOrderNotional()
+	target := orderNotional
+	if minValue > target {
+		target = minValue
+	}
+	if target <= 0 {
+		return 0
+	}
+
+	raw := target / price
+	quantity := roundPrice(raw, spm.quantityDecimals)
+	if quantity <= 0 || quantity*price+fillQtyTolerance < minValue {
+		quantity = ceilPrice(raw, spm.quantityDecimals)
+	}
+	if quantity*price+fillQtyTolerance < minValue {
+		quantity = roundPrice(quantity+spm.quantityStep(), spm.quantityDecimals)
+	}
+	if quantity <= 0 || math.IsNaN(quantity) || math.IsInf(quantity, 0) ||
+		quantity*price+fillQtyTolerance < minValue {
+		return 0
+	}
+	return quantity
+}
+
+// reduceOnlyNotionalTooSmall 判断已有持仓是否小到不该再挂减仓单。
+// 少一个数量步长就能跨过阈值时视为精度损失，必须继续挂卖单。
+func (spm *SuperPositionManager) reduceOnlyNotionalTooSmall(sellPrice, qty float64) bool {
+	if qty <= fillQtyTolerance || sellPrice <= 0 ||
+		math.IsNaN(qty) || math.IsInf(qty, 0) ||
+		math.IsNaN(sellPrice) || math.IsInf(sellPrice, 0) {
+		return true
+	}
+	minValue := spm.minOrderNotional()
+	if sellPrice*qty+fillQtyTolerance >= minValue {
+		return false
+	}
+	return sellPrice*(qty+spm.quantityStep())+fillQtyTolerance < minValue
+}
+
 // roundPrice 价格四舍五入
 func roundPrice(price float64, decimals int) float64 {
 	multiplier := math.Pow(10, float64(decimals))
 	return math.Round(price*multiplier) / multiplier
+}
+
+func ceilPrice(price float64, decimals int) float64 {
+	multiplier := math.Pow(10, float64(decimals))
+	return math.Ceil(price*multiplier-1e-9) / multiplier
 }
 
 // formatPrice 格式化价格字符串，使用指定的小数位数
