@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta name="color-scheme" content="dark">
-    <meta name="theme-color" content="#080b0d">
+    <meta name="theme-color" content="#070a10">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -49,7 +49,7 @@
             </div>
         </header>
 
-        <main id="main-content">
+        <main id="main-content" tabindex="-1">
             <section class="summary" id="section-account" aria-labelledby="summaryTitle">
                 <div class="section-heading">
                     <div>
@@ -156,7 +156,7 @@
                         <span class="lg empty-slot">空网格 · 细点线</span>
                         <span class="lg mark">G 网格基准</span>
                     </div>
-                    <p class="chart-summary sr-only" id="klineSummary" role="status" aria-live="polite">
+                    <p class="chart-summary sr-only" id="klineSummary">
                         正在加载真实 OHLC 行情…
                     </p>
                     <div class="kline-stage" id="klineStage">
@@ -173,13 +173,14 @@
                         <button type="button" class="chart-step" id="klinePrev" aria-label="上一根 K 线" disabled>
                             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 5.5 8 12l6.5 6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square"/></svg>
                         </button>
-                        <p class="ladder-detail" id="klineDetail" role="status" aria-live="polite">
+                        <p class="ladder-detail" id="klineDetail">
                             轻触图表或用两侧按钮查看单根 K 线
                         </p>
                         <button type="button" class="chart-step" id="klineNext" aria-label="下一根 K 线" disabled>
                             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 5.5 16 12l-6.5 6.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="square"/></svg>
                         </button>
                     </div>
+                    <p class="sr-only" id="klineAnnouncer" role="status" aria-live="polite" aria-atomic="true"></p>
                 </section>
 
                 <aside class="status-strip" id="section-status" aria-label="风险与运行状态">
@@ -276,8 +277,8 @@
                         </div>
                         <span class="panel-meta">最新事件优先</span>
                     </div>
-                    <div class="logs" id="logs" role="log" aria-label="最近日志，可上下滑动" tabindex="0"
-                        aria-live="polite" aria-relevant="additions"></div>
+                    <div class="logs" id="logs" role="log" aria-label="最近日志，可上下滑动" tabindex="0"></div>
+                    <p class="sr-only" id="logAnnouncer" role="status" aria-live="polite" aria-atomic="true"></p>
                 </section>
             </section>
         </main>
