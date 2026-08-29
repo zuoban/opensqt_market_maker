@@ -1037,20 +1037,20 @@
         const style = getComputedStyle(document.documentElement);
         const color = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
         const colors = {
-            ink: color("--ink", "#eef4f1"),
-            muted: color("--muted", "#9aaba4"),
-            mutedSoft: color("--muted-soft", "#7e9089"),
-            line: color("--line", "rgba(154,186,176,.14)"),
-            lineStrong: color("--line-strong", "rgba(154,186,176,.28)"),
-            up: color("--positive", "#3ee0a4"),
-            down: color("--negative", "#ff7a73"),
-            buy: color("--buy", "#ffab70"),
-            sell: color("--sell", "#67c8ff"),
-            position: color("--position", "#c4a7ff"),
-            grid: color("--warn", "#f0c15a"),
-            surface: color("--surface", "#0d1214"),
-            rail: color("--plot-rail", "rgba(8,12,14,.55)"),
-            labelBg: color("--plot-label", "rgba(8,12,14,.9)")
+            ink: color("--ink", "#ede7db"),
+            muted: color("--muted", "#a8a093"),
+            mutedSoft: color("--muted-soft", "#7d776c"),
+            line: color("--line", "rgba(232,214,176,.14)"),
+            lineStrong: color("--line-strong", "rgba(232,214,176,.28)"),
+            up: color("--positive", "#3dcf9a"),
+            down: color("--negative", "#f07178"),
+            buy: color("--buy", "#e3a15a"),
+            sell: color("--sell", "#4ecdc4"),
+            position: color("--position", "#cbb589"),
+            grid: color("--warn", "#e3b34a"),
+            surface: color("--surface", "#12141b"),
+            rail: color("--plot-rail", "rgba(8,8,10,.66)"),
+            labelBg: color("--plot-label", "rgba(12,13,16,.94)")
         };
         const compact = width < 520;
         const narrow = width < 400;
