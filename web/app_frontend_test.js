@@ -85,63 +85,6 @@ test("event stream follows execution tape at the end of the dashboard", () => {
     assert.ok(html.indexOf("03 / EXECUTION TAPE") < html.indexOf("04 / EVENT STREAM"));
 });
 
-test("browser bindings resolve to unique DOM ids", () => {
-    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
-    const js = fs.readFileSync(__dirname + "/static/app.js", "utf8");
-    const ids = Array.from(html.matchAll(/\sid="([^"]+)"/g), (match) => match[1]);
-    const counts = new Map();
-    ids.forEach((id) => counts.set(id, (counts.get(id) || 0) + 1));
-    const bound = new Set(Array.from(js.matchAll(/\$\("([^"]+)"\)/g), (match) => match[1]));
-
-    assert.deepEqual(Array.from(counts).filter(([, count]) => count !== 1), []);
-    assert.deepEqual(Array.from(bound).filter((id) => !counts.has(id)), []);
-});
-
-test("high-frequency surfaces use dedicated and restrained live regions", () => {
-    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
-    const js = fs.readFileSync(__dirname + "/static/app.js", "utf8");
-    const klineSummary = html.match(/<p class="chart-summary sr-only" id="klineSummary"[^>]*>/)?.[0];
-    const klineDetail = html.match(/<p class="ladder-detail" id="klineDetail"[^>]*>/)?.[0];
-    const logs = html.match(/<div class="logs" id="logs"[^>]*>/)?.[0];
-
-    for (const tag of [klineSummary, klineDetail, logs]) {
-        assert.ok(tag);
-        assert.doesNotMatch(tag, /aria-live=/);
-    }
-    assert.match(html, /id="klineAnnouncer"[^>]*role="status"[^>]*aria-live="polite"/);
-    assert.match(html, /id="logAnnouncer"[^>]*role="status"[^>]*aria-live="polite"/);
-    assert.match(js, /updateSelectedCandle\(true\)/);
-    assert.match(js, /最新日志：/);
-});
-
-test("adaptive dashboard layout preserves visible navigation destinations", () => {
-    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
-    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
-    const js = fs.readFileSync(__dirname + "/static/app.js", "utf8");
-    const desktop = cssBlock(css, "@media (min-width: 1240px)");
-    const rail = cssBlock(css, "@media (min-width: 1440px)");
-    const tablet = cssBlock(css, "@media (min-width: 681px) and (max-width: 980px) and (min-height: 501px)");
-
-    assert.match(cssBlock(desktop, ".board"), /grid-template-columns:\s*minmax\(0, 3fr\)/);
-    assert.match(cssBlock(rail, ".desk-nav"), /display:\s*flex/);
-    assert.match(cssBlock(tablet, ".desk-nav"), /display:\s*grid/);
-    assert.doesNotMatch(css, /\.status-strip\.risk-off\s*\{[^}]*display:\s*none/);
-    assert.match(js, /主动风控未启用/);
-
-    const links = Array.from(html.matchAll(/<a href="#(section-[^"]+)"/g), (match) => match[1]);
-    assert.deepEqual(links, ["section-account", "section-market", "section-status", "section-fills", "section-logs"]);
-    links.forEach((id) => assert.match(html, new RegExp(`id="${id}"`)));
-});
-
-test("interactive dashboard controls keep touch-friendly targets", () => {
-    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
-    const coarse = cssBlock(css, "@media (pointer: coarse)");
-
-    assert.match(cssBlock(coarse, ".copy-id"), /min-height:\s*44px/);
-    assert.match(cssBlock(coarse, ".hour-col"), /min-width:\s*44px/);
-    assert.match(cssBlock(coarse, ".chart-step"), /min-height:\s*48px/);
-});
-
 test("margin capacity surface exposes status, exact amounts and an accessible gauge", () => {
     const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
     const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");

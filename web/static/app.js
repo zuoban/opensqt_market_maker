@@ -35,7 +35,6 @@
     let chartResizeObserver = null;
     let selectedHourKey = null;
     let toastTimer = null;
-    let tokenReturnFocus = null;
     const renderKeys = Object.create(null);
 
     const $ = (id) => document.getElementById(id);
@@ -77,7 +76,6 @@
         hideTokenModal();
         connect();
     });
-    $("tokenMask").addEventListener("keydown", trapTokenFocus);
 
     function readSessionToken() {
         try {
@@ -116,34 +114,6 @@
         button.disabled = loading;
         button.textContent = loading ? "验证中…" : "验证并进入";
         $("tokenInput").disabled = loading;
-        $("tokenForm").setAttribute("aria-busy", loading ? "true" : "false");
-    }
-
-    function setDashboardInert(inert) {
-        [document.querySelector(".app-shell"), $("deskNav")].forEach((node) => {
-            if (node) node.inert = inert;
-        });
-    }
-
-    function tokenFocusableElements() {
-        return Array.from($("tokenMask").querySelectorAll(
-            "input:not(:disabled), button:not(:disabled), a[href], [tabindex]:not([tabindex='-1'])"
-        )).filter((node) => !node.hidden);
-    }
-
-    function trapTokenFocus(event) {
-        if (event.key !== "Tab") return;
-        const focusable = tokenFocusableElements();
-        if (!focusable.length) return;
-        const first = focusable[0];
-        const last = focusable[focusable.length - 1];
-        if (event.shiftKey && (document.activeElement === first || !$("tokenMask").contains(document.activeElement))) {
-            event.preventDefault();
-            last.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
-            event.preventDefault();
-            first.focus();
-        }
     }
 
     function showTokenModal(message) {
@@ -154,12 +124,6 @@
             ws = null;
         }
         const mask = $("tokenMask");
-        const opening = mask.classList.contains("hidden");
-        if (opening) {
-            const active = document.activeElement;
-            tokenReturnFocus = active && active !== document.body && !mask.contains(active) ? active : null;
-        }
-        setDashboardInert(true);
         mask.classList.remove("hidden");
         mask.setAttribute("aria-hidden", "false");
         $("tokenErr").textContent = message || "";
@@ -168,19 +132,9 @@
 
     function hideTokenModal() {
         const mask = $("tokenMask");
-        const wasOpen = !mask.classList.contains("hidden");
         mask.classList.add("hidden");
         mask.setAttribute("aria-hidden", "true");
-        setDashboardInert(false);
         $("tokenErr").textContent = "";
-        if (wasOpen) {
-            const fallback = $("main-content");
-            const target = tokenReturnFocus && document.contains(tokenReturnFocus)
-                ? tokenReturnFocus
-                : fallback;
-            tokenReturnFocus = null;
-            requestAnimationFrame(() => target && target.focus({ preventScroll: true }));
-        }
     }
 
     function snapshotHeaders() {
@@ -818,7 +772,6 @@
                 : "正在加载真实 OHLC 行情…");
             renderKlineStats(null, pos.priceDecimals ?? 2);
             setText($("klineDetail"), "获得首根 K 线后即可查看开、高、低、收明细");
-            setText($("klineAnnouncer"), "");
             $("klineCanvas").setAttribute("aria-label", "K 线数据尚未就绪");
             syncKlineStepper();
             drawKlineChart();
@@ -836,10 +789,7 @@
             " · " + direction + " " + fmtSigned(chartModel.changePct, 2) + "%" +
             " · 网格层 " + chartModel.levels.length + degradedText;
         setText($("klineSummary"), summary);
-        $("klineCanvas").setAttribute(
-            "aria-label",
-            "K 线网格执行图，" + interval + "，共 " + chartModel.candles.length + " 根。可使用方向键逐根查看。"
-        );
+        $("klineCanvas").setAttribute("aria-label", summary + "。可使用左右方向键或两侧按钮逐根查看。");
         renderKlineStats(chartModel, decimals);
         if ((chartTooltipActive || chartPinned) && chartSelection !== null) updateSelectedCandle();
         else setText($("klineDetail"), candleDetail(latest, decimals));
@@ -888,7 +838,7 @@
         chartSelection = index;
         chartPinned = Boolean(options && options.pin);
         chartTooltipActive = !isCoarsePointer();
-        updateSelectedCandle(Boolean(options && options.announce));
+        updateSelectedCandle();
         syncKlineStepper();
         drawKlineChart();
     }
@@ -899,7 +849,7 @@
         chartSelection = Math.max(0, Math.min(chartModel.candles.length - 1, chartSelection + delta));
         chartPinned = true;
         chartTooltipActive = !isCoarsePointer();
-        updateSelectedCandle(true);
+        updateSelectedCandle();
         syncKlineStepper();
         drawKlineChart();
     }
@@ -943,7 +893,7 @@
         });
         canvas.addEventListener("pointerup", (event) => {
             if (chartPointer && event.pointerId === chartPointer.id && !chartPointer.panning && isCoarsePointer(event)) {
-                inspectKlineAt(event.clientX, { pin: true, announce: true });
+                inspectKlineAt(event.clientX, { pin: true });
                 canvas.focus({ preventScroll: true });
             }
             if (chartPointer && event.pointerId === chartPointer.id) chartPointer = null;
@@ -1037,26 +987,26 @@
         const style = getComputedStyle(document.documentElement);
         const color = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
         const colors = {
-            ink: color("--ink", "#ede7db"),
-            muted: color("--muted", "#a8a093"),
-            mutedSoft: color("--muted-soft", "#7d776c"),
-            line: color("--line", "rgba(232,214,176,.14)"),
-            lineStrong: color("--line-strong", "rgba(232,214,176,.28)"),
-            up: color("--positive", "#3dcf9a"),
-            down: color("--negative", "#f07178"),
-            buy: color("--buy", "#e3a15a"),
-            sell: color("--sell", "#4ecdc4"),
-            position: color("--position", "#cbb589"),
-            grid: color("--warn", "#e3b34a"),
-            surface: color("--surface", "#12141b"),
-            rail: color("--plot-rail", "rgba(8,8,10,.66)"),
-            labelBg: color("--plot-label", "rgba(12,13,16,.94)")
+            ink: color("--ink", "#eef4f1"),
+            muted: color("--muted", "#9aaba4"),
+            mutedSoft: color("--muted-soft", "#7e9089"),
+            line: color("--line", "rgba(154,186,176,.14)"),
+            lineStrong: color("--line-strong", "rgba(154,186,176,.28)"),
+            up: color("--positive", "#3ee0a4"),
+            down: color("--negative", "#ff7a73"),
+            buy: color("--buy", "#ff7a73"),
+            sell: color("--sell", "#3ee0a4"),
+            position: color("--cyan", "#5ec6ff"),
+            grid: color("--warn", "#f0c15a"),
+            surface: color("--surface", "#0d1214"),
+            rail: color("--plot-rail", "rgba(8,12,14,.55)"),
+            labelBg: color("--plot-label", "rgba(8,12,14,.9)")
         };
         const compact = width < 520;
         const narrow = width < 400;
         const left = narrow ? 6 : (compact ? 9 : 14);
-        const axisWidth = narrow ? 56 : (compact ? 68 : 80);
-        const railWidth = narrow ? 66 : (compact ? 82 : 104);
+        const axisWidth = narrow ? 46 : (compact ? 58 : 72);
+        const railWidth = narrow ? 62 : (compact ? 78 : 98);
         const right = axisWidth + railWidth;
         const top = 22;
         const bottom = 30;
@@ -1069,7 +1019,7 @@
             (chartModel.priceMax - chartModel.priceMin) * plotHeight;
         chartGeometry = { left, right, top, bottom, plotWidth, plotHeight, plotRight, railLeft, railRight, yForPrice };
 
-        ctx.font = (compact ? "11px " : "12px ") + style.getPropertyValue("--font-mono");
+        ctx.font = (compact ? "9px " : "10px ") + style.getPropertyValue("--font-mono");
         ctx.textBaseline = "middle";
         ctx.lineWidth = 1;
         const yTicks = compact ? 4 : 5;
@@ -1387,16 +1337,14 @@
         ctx.fillText(text, x + width / 2, y + 0.5, width - 5);
     }
 
-    function updateSelectedCandle(announce) {
+    function updateSelectedCandle() {
         if (!chartModel || chartSelection === null) return;
         const candle = chartModel.candles[chartSelection];
         if (!candle) return;
         const decimals = latestSnapshot && latestSnapshot.position
             ? (latestSnapshot.position.priceDecimals ?? 2)
             : 2;
-        const detail = candleDetail(candle, decimals);
-        setText($("klineDetail"), detail);
-        if (announce) setText($("klineAnnouncer"), "已选择 " + detail);
+        setText($("klineDetail"), candleDetail(candle, decimals));
     }
 
     function candleDetail(candle, decimals) {
@@ -1461,20 +1409,11 @@
         const statusStrip = document.querySelector(".status-strip");
         const enabled = Boolean(risk.enabled);
         if (panel) {
-            panel.hidden = false;
-            panel.setAttribute("aria-hidden", "false");
+            panel.hidden = !enabled;
+            panel.setAttribute("aria-hidden", enabled ? "false" : "true");
         }
         if (statusStrip) statusStrip.classList.toggle("risk-off", !enabled);
-        if (!enabled) {
-            setText($("riskMsg"), "市场主动风控未启用；保证金守卫与连接状态仍独立工作。");
-            const empty = element("div", "risk-empty-state");
-            empty.append(
-                element("strong", "", "主动风控未启用"),
-                element("span", "", "如需监控量价异常，请在配置中启用 risk_control。")
-            );
-            replaceChildren($("riskList"), [empty]);
-            return;
-        }
+        if (!enabled) return;
 
         $("riskMsg").textContent = risk.lastMsg || "等待风控读数";
         const list = $("riskList");
@@ -1510,7 +1449,6 @@
         const box = $("logs");
         if (!logs.length) {
             replaceChildren(box, [element("div", "empty", "暂无日志")]);
-            setText($("logAnnouncer"), "");
             return;
         }
 
@@ -1527,9 +1465,6 @@
             return row;
         });
         replaceChildren(box, items);
-        const newest = logs[logs.length - 1] || {};
-        const newestLevel = allowedLevels.has(newest.level) ? newest.level : "INFO";
-        setText($("logAnnouncer"), "最新日志：" + newestLevel + "，" + (newest.message || "无内容"));
     }
 
     function pad2(value) {
@@ -1947,7 +1882,7 @@
         nav.querySelectorAll("a[href^='#']").forEach((link) => {
             const on = link.hash === hash;
             link.classList.toggle("is-active", on);
-            if (on) link.setAttribute("aria-current", "location");
+            if (on) link.setAttribute("aria-current", "page");
             else link.removeAttribute("aria-current");
         });
     }
@@ -2087,10 +2022,6 @@
             }
             return true;
         } catch (_error) {
-            const mask = $("tokenMask");
-            if (mask && !mask.classList.contains("hidden")) {
-                $("tokenErr").textContent = "暂时无法连接面板，请检查网络后重试";
-            }
             if (!ws || ws.readyState !== WebSocket.OPEN) {
                 const recent = lastSnapshotAt && Date.now() - lastSnapshotAt < 8000;
                 setConnectionState(recent ? "fallback" : "down", recent ? "轮询异常" : "数据已中断");
