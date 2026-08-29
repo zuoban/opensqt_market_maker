@@ -321,6 +321,7 @@ func (spm *SuperPositionManager) extractCanceledBuyUpdate(raw interface{}, targe
 		ClientOrderID: clientOrderID,
 		Symbol:        symbol,
 		Status:        strings.ToUpper(status),
+		Quantity:      quantity,
 		ExecutedQty:   executedQty,
 		Price:         price,
 		AvgPrice:      avgPrice,

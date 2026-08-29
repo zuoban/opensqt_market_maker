@@ -268,6 +268,10 @@ func (w *backpackWrapper) GetPriceDecimals() int {
 	return w.adapter.GetPriceDecimals()
 }
 
+func (w *backpackWrapper) GetPriceTickSize() float64 {
+	return w.adapter.GetPriceTickSize()
+}
+
 func (w *backpackWrapper) GetQuantityDecimals() int {
 	return w.adapter.GetQuantityDecimals()
 }

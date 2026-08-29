@@ -269,6 +269,27 @@ func TestNormalizeOrderSupportsNonPowerOfTenTickAndIntegerStep(t *testing.T) {
 	}
 }
 
+func TestAdapterPriceTickSizeUsesContractFilter(t *testing.T) {
+	symbol := validContractSymbol()
+	symbol.Filters[0]["tickSize"] = "0.25"
+	spec, err := contractSpecFromSymbol(symbol)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &BinanceAdapter{contractSpec: spec, priceDecimals: symbol.PricePrecision}
+	if got := adapter.GetPriceTickSize(); got != 0.25 {
+		t.Fatalf("GetPriceTickSize() = %v, want 0.25", got)
+	}
+}
+
+func TestAdapterPriceTickSizeDoesNotGuessWithoutContractFilter(t *testing.T) {
+	adapter := &BinanceAdapter{priceDecimals: 2}
+	if got := adapter.GetPriceTickSize(); got != 0 {
+		t.Fatalf("GetPriceTickSize() = %v, want 0 without validated PRICE_FILTER", got)
+	}
+}
+
 func TestNormalizeOrderRejectsFilterViolations(t *testing.T) {
 	spec, err := contractSpecFromSymbol(validContractSymbol())
 	if err != nil {

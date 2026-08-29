@@ -26,6 +26,7 @@ type BybitAdapter struct {
 	klineWSManager   *KlineWebSocketManager
 	orderIDs         *orderIDMapper
 	priceDecimals    int
+	priceTickSize    float64
 	quantityDecimals int
 	baseAsset        string
 	quoteAsset       string
@@ -112,9 +113,7 @@ func NewBybitAdapter(cfg map[string]string, symbol string) (*BybitAdapter, error
 	defer cancel()
 
 	if err := adapter.fetchExchangeInfo(ctx); err != nil {
-		logger.Warn("⚠️ [Bybit] 获取合约信息失败: %v，使用默认精度", err)
-		adapter.priceDecimals = 2
-		adapter.quantityDecimals = 3
+		return nil, fmt.Errorf("初始化 Bybit 合约规格失败: %w", err)
 	}
 
 	return adapter, nil
@@ -157,7 +156,12 @@ func (b *BybitAdapter) fetchExchangeInfo(ctx context.Context) error {
 	item := result.List[0]
 	b.baseAsset = item.BaseCoin
 	b.quoteAsset = item.QuoteCoin
+	priceTickSize, err := strconv.ParseFloat(item.PriceFilter.TickSize, 64)
+	if err != nil || priceTickSize <= 0 || math.IsNaN(priceTickSize) || math.IsInf(priceTickSize, 0) {
+		return fmt.Errorf("Bybit tickSize=%q 无效", item.PriceFilter.TickSize)
+	}
 	b.priceDecimals = decimalsFromStep(item.PriceFilter.TickSize)
+	b.priceTickSize = priceTickSize
 	if b.priceDecimals == 0 {
 		b.priceDecimals = parseInt(item.PriceScale)
 	}
@@ -692,6 +696,13 @@ func (b *BybitAdapter) GetHistoricalKlines(ctx context.Context, symbol string, i
 
 func (b *BybitAdapter) GetPriceDecimals() int {
 	return b.priceDecimals
+}
+
+func (b *BybitAdapter) GetPriceTickSize() float64 {
+	if b.priceTickSize > 0 && !math.IsNaN(b.priceTickSize) && !math.IsInf(b.priceTickSize, 0) {
+		return b.priceTickSize
+	}
+	return 0
 }
 
 func (b *BybitAdapter) GetQuantityDecimals() int {

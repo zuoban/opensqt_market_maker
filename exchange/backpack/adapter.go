@@ -28,6 +28,7 @@ type BackpackAdapter struct {
 	klineWSManager   *KlineWebSocketManager
 	idMapper         *clientIDMapper
 	priceDecimals    int
+	priceTickSize    float64
 	quantityDecimals int
 	baseAsset        string
 	quoteAsset       string
@@ -150,7 +151,12 @@ func (b *BackpackAdapter) fetchMarketInfo(ctx context.Context) error {
 
 	b.baseAsset = market.BaseSymbol
 	b.quoteAsset = market.QuoteSymbol
+	priceTickSize, err := strconv.ParseFloat(market.Filters.Price.TickSize, 64)
+	if err != nil || priceTickSize <= 0 || math.IsNaN(priceTickSize) || math.IsInf(priceTickSize, 0) {
+		return fmt.Errorf("Backpack tickSize=%q 无效", market.Filters.Price.TickSize)
+	}
 	b.priceDecimals = decimalsFromStep(market.Filters.Price.TickSize)
+	b.priceTickSize = priceTickSize
 	b.quantityDecimals = decimalsFromStep(market.Filters.Quantity.StepSize)
 	if b.priceDecimals == 0 {
 		b.priceDecimals = 2
@@ -596,6 +602,13 @@ func (b *BackpackAdapter) GetHistoricalKlines(ctx context.Context, symbol string
 
 func (b *BackpackAdapter) GetPriceDecimals() int {
 	return b.priceDecimals
+}
+
+func (b *BackpackAdapter) GetPriceTickSize() float64 {
+	if b.priceTickSize > 0 && !math.IsNaN(b.priceTickSize) && !math.IsInf(b.priceTickSize, 0) {
+		return b.priceTickSize
+	}
+	return 0
 }
 
 func (b *BackpackAdapter) GetQuantityDecimals() int {

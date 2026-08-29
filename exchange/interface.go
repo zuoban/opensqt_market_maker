@@ -76,6 +76,10 @@ type IExchange interface {
 	// GetPriceDecimals 获取价格精度（小数位数）
 	GetPriceDecimals() int
 
+	// GetPriceTickSize 获取交易所真实最小价格变动单位。
+	// 订单去重和价格分配必须使用 tickSize，不能用展示小数位代替。
+	GetPriceTickSize() float64
+
 	// GetQuantityDecimals 获取数量精度（小数位数）
 	GetQuantityDecimals() int
 

@@ -1,7 +1,7 @@
 # OpenSQT 做市商系统架构说明
 
-> **版本**: v3.5.1
-> **最近更新**: 2026-08-26
+> **版本**: v3.5.2
+> **最近更新**: 2026-08-29
 > **目的**: 说明当前运行架构、交易安全边界与扩展约束
 
 ---
@@ -299,6 +299,7 @@ type IExchange interface {
     
     // 精度信息
     GetPriceDecimals() int
+    GetPriceTickSize() float64
     GetQuantityDecimals() int
     GetBaseAsset() string
     GetQuoteAsset() string
@@ -333,9 +334,11 @@ binance/websocket.go (WebSocket)
    - Gate.io: 用户订单 WebSocket
 
 2. **精度处理**:
-   - Binance: 通过 exchangeInfo 获取
-   - Bitget: 通过 contractInfo 获取
-   - Gate.io: 通过 contracts 获取
+   - Binance: 使用 `PRICE_FILTER.tickSize`
+   - Bitget: 使用 `priceEndStep × 10^-pricePlace`
+   - Gate.io: 使用 `order_price_round`
+   - Bybit / Backpack: 使用合约元数据中的 `tickSize`
+   - 真实 tick 缺失或非法时拒绝启动交易，不用展示小数位猜测
 
 3. **批量操作**:
    - Bitget: 原生支持批量下单/撤单
@@ -406,6 +409,13 @@ CancelAllBuyOrders()
 1. **全局锁**: `mu sync.RWMutex`（保护 slots Map）
 2. **槽位锁**: `slot.mu sync.RWMutex`（保护单个槽位）
 3. **槽位状态**: `SlotStatus` 防止重复操作
+
+#### 卖价唯一性
+
+- 卖价下限为 `max(原网格盈利目标, Maker 安全价)`，然后按交易所真实 tick 向上量化。
+- 每个持仓槽位仍保持一张独立 `ReduceOnly + PostOnly` 卖单，不合并数量。
+- 已活跃、`PENDING/UNKNOWN` 和 `CANCEL_REQUESTED` 的 SELL 都持续占用其价格 tick；新卖单逐 tick 向上寻找未占用价位。
+- 候选收集后会再次检查槽位订单身份，防止订单流的异步绑定被新 reservation 覆盖。
 
 **典型操作流程**:
 ```go
@@ -985,6 +995,7 @@ timing:
 | 锚点价格 | Anchor Price | 系统初始化时的市场价格，作为网格基准 |
 | 固定金额模式 | Fixed Amount Mode | 每笔交易投入固定金额（而非固定数量） |
 | 价格精度 | Price Decimals | 价格小数位数（如BTC为2，ETH为2） |
+| 价格步长 | Price Tick Size | 交易所允许的最小价格变动单位；可能为 `0.25` 等非 10 的幂 |
 | 数量精度 | Quantity Decimals | 数量小数位数（如BTC为3，ETH为3） |
 | PostOnly | Post Only Order | 只做Maker的订单（不立即成交） |
 | ReduceOnly | Reduce Only Order | 只减仓订单（平仓单） |
@@ -1045,5 +1056,5 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 
 **官网**:
 - Website: www.OpenSQT.com
-- Version: v3.5.1
-- Last Updated: 2026-08-26
+- Version: v3.5.2
+- Last Updated: 2026-08-29

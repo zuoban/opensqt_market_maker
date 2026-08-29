@@ -118,15 +118,16 @@ type BitgetAdapter struct {
 	// 用于在下单成功后立即建立映射，避免 WebSocket 更新先到导致找不到槽位
 	orderMappingCallback func(orderID int64, price float64)
 
-	posMode      string // 持仓模式：hedge_mode 或 one_way_mode
-	productType  string // 合约类型：usdt-futures（U本位）或 coin-futures（币本位）
-	marginCoin   string // 保证金币种：自动从合约信息获取
-	volumePlace  int    // 数量小数位（从合约信息获取）
-	pricePlace   int    // 价格小数位（从合约信息获取）
-	minTradeNum  string // 最小下单数量
-	minTradeUSDT string // 最小下单金额（USDT）
-	baseAsset    string // 基础资产（交易币种），如 BTC
-	quoteAsset   string // 计价资产（结算币种），如 USDT、USD
+	posMode       string  // 持仓模式：hedge_mode 或 one_way_mode
+	productType   string  // 合约类型：usdt-futures（U本位）或 coin-futures（币本位）
+	marginCoin    string  // 保证金币种：自动从合约信息获取
+	volumePlace   int     // 数量小数位（从合约信息获取）
+	pricePlace    int     // 价格小数位（从合约信息获取）
+	priceTickSize float64 // 真实价格步长：priceEndStep × 10^-pricePlace
+	minTradeNum   string  // 最小下单数量
+	minTradeUSDT  string  // 最小下单金额（USDT）
+	baseAsset     string  // 基础资产（交易币种），如 BTC
+	quoteAsset    string  // 计价资产（结算币种），如 USDT、USD
 }
 
 // NewBitgetAdapter 创建 Bitget 适配器
@@ -158,12 +159,7 @@ func NewBitgetAdapter(cfg map[string]string, symbol string) (*BitgetAdapter, err
 
 	// 1. 先获取合约信息（必须先获取，因为需要设置productType和marginCoin）
 	if err := adapter.fetchContractInfo(ctxInit); err != nil {
-		logger.Warn("⚠️ [Bitget] 获取合约信息失败: %v", err)
-		// 使用默认值
-		adapter.volumePlace = 4
-		adapter.pricePlace = 2
-		adapter.productType = "usdt-futures"
-		adapter.marginCoin = "USDT"
+		return nil, fmt.Errorf("初始化 Bitget 合约规格失败: %w", err)
 	}
 
 	// 2. 获取持仓模式和账户信息
@@ -222,6 +218,7 @@ func (b *BitgetAdapter) fetchContractInfo(ctx context.Context) error {
 			Symbol             string   `json:"symbol"`
 			VolumePlace        string   `json:"volumePlace"`        // 数量小数位
 			PricePlace         string   `json:"pricePlace"`         // 价格小数位
+			PriceEndStep       string   `json:"priceEndStep"`       // 最小价格步长的整数系数
 			MinTradeNum        string   `json:"minTradeNum"`        // 最小下单数量
 			MinTradeUSDT       string   `json:"minTradeUSDT"`       // 最小下单金额
 			BaseCoin           string   `json:"baseCoin"`           // 基础币种
@@ -241,8 +238,26 @@ func (b *BitgetAdapter) fetchContractInfo(ctx context.Context) error {
 		// 找到合约信息
 		contract := dataList[0]
 		b.productType = pt
-		b.volumePlace, _ = strconv.Atoi(contract.VolumePlace)
-		b.pricePlace, _ = strconv.Atoi(contract.PricePlace)
+		volumePlace, err := strconv.Atoi(contract.VolumePlace)
+		if err != nil || volumePlace < 0 {
+			return fmt.Errorf("Bitget volumePlace=%q 无效", contract.VolumePlace)
+		}
+		pricePlace, err := strconv.Atoi(contract.PricePlace)
+		if err != nil || pricePlace < 0 {
+			return fmt.Errorf("Bitget pricePlace=%q 无效", contract.PricePlace)
+		}
+		priceEndStep, err := strconv.ParseFloat(contract.PriceEndStep, 64)
+		if err != nil || priceEndStep <= 0 || math.IsNaN(priceEndStep) || math.IsInf(priceEndStep, 0) {
+			return fmt.Errorf("Bitget priceEndStep=%q 无效", contract.PriceEndStep)
+		}
+		priceTickSize := priceEndStep * math.Pow10(-pricePlace)
+		if priceTickSize <= 0 || math.IsNaN(priceTickSize) || math.IsInf(priceTickSize, 0) {
+			return fmt.Errorf("Bitget 价格步长无效: priceEndStep=%q pricePlace=%q",
+				contract.PriceEndStep, contract.PricePlace)
+		}
+		b.volumePlace = volumePlace
+		b.pricePlace = pricePlace
+		b.priceTickSize = priceTickSize
 		b.minTradeNum = contract.MinTradeNum
 		b.minTradeUSDT = contract.MinTradeUSDT
 		b.baseAsset = contract.BaseCoin
@@ -1175,6 +1190,14 @@ func getHoldSide(size float64) string {
 // GetPriceDecimals 获取价格精度（小数位数）
 func (b *BitgetAdapter) GetPriceDecimals() int {
 	return b.pricePlace
+}
+
+// GetPriceTickSize 获取 Bitget priceEndStep 对应的真实价格步长。
+func (b *BitgetAdapter) GetPriceTickSize() float64 {
+	if b.priceTickSize > 0 && !math.IsNaN(b.priceTickSize) && !math.IsInf(b.priceTickSize, 0) {
+		return b.priceTickSize
+	}
+	return 0
 }
 
 // GetQuantityDecimals 获取数量精度（小数位数）

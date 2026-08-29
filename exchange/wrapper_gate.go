@@ -304,8 +304,11 @@ func (w *gateWrapper) GetHistoricalKlines(ctx context.Context, symbol string, in
 }
 
 func (w *gateWrapper) GetPriceDecimals() int {
-	// 从 adapter 获取价格精度
-	return 2 // 默认值，实际应从 adapter 获取
+	return w.adapter.GetPriceDecimals()
+}
+
+func (w *gateWrapper) GetPriceTickSize() float64 {
+	return w.adapter.GetPriceTickSize()
 }
 
 func (w *gateWrapper) GetQuantityDecimals() int {

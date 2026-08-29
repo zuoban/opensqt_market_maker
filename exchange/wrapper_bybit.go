@@ -268,6 +268,10 @@ func (w *bybitWrapper) GetPriceDecimals() int {
 	return w.adapter.GetPriceDecimals()
 }
 
+func (w *bybitWrapper) GetPriceTickSize() float64 {
+	return w.adapter.GetPriceTickSize()
+}
+
 func (w *bybitWrapper) GetQuantityDecimals() int {
 	return w.adapter.GetQuantityDecimals()
 }

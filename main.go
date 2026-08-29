@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"reflect"
@@ -22,7 +23,7 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.5.1"
+var Version = "v3.5.2"
 
 func main() {
 	programStartedAt := time.Now()
@@ -107,8 +108,13 @@ func main() {
 
 	// 从交易所获取精度信息
 	priceDecimals := ex.GetPriceDecimals()
+	priceTickSize := ex.GetPriceTickSize()
 	quantityDecimals := ex.GetQuantityDecimals()
-	logger.Info("ℹ️ 交易精度 - 价格精度:%d, 数量精度:%d", priceDecimals, quantityDecimals)
+	if priceTickSize <= 0 || math.IsNaN(priceTickSize) || math.IsInf(priceTickSize, 0) {
+		logger.Fatalf("❌ 交易所返回无效价格步长: %v", priceTickSize)
+	}
+	logger.Info("ℹ️ 交易精度 - 价格精度:%d, 价格步长:%g, 数量精度:%d",
+		priceDecimals, priceTickSize, quantityDecimals)
 	logger.Debug("📊 当前价格: %.*f", priceDecimals, currentPrice)
 
 	// 6. 持仓安全性检查（必须在开始交易之前执行）
@@ -163,7 +169,14 @@ func main() {
 
 	// 创建交易所适配器（匹配 position.IExchange 接口）
 	exchangeAdapter := &positionExchangeAdapter{exchange: ex}
-	superPositionManager := position.NewSuperPositionManager(cfg, executorAdapter, exchangeAdapter, priceDecimals, quantityDecimals)
+	superPositionManager := position.NewSuperPositionManager(
+		cfg,
+		executorAdapter,
+		exchangeAdapter,
+		priceDecimals,
+		quantityDecimals,
+		priceTickSize,
+	)
 
 	// === 新增：初始化风控监视器 ===
 	riskMonitor := safety.NewRiskMonitor(cfg, ex)
@@ -232,6 +245,7 @@ func main() {
 			ClientOrderID:          getStringField("ClientOrderID"), // 🔥 关键：传递 ClientOrderID
 			Symbol:                 getStringField("Symbol"),
 			Status:                 getStringField("Status"),
+			Quantity:               getFloat64Field("Quantity"),
 			ExecutedQty:            getFloat64Field("ExecutedQty"),
 			Price:                  getFloat64Field("Price"),
 			AvgPrice:               getFloat64Field("AvgPrice"),

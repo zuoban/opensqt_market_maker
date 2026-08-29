@@ -269,6 +269,10 @@ func (w *binanceWrapper) GetPriceDecimals() int {
 	return w.adapter.GetPriceDecimals()
 }
 
+func (w *binanceWrapper) GetPriceTickSize() float64 {
+	return w.adapter.GetPriceTickSize()
+}
+
 func (w *binanceWrapper) GetQuantityDecimals() int {
 	return w.adapter.GetQuantityDecimals()
 }

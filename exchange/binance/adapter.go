@@ -1140,6 +1140,17 @@ func (b *BinanceAdapter) GetPriceDecimals() int {
 	return b.priceDecimals
 }
 
+// GetPriceTickSize 获取 Binance PRICE_FILTER 中的真实 tickSize。
+func (b *BinanceAdapter) GetPriceTickSize() float64 {
+	if b.contractSpec != nil {
+		if tick, err := strconv.ParseFloat(b.contractSpec.TickSize.String(), 64); err == nil &&
+			tick > 0 && !math.IsNaN(tick) && !math.IsInf(tick, 0) {
+			return tick
+		}
+	}
+	return 0
+}
+
 // GetQuantityDecimals 获取数量精度（小数位数）
 func (b *BinanceAdapter) GetQuantityDecimals() int {
 	return b.quantityDecimals

@@ -34,6 +34,7 @@ type GateAdapter struct {
 	posMode          string  // 持仓模式：dual_long_short 或 single
 	quantoMultiplier float64 // 合约乘数
 	orderPriceRound  int     // 价格精度
+	priceTickSize    float64 // order_price_round 真实价格步长
 	orderSizeMin     float64 // 最小下单数量
 	volumePlace      int     // 数量小数位
 	pricePlace       int     // 价格小数位
@@ -78,11 +79,7 @@ func NewGateAdapter(cfg map[string]string, symbol string) (*GateAdapter, error) 
 
 	// 1. 获取合约信息
 	if err := adapter.fetchContractInfo(ctxInit); err != nil {
-		logger.Warn("⚠️ [Gate] 获取合约信息失败: %v", err)
-		// 使用默认值
-		adapter.volumePlace = 0
-		adapter.pricePlace = 2
-		adapter.orderSizeMin = 1
+		return nil, fmt.Errorf("初始化 Gate.io 合约规格失败: %w", err)
 	}
 
 	// 2. 获取账户信息（判断持仓模式）
@@ -117,6 +114,14 @@ func (g *GateAdapter) GetPriceDecimals() int {
 	return g.pricePlace
 }
 
+// GetPriceTickSize 获取 Gate order_price_round 对应的真实价格步长。
+func (g *GateAdapter) GetPriceTickSize() float64 {
+	if g.priceTickSize > 0 && !math.IsNaN(g.priceTickSize) && !math.IsInf(g.priceTickSize, 0) {
+		return g.priceTickSize
+	}
+	return 0
+}
+
 // GetQuantityDecimals 获取数量精度
 func (g *GateAdapter) GetQuantityDecimals() int {
 	return g.volumePlace
@@ -134,11 +139,15 @@ func (g *GateAdapter) fetchContractInfo(ctx context.Context) error {
 		g.quantoMultiplier, _ = strconv.ParseFloat(contract.QuantoMultiplier, 64)
 	}
 
-	// 解析价格精度（如 "0.1" -> 1位小数）
-	if contract.OrderPriceRound != "" {
-		priceRound, _ := strconv.ParseFloat(contract.OrderPriceRound, 64)
-		g.pricePlace = calculateDecimalPlaces(priceRound)
+	// 解析价格精度（如 "0.1" -> 1位小数）。这是唯一价格分配的
+	// 交易所真实 tick 来源，缺失时不得用默认小数位继续交易。
+	priceRoundText := strings.TrimSpace(contract.OrderPriceRound)
+	priceRound, err := strconv.ParseFloat(priceRoundText, 64)
+	if err != nil || priceRound <= 0 || math.IsNaN(priceRound) || math.IsInf(priceRound, 0) {
+		return fmt.Errorf("Gate.io order_price_round=%q 无效", contract.OrderPriceRound)
 	}
+	g.priceTickSize = priceRound
+	g.pricePlace = calculateDecimalPlaces(priceRound)
 
 	// 解析数量精度
 	// Gate.io 的 order_size_round 字段可能为空,需要推断精度
@@ -785,24 +794,20 @@ func (g *GateAdapter) StopKlineStream() {
 
 // calculateDecimalPlaces 计算小数位数
 func calculateDecimalPlaces(value float64) int {
-	if value >= 1 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return 0
 	}
 
-	str := fmt.Sprintf("%.10f", value)
-	parts := strings.Split(str, ".")
-	if len(parts) != 2 {
+	// order_price_round/order_size_round 是价格或数量的完整十进制步长。
+	// 小数位数必须保留到最后一个非零位，而不是第一个非零位；
+	// 例如 0.25 需要 2 位小数，否则会被格式化为 0.3 精度。
+	text := strconv.FormatFloat(value, 'f', -1, 64)
+	dot := strings.IndexByte(text, '.')
+	if dot < 0 {
 		return 0
 	}
-
-	// 计算小数点后第一个非零数字的位置
-	for i, c := range parts[1] {
-		if c != '0' {
-			return i + 1
-		}
-	}
-
-	return 0
+	fraction := strings.TrimRight(text[dot+1:], "0")
+	return len(fraction)
 }
 
 // convertToBitgetSymbol 转换交易对格式（兼容性函数）
