@@ -271,7 +271,7 @@ func TestPlaceOrderNeverDowngradesAfterPostOnlyRejections(t *testing.T) {
 	}
 }
 
-func TestPlaceOrderReacquiresSubmissionLeaseForEveryAttempt(t *testing.T) {
+func TestPlaceOrderReacquiresSubmissionLeaseForRateLimitRetry(t *testing.T) {
 	attempts := 0
 	leaseHeld := false
 	leaseAcquires := 0
@@ -283,7 +283,7 @@ func TestPlaceOrderReacquiresSubmissionLeaseForEveryAttempt(t *testing.T) {
 			}
 			attempts++
 			if attempts == 1 {
-				return nil, errors.New("temporary exchange failure")
+				return nil, &common.APIError{Code: -1003, Message: "rate limit"}
 			}
 			return &exchange.Order{
 				OrderID:       7,
@@ -516,6 +516,40 @@ func TestBatchPlaceOrdersPropagatesUnknownResultAndStopsBatch(t *testing.T) {
 	}
 }
 
+func TestBatchPlaceOrdersTreatsUnclassifiedErrorAsUnknownAndStopsBatch(t *testing.T) {
+	ordinaryErr := errors.New("unclassified exchange failure")
+	ex := &recordingExchange{
+		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {
+			return nil, ordinaryErr
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	waiter := &countingWaiter{}
+	executor.rateLimiter = waiter
+
+	unknown := false
+	placed, marginErr, err := executor.BatchPlaceOrders([]*OrderRequest{
+		{
+			Symbol: "ETHUSDT", Side: "BUY", Price: 100, Quantity: 0.1,
+			OnSubmissionUnknown: func() { unknown = true },
+		},
+		{Symbol: "ETHUSDT", Side: "BUY", Price: 99, Quantity: 0.1},
+	})
+	if !errors.Is(err, exchange.ErrOrderPlacementUnknown) || !errors.Is(err, ordinaryErr) {
+		t.Fatalf("BatchPlaceOrders() error = %v, want UNKNOWN wrapping original error", err)
+	}
+	if IsDefiniteOrderRejection(err) {
+		t.Fatalf("BatchPlaceOrders() error = %v, must not be a definite rejection", err)
+	}
+	if !unknown {
+		t.Fatal("unclassified placement error did not preserve reservation as UNKNOWN")
+	}
+	if marginErr || len(placed) != 0 || len(ex.requests) != 1 || waiter.count != 1 {
+		t.Fatalf("BatchPlaceOrders() = placed:%d margin:%v requests:%d waits:%d, want stop after first UNKNOWN",
+			len(placed), marginErr, len(ex.requests), waiter.count)
+	}
+}
+
 func TestBatchPlaceOrdersNeverSwallowsUnknownThatMentionsMargin(t *testing.T) {
 	ex := &recordingExchange{
 		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {
@@ -613,27 +647,33 @@ func TestPlaceOrderClassifiesTypedBinanceErrors(t *testing.T) {
 	}
 }
 
-func TestPlaceOrderDoesNotAssumeEveryBinanceAPIErrorIsDefinite(t *testing.T) {
+func TestPlaceOrderUnclassifiedErrorIsUnknownAndNotRetried(t *testing.T) {
+	ordinaryErr := errors.New("unclassified exchange failure")
 	ex := &recordingExchange{
 		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {
-			return nil, &common.APIError{Code: -1102, Message: "unclassified API error"}
+			return nil, ordinaryErr
 		},
 	}
 	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
 	waiter := &countingWaiter{}
 	executor.rateLimiter = waiter
 
+	unknown := false
 	_, err := executor.PlaceOrder(&OrderRequest{
 		Symbol: "ETHUSDT", Side: "BUY", Price: 100, Quantity: 0.1,
+		OnSubmissionUnknown: func() { unknown = true },
 	})
-	if err == nil {
-		t.Fatal("PlaceOrder() error = nil, want error")
+	if !errors.Is(err, exchange.ErrOrderPlacementUnknown) || !errors.Is(err, ordinaryErr) {
+		t.Fatalf("PlaceOrder() error = %v, want UNKNOWN wrapping original error", err)
 	}
 	if IsDefiniteOrderRejection(err) {
 		t.Fatalf("PlaceOrder() error = %v, must not be a definite rejection", err)
 	}
-	if len(ex.requests) != 6 || waiter.count != 6 {
-		t.Fatalf("attempts = requests:%d waits:%d, want 6/6", len(ex.requests), waiter.count)
+	if !unknown {
+		t.Fatal("unclassified placement error did not mark submission UNKNOWN")
+	}
+	if len(ex.requests) != 1 || waiter.count != 1 {
+		t.Fatalf("unclassified error was retried: requests=%d waits=%d", len(ex.requests), waiter.count)
 	}
 }
 
@@ -779,6 +819,66 @@ func TestBatchPlaceOrdersSkipsLaterBuysAfterMarginRejectionButKeepsSells(t *test
 	if len(ex.requests) != 2 || ex.requests[0].ClientOrderID != "buy-rejected" ||
 		ex.requests[1].ClientOrderID != "sell-kept" {
 		t.Fatalf("submitted requests = %+v, want first BUY and later SELL only", ex.requests)
+	}
+}
+
+func TestBatchPlaceOrdersStopsOnReduceOnlySellMarginRejection(t *testing.T) {
+	ex := &recordingExchange{
+		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {
+			return nil, &common.APIError{Code: -2019, Message: "insufficient margin"}
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	waiter := &countingWaiter{}
+	executor.rateLimiter = waiter
+
+	placed, marginErr, err := executor.BatchPlaceOrders([]*OrderRequest{
+		{
+			Symbol: "ETHUSDT", Side: "SELL", Price: 101, Quantity: 0.1,
+			ReduceOnly: true, ClientOrderID: "reduce-rejected",
+		},
+		{Symbol: "ETHUSDT", Side: "BUY", Price: 99, Quantity: 0.1, ClientOrderID: "must-not-submit"},
+	})
+	if !errors.Is(err, ErrReduceOnlySellMarginRejected) {
+		t.Fatalf("BatchPlaceOrders() error = %v, want ErrReduceOnlySellMarginRejected", err)
+	}
+	var rejected *OrderRejectedError
+	if !errors.As(err, &rejected) || rejected.Kind != OrderRejectionMargin {
+		t.Fatalf("BatchPlaceOrders() rejection = %#v, want preserved margin kind", rejected)
+	}
+	if IsDefiniteOrderRejection(err) {
+		t.Fatalf("BatchPlaceOrders() error = %v, escalated reduction failure must not be definite", err)
+	}
+	if !marginErr || len(placed) != 0 || len(ex.requests) != 1 || waiter.count != 1 {
+		t.Fatalf("BatchPlaceOrders() = placed:%d margin:%v requests:%d waits:%d, want immediate stop",
+			len(placed), marginErr, len(ex.requests), waiter.count)
+	}
+}
+
+func TestBatchPlaceOrdersDoesNotEscalateUnknownReduceOnlySellAsMarginRejection(t *testing.T) {
+	ex := &recordingExchange{
+		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {
+			return nil, fmt.Errorf("insufficient margin response lost: %w", exchange.ErrOrderPlacementUnknown)
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	executor.rateLimiter = &countingWaiter{}
+
+	placed, marginErr, err := executor.BatchPlaceOrders([]*OrderRequest{
+		{
+			Symbol: "ETHUSDT", Side: "SELL", Price: 101, Quantity: 0.1,
+			ReduceOnly: true, ClientOrderID: "reduce-unknown",
+		},
+	})
+	if !errors.Is(err, exchange.ErrOrderPlacementUnknown) {
+		t.Fatalf("BatchPlaceOrders() error = %v, want ErrOrderPlacementUnknown", err)
+	}
+	if errors.Is(err, ErrReduceOnlySellMarginRejected) {
+		t.Fatalf("BatchPlaceOrders() error = %v, UNKNOWN must not be labeled a definite SELL margin rejection", err)
+	}
+	if !marginErr || len(placed) != 0 || len(ex.requests) != 1 {
+		t.Fatalf("BatchPlaceOrders() = placed:%d margin:%v requests:%d, want UNKNOWN stop with margin diagnostic",
+			len(placed), marginErr, len(ex.requests))
 	}
 }
 

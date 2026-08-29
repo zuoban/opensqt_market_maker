@@ -5,6 +5,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	orderpkg "opensqt/order"
 )
 
 type marginThenAcceptExecutor struct {
@@ -54,6 +56,129 @@ func (e *marginThenAcceptExecutor) BatchPlaceOrders(requests []*OrderRequest) ([
 func (e *marginThenAcceptExecutor) BatchCancelOrders([]int64) error {
 	e.cancelCalls++
 	return nil
+}
+
+type reduceOnlySellMarginExecutor struct {
+	requests []*OrderRequest
+	err      error
+}
+
+func (e *reduceOnlySellMarginExecutor) PlaceOrder(*OrderRequest) (*Order, error) {
+	return nil, e.err
+}
+
+func (e *reduceOnlySellMarginExecutor) BatchPlaceOrders(requests []*OrderRequest) ([]*Order, bool, error) {
+	e.requests = append(e.requests, requests...)
+	for _, req := range requests {
+		release, ok := req.AcquireSubmissionLease()
+		if ok {
+			release()
+		}
+	}
+	return nil, true, e.err
+}
+
+func (e *reduceOnlySellMarginExecutor) BatchCancelOrders([]int64) error { return nil }
+
+func TestReduceOnlySellMarginRejectionPropagatesAndPreservesInventory(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.BuyWindowSize = 0
+	cfg.Trading.SellWindowSize = 1
+
+	marginRejected := orderpkg.NewOrderRejectedError(
+		orderpkg.OrderRejectionMargin,
+		errors.New("insufficient margin"),
+	)
+	criticalErr := errors.Join(orderpkg.ErrReduceOnlySellMarginRejected, marginRejected)
+	executor := &reduceOnlySellMarginExecutor{err: criticalErr}
+	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3)
+	spm.anchorPrice = 100
+
+	slot := spm.getOrCreateSlot(100)
+	slot.PositionStatus = PositionStatusFilled
+	slot.PositionQty = 0.1
+
+	type notification struct {
+		delay           time.Duration
+		managerUnlocked bool
+	}
+	notified := make(chan notification, 4)
+	spm.SetAdjustmentNotifier(func(delay time.Duration) {
+		unlocked := spm.mu.TryLock()
+		if unlocked {
+			spm.mu.Unlock()
+		}
+		notified <- notification{delay: delay, managerUnlocked: unlocked}
+	})
+
+	err := spm.AdjustOrders(100)
+	if !errors.Is(err, orderpkg.ErrReduceOnlySellMarginRejected) {
+		t.Fatalf("AdjustOrders() error = %v, want ErrReduceOnlySellMarginRejected", err)
+	}
+	if orderpkg.IsDefiniteOrderRejection(err) {
+		t.Fatalf("AdjustOrders() error = %v, want non-definite critical failure", err)
+	}
+	var rejected *orderpkg.OrderRejectedError
+	if !errors.As(err, &rejected) || rejected.Kind != orderpkg.OrderRejectionMargin {
+		t.Fatalf("AdjustOrders() rejection = %#v, want margin kind", rejected)
+	}
+	if len(executor.requests) != 1 || executor.requests[0].Side != "SELL" ||
+		!executor.requests[0].ReduceOnly {
+		t.Fatalf("submitted requests = %+v, want one ReduceOnly SELL", executor.requests)
+	}
+
+	slot.mu.RLock()
+	positionStatus := slot.PositionStatus
+	positionQty := slot.PositionQty
+	slotStatus := slot.SlotStatus
+	orderID := slot.OrderID
+	clientOID := slot.ClientOID
+	retryAt := slot.placementRetryNotBefore
+	slot.mu.RUnlock()
+	if positionStatus != PositionStatusFilled || positionQty != 0.1 {
+		t.Fatalf("inventory after rejection = status:%s qty:%v, want FILLED/0.1", positionStatus, positionQty)
+	}
+	if slotStatus != SlotStatusFree || orderID != 0 || clientOID != "" {
+		t.Fatalf("reservation after rejection = slot:%s order:%d client:%q, want FREE/0/empty",
+			slotStatus, orderID, clientOID)
+	}
+	if retryAt.IsZero() || !retryAt.After(time.Now()) {
+		t.Fatalf("retry deadline = %s, want future cooldown", retryAt)
+	}
+	if !spm.insufficientMargin {
+		t.Fatal("critical SELL margin rejection did not activate the BUY margin lock")
+	}
+
+	var notifications []notification
+	for {
+		select {
+		case got := <-notified:
+			notifications = append(notifications, got)
+		default:
+			goto notificationsDrained
+		}
+	}
+
+notificationsDrained:
+	shortRetrySeen := false
+	marginUnlockSeen := false
+	for _, got := range notifications {
+		if !got.managerUnlocked {
+			t.Fatal("retry notifier ran while manager lock was held")
+		}
+		if got.delay > 0 && got.delay <= placementRetryCooldown {
+			shortRetrySeen = true
+		}
+		if got.delay > placementRetryCooldown && got.delay <= spm.marginLockDuration {
+			marginUnlockSeen = true
+		}
+	}
+	if !shortRetrySeen {
+		t.Fatalf("notifications = %+v, want slot retry within %s", notifications, placementRetryCooldown)
+	}
+	if !marginUnlockSeen {
+		t.Fatalf("notifications = %+v, want margin unlock within %s", notifications, spm.marginLockDuration)
+	}
 }
 
 func TestMarginLockKeepsExistingBuysAndStillPlacesReduceOnlySells(t *testing.T) {
@@ -655,5 +780,103 @@ func TestUnboundNewSellUpdateLocksSlotAndPreventsReplacement(t *testing.T) {
 	}
 	if len(executor.orders) != 0 {
 		t.Fatalf("remote SELL was overwritten by new reservation: %+v", executor.orders)
+	}
+}
+
+func TestGridBuyQuantityRoundsUpToMeetMinNotional(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 20
+	spm := NewSuperPositionManager(cfg, stubExecutor{}, stubEx{}, 4, 2)
+
+	quantity := spm.gridBuyQuantity(103.79)
+	if quantity != 0.2 {
+		t.Fatalf("gridBuyQuantity(103.79) = %.12f, want 0.20 (round-half 20/103.79 is 0.19)", quantity)
+	}
+	if quantity*103.79 < 20 {
+		t.Fatalf("buy notional = %.12f, want >= 20", quantity*103.79)
+	}
+	if got := spm.gridBuyQuantity(100); got != 0.2 {
+		t.Fatalf("gridBuyQuantity(100) = %.12f, want 0.20", got)
+	}
+}
+
+func TestReduceOnlyNotionalAllowsQuantityRoundingShortfall(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.MinOrderValue = 20
+	spm := NewSuperPositionManager(cfg, stubExecutor{}, stubEx{}, 4, 2)
+
+	if spm.reduceOnlyNotionalTooSmall(103.89, 0.19) {
+		t.Fatal("0.19 inventory at 103.89 is only one qty step short of min and must still sell")
+	}
+	if !spm.reduceOnlyNotionalTooSmall(103.89, 0.10) {
+		t.Fatal("0.10 inventory at 103.89 is true dust relative to min 20 and should skip")
+	}
+}
+
+func TestAdjustOrdersPlacesSellAfterRoundedMinNotionalBuyFill(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.BuyWindowSize = 0
+	cfg.Trading.SellWindowSize = 3
+	cfg.Trading.PriceInterval = 0.05
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 20
+	executor := &recordingExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 4, 2, 0.01)
+	spm.anchorPrice = 103.79
+
+	for _, slotPrice := range []float64{103.74, 103.79, 103.84} {
+		prepareFilledSellSlot(spm, slotPrice, 0.19)
+	}
+
+	if err := spm.AdjustOrders(103.79); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	sells := recordedSellOrders(executor.orders)
+	if len(sells) != 3 {
+		t.Fatalf("recorded SELL requests = %d, want 3: %+v", len(sells), sells)
+	}
+	for _, order := range sells {
+		if order.Quantity != 0.19 {
+			t.Fatalf("SELL quantity = %.12f, want filled inventory 0.19", order.Quantity)
+		}
+		if order.Price*order.Quantity >= 20 {
+			continue
+		}
+		if order.Price*(order.Quantity+0.01) < 20 {
+			t.Fatalf("SELL %+v is below min even after one qty step", order)
+		}
+	}
+}
+
+func TestAdjustOrdersBuyQuantityMeetsMinNotionalAfterRounding(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 0
+	cfg.Trading.PriceInterval = 0.05
+	cfg.Trading.OrderQuantity = 20
+	cfg.Trading.MinOrderValue = 20
+	executor := &recordingExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 4, 2, 0.01)
+	spm.anchorPrice = 103.79
+
+	if err := spm.AdjustOrders(103.79); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	if len(executor.orders) == 0 {
+		t.Fatal("expected BUY orders below current price")
+	}
+	for _, order := range executor.orders {
+		if order.Side != "BUY" {
+			t.Fatalf("order = %+v, want BUY", order)
+		}
+		if order.Quantity != 0.2 {
+			t.Fatalf("BUY quantity = %.12f at %.4f, want 0.20 so notional stays >= 20",
+				order.Quantity, order.Price)
+		}
+		if order.Quantity*order.Price < 20 {
+			t.Fatalf("BUY notional = %.12f at %.4f, want >= 20",
+				order.Quantity*order.Price, order.Price)
+		}
 	}
 }

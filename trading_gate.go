@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -132,6 +133,10 @@ type tradingPositionManager interface {
 	GetSymbol() string
 }
 
+type adjustmentNotifierPosition interface {
+	SetAdjustmentNotifier(func(delay time.Duration))
+}
+
 type marginGateMonitor interface {
 	IsReady() bool
 	IsTriggered() bool
@@ -222,6 +227,11 @@ type tradingGateRuntime struct {
 	withdrawRequired  atomic.Bool
 	cancelAllRequired atomic.Bool
 	marginCancelDone  atomic.Bool
+	adjustStopped     atomic.Bool
+
+	adjustMu        sync.Mutex
+	adjustImmediate bool
+	adjustDeadlines []time.Time
 
 	lifecycleMu sync.Mutex
 	cancel      context.CancelFunc
@@ -267,6 +277,11 @@ func newTradingGateRuntime(
 	if gate != nil && gate.executor != nil {
 		gate.executor.SetSubmissionHealthGuard(runtime.submissionHealthGuard)
 	}
+	if notifier, ok := positionManager.(adjustmentNotifierPosition); ok {
+		notifier.SetAdjustmentNotifier(func(delay time.Duration) {
+			runtime.RequestAdjustOrders(delay)
+		})
+	}
 	reconciler.SetHealthHandler(runtime.handleReconcileHealth)
 	return runtime
 }
@@ -276,6 +291,109 @@ func (r *tradingGateRuntime) signal() {
 	case r.wake <- struct{}{}:
 	default:
 	}
+}
+
+// RequestAdjustOrders 请求协调协程再次执行一次 AdjustOrders。
+// delay<=0 的请求合并为一个立即标志；未来 deadline 有序保留，避免较早的
+// 普通调整误吞仍处于冷却期的重试。实际订单调整仍只由 run 协程串行执行。
+func (r *tradingGateRuntime) RequestAdjustOrders(delay time.Duration) bool {
+	if r == nil || r.adjustStopped.Load() {
+		return false
+	}
+
+	immediate := delay <= 0
+
+	r.adjustMu.Lock()
+	if r.adjustStopped.Load() {
+		r.adjustMu.Unlock()
+		return false
+	}
+	if immediate {
+		r.adjustImmediate = true
+	} else {
+		deadline := time.Now().Add(delay)
+		index := sort.Search(len(r.adjustDeadlines), func(i int) bool {
+			return !r.adjustDeadlines[i].Before(deadline)
+		})
+		// 完全相同的 deadline 可以合并；不同冷却期限必须分别保留。
+		if index == len(r.adjustDeadlines) || !r.adjustDeadlines[index].Equal(deadline) {
+			r.adjustDeadlines = append(r.adjustDeadlines, time.Time{})
+			copy(r.adjustDeadlines[index+1:], r.adjustDeadlines[index:])
+			r.adjustDeadlines[index] = deadline
+		}
+	}
+	r.adjustMu.Unlock()
+
+	// 即使立即请求被合并，也唤醒协调协程重新观察健康状态；延迟请求则需要
+	// 让协调循环按新的最早 deadline 重新武装唯一的定时器。
+	r.signal()
+	return true
+}
+
+// nextAdjustDeadline 返回仍在未来队列中的最早调整时间。已到期项会在事件
+// 处理或 evaluate 时提升为 immediate 并从队列移除，因此不会反复得到零时长。
+func (r *tradingGateRuntime) nextAdjustDeadline() (time.Time, bool) {
+	r.adjustMu.Lock()
+	defer r.adjustMu.Unlock()
+	if r.adjustStopped.Load() || len(r.adjustDeadlines) == 0 {
+		return time.Time{}, false
+	}
+	return r.adjustDeadlines[0], true
+}
+
+func (r *tradingGateRuntime) promoteDueAdjustRequestsLocked(now time.Time) bool {
+	due := sort.Search(len(r.adjustDeadlines), func(i int) bool {
+		return now.Before(r.adjustDeadlines[i])
+	})
+	if due == 0 {
+		return false
+	}
+	r.adjustImmediate = true
+	if due == len(r.adjustDeadlines) {
+		r.adjustDeadlines = nil
+	} else {
+		copy(r.adjustDeadlines, r.adjustDeadlines[due:])
+		r.adjustDeadlines = r.adjustDeadlines[:len(r.adjustDeadlines)-due]
+	}
+	return true
+}
+
+// promoteDueAdjustRequests 将当前所有已到期 deadline 合并为一个 immediate。
+// 即使健康门禁暂时关闭，immediate 也会保留；未来 deadline 继续由定时器管理。
+func (r *tradingGateRuntime) promoteDueAdjustRequests(now time.Time) bool {
+	r.adjustMu.Lock()
+	defer r.adjustMu.Unlock()
+	if r.adjustStopped.Load() {
+		return false
+	}
+	return r.promoteDueAdjustRequestsLocked(now)
+}
+
+// takeReadyAdjustRequest 在真正调用 AdjustOrders 前只取走 immediate 和已到期
+// deadline。未来 deadline 始终保留；调用期间新到达的请求也形成下一轮 pending。
+func (r *tradingGateRuntime) takeReadyAdjustRequest(now time.Time) bool {
+	r.adjustMu.Lock()
+	defer r.adjustMu.Unlock()
+	if r.adjustStopped.Load() {
+		return false
+	}
+	r.promoteDueAdjustRequestsLocked(now)
+	if !r.adjustImmediate {
+		return false
+	}
+	r.adjustImmediate = false
+	return true
+}
+
+func (r *tradingGateRuntime) stopAdjustRequests() {
+	if r == nil {
+		return
+	}
+	r.adjustStopped.Store(true)
+	r.adjustMu.Lock()
+	r.adjustImmediate = false
+	r.adjustDeadlines = nil
+	r.adjustMu.Unlock()
 }
 
 // disableForRecovery 只在门禁真的从开启切到关闭时标记撤买单和恢复对账。
@@ -469,6 +587,7 @@ func (r *tradingGateRuntime) Start(parent context.Context) error {
 
 func (r *tradingGateRuntime) Stop() {
 	r.gate.BeginShutdown()
+	r.stopAdjustRequests()
 	r.lifecycleMu.Lock()
 	cancel := r.cancel
 	done := r.done
@@ -482,9 +601,13 @@ func (r *tradingGateRuntime) Stop() {
 }
 
 func (r *tradingGateRuntime) run(ctx context.Context, initialResult chan<- error) {
+	defer r.stopAdjustRequests()
 	priceChanges := r.price.Subscribe()
 	reconcileTicker := time.NewTicker(r.reconcileEvery)
 	defer reconcileTicker.Stop()
+	adjustTimer := time.NewTimer(time.Hour)
+	adjustTimer.Stop()
+	defer adjustTimer.Stop()
 
 	if err := r.evaluate(ctx, false); err != nil {
 		initialResult <- r.rollbackFailedStart(err)
@@ -506,6 +629,19 @@ func (r *tradingGateRuntime) run(ctx context.Context, initialResult chan<- error
 	initialResult <- nil
 
 	for {
+		var adjustTimerC <-chan time.Time
+		// 项目要求 Go 1.25；channel timer 在 Stop/Reset 返回后保证不会再交付
+		// 旧设置的 tick，因此每轮可安全按当前队首 deadline 重新武装。
+		adjustTimer.Stop()
+		if deadline, ok := r.nextAdjustDeadline(); ok {
+			wait := time.Until(deadline)
+			if wait < 0 {
+				wait = 0
+			}
+			adjustTimer.Reset(wait)
+			adjustTimerC = adjustTimer.C
+		}
+
 		select {
 		case <-ctx.Done():
 			return
@@ -520,6 +656,12 @@ func (r *tradingGateRuntime) run(ctx context.Context, initialResult chan<- error
 			if err := r.evaluate(ctx, false); err != nil && ctx.Err() == nil {
 				logger.Error("❌ 交易门禁健康评估失败: %v", err)
 			}
+		case <-adjustTimerC:
+			if r.promoteDueAdjustRequests(time.Now()) {
+				if err := r.evaluate(ctx, false); err != nil && ctx.Err() == nil {
+					logger.Error("❌ 交易门禁延迟调整失败: %v", err)
+				}
+			}
 		case <-reconcileTicker.C:
 			r.periodicReconcile(ctx)
 			if err := r.evaluate(ctx, false); err != nil && ctx.Err() == nil {
@@ -532,6 +674,7 @@ func (r *tradingGateRuntime) run(ctx context.Context, initialResult chan<- error
 func (r *tradingGateRuntime) rollbackFailedStart(startErr error) error {
 	// 首次 AdjustOrders 可能已经部分成功；返回启动错误前必须永久关门并确认远端为空。
 	r.gate.BeginShutdown()
+	r.stopAdjustRequests()
 	r.withdrawRequired.Store(false)
 	ctx, cancel := context.WithTimeout(context.Background(), startupCancelTimeout)
 	defer cancel()
@@ -624,6 +767,9 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 		if err != nil {
 			return fmt.Errorf("开启新下单门禁失败: %w", err)
 		}
+		// 首次放行本身必定执行 AdjustOrders，只消费 immediate 和已经到期的
+		// 请求；仍在冷却期的 deadline 必须保留到期后再触发。
+		r.takeReadyAdjustRequest(time.Now())
 		if err := r.position.AdjustOrders(r.price.GetLastPrice()); err != nil {
 			if order.IsDefiniteOrderRejection(err) {
 				logger.Warn("⚠️ 门禁放行后的首次订单调整包含明确未受理订单，保留已确认订单并继续交易: %v", err)
@@ -646,7 +792,8 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 		return nil
 	}
 
-	if priceChanged {
+	adjustRequested := r.takeReadyAdjustRequest(time.Now())
+	if priceChanged || adjustRequested {
 		if err := r.position.AdjustOrders(r.price.GetLastPrice()); err != nil {
 			if order.IsDefiniteOrderRejection(err) {
 				logger.Warn("⚠️ 实时订单调整包含明确未受理订单，保留已确认订单并继续交易: %v", err)

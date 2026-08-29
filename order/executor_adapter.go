@@ -28,6 +28,9 @@ var (
 	// ErrTradingHealthGuardRejected 表示订单在最终交易所边界前的
 	// 同步健康复检失败，请求尚未发送到交易所。
 	ErrTradingHealthGuardRejected = errors.New("下单前交易健康复检失败")
+	// ErrReduceOnlySellMarginRejected 表示本应降低风险的 SELL 平仓单也因
+	// 保证金不足被交易所明确拒绝，必须停止本批并交由门禁恢复处理。
+	ErrReduceOnlySellMarginRejected = errors.New("ReduceOnly SELL 因保证金不足被拒绝")
 )
 
 type contextWaiter interface {
@@ -87,7 +90,6 @@ type ExchangeOrderExecutor struct {
 
 	// 时间配置
 	rateLimitRetryDelay time.Duration
-	orderRetryDelay     time.Duration
 	requestTimeout      time.Duration
 }
 
@@ -111,7 +113,7 @@ func (oe *ExchangeOrderExecutor) checkSubmissionHealth() error {
 }
 
 // NewExchangeOrderExecutor 创建基于交易所接口的订单执行器
-func NewExchangeOrderExecutor(ex exchange.IExchange, symbol string, rateLimitRetryDelay, orderRetryDelay int) *ExchangeOrderExecutor {
+func NewExchangeOrderExecutor(ex exchange.IExchange, symbol string, rateLimitRetryDelay, _ int) *ExchangeOrderExecutor {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	newOrdersCtx, newOrdersCancel := context.WithCancel(rootCtx)
 	oe := &ExchangeOrderExecutor{
@@ -123,7 +125,6 @@ func NewExchangeOrderExecutor(ex exchange.IExchange, symbol string, rateLimitRet
 		newOrdersCtx:        newOrdersCtx,
 		newOrdersCancel:     newOrdersCancel,
 		rateLimitRetryDelay: time.Duration(rateLimitRetryDelay) * time.Second,
-		orderRetryDelay:     time.Duration(orderRetryDelay) * time.Millisecond,
 		requestTimeout:      defaultRequestTimeout,
 	}
 	oe.newOrdersEnabled.Store(true)
@@ -308,17 +309,17 @@ func acquireSubmissionLease(req *OrderRequest) (func(), bool) {
 	return release, true
 }
 
-// PlaceOrder 下单（严格 PostOnly，带重试）
+// PlaceOrder 下单（严格 PostOnly，仅对明确限流做有界重试）
 func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 	placeCtx, err := oe.newOrderContext()
 	if err != nil {
 		return nil, err
 	}
 
-	const maxRetries = 5 // 首次尝试失败后最多再重试5次
+	const maxRateLimitRetries = 5 // 首次限流失败后最多再重试5次
 	var lastErr error
 
-	for i := 0; i <= maxRetries; i++ {
+	for i := 0; i <= maxRateLimitRetries; i++ {
 		if !oe.newOrdersEnabled.Load() {
 			return nil, ErrNewOrdersStopped
 		}
@@ -431,7 +432,7 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			lastErr = NewOrderRejectedError(rejectionKind, err)
 			// 速率限制，等待后重试
 			logger.Warn("⚠️ 触发速率限制，等待后重试...")
-			if i < maxRetries {
+			if i < maxRateLimitRetries {
 				if err := waitWithContext(placeCtx, oe.rateLimitRetryDelay); err != nil {
 					return nil, oe.placementContextError("速率限制退避被取消", err)
 				}
@@ -450,15 +451,12 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			return nil, rejectedErr
 		}
 
-		// 其他错误，短暂等待后重试
-		if i < maxRetries {
-			if err := waitWithContext(placeCtx, oe.orderRetryDelay); err != nil {
-				return nil, oe.placementContextError("下单重试等待被取消", err)
-			}
-		}
+		// PlaceOrder 已经越过真实交易所边界。适配器若没有明确证明请求被拒绝，
+		// 执行器就不能假设远端没有生成订单，更不能换下一次尝试盲目重提。
+		return nil, unknownSubmissionError(req, "下单返回未分类错误，禁止自动重试", err)
 	}
 
-	return nil, fmt.Errorf("下单失败（重试%d次）: %w", maxRetries, lastErr)
+	return nil, fmt.Errorf("下单失败（限流重试%d次）: %w", maxRateLimitRetries, lastErr)
 }
 
 // BatchPlaceOrders 批量下单
@@ -496,6 +494,16 @@ func (oe *ExchangeOrderExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Or
 				errors.Is(err, ErrNewOrdersStopped) || errors.Is(err, ErrOrderExecutorStopped) ||
 				errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 			marginFailure := isMarginError(err)
+			var marginRejection *OrderRejectedError
+			definiteMarginFailure := IsDefiniteOrderRejection(err) &&
+				errors.As(err, &marginRejection) && marginRejection.Kind == OrderRejectionMargin
+			if definiteMarginFailure && orderReq.ReduceOnly && strings.EqualFold(orderReq.Side, "SELL") {
+				// BUY 保证金拒绝只需锁住后续开仓；连 ReduceOnly SELL 都被拒绝
+				// 则无法按预期降低风险，升级为非 definite 的门禁恢复错误。
+				// UNKNOWN 即使错误文本含 insufficient 也不能被降级成明确保证金拒绝。
+				err = errors.Join(ErrReduceOnlySellMarginRejected, err)
+				mustStopBatch = true
+			}
 			if marginFailure {
 				hasMarginError = true
 				logger.Error("❌ [保证金不足] 订单 %.2f %s 因保证金不足失败", orderReq.Price, orderReq.Side)

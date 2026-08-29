@@ -1,7 +1,7 @@
 # OpenSQT 做市商系统架构说明
 
-> **版本**: v3.5.2
-> **最近更新**: 2026-08-29
+> **版本**: v3.5.5
+> **最近更新**: 2026-08-30
 > **目的**: 说明当前运行架构、交易安全边界与扩展约束
 
 ---
@@ -618,15 +618,15 @@ PlaceOrder(req *OrderRequest) (*Order, error) {
     rateLimiter.Wait(ctx)
     req.PostOnly = true
     order, err := exchange.PlaceOrder(requestTimeoutCtx, req)
-    if resultIsUnknown(err) {
+    if resultIsUnknown(err) || unclassifiedAfterSubmission(err) {
         return nil, err // 上层关门并对账，禁止换 ID 重下
+    }
+    if rateLimited(err) {
+        waitWithContext(ctx, rateLimitRetryDelay)
+        // 仅对明确限流做有界重试
     }
     if definitelyRejected(err) {
         return nil, OrderRejectedError{Cause: err} // 局部释放，不触发全局撤买
-    }
-    if safelyRetryable(err) {
-        waitWithContext(ctx, orderRetryDelay)
-        // 使用同一槽位请求继续受控重试
     }
     return order, err
 }
@@ -981,7 +981,6 @@ timing:
   listen_key_keepalive_interval: 30
   price_send_interval: 50
   rate_limit_retry_delay: 1
-  order_retry_delay: 500
   price_poll_interval: 500
   status_print_interval: 1
   order_cleanup_interval: 60
@@ -1056,5 +1055,5 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 
 **官网**:
 - Website: www.OpenSQT.com
-- Version: v3.5.2
-- Last Updated: 2026-08-29
+- Version: v3.5.5
+- Last Updated: 2026-08-30

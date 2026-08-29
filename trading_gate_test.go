@@ -819,6 +819,15 @@ func (p *adjustmentTradingPosition) AdjustOrders(float64) error {
 
 func (p *adjustmentTradingPosition) GetSymbol() string { return "BTCUSDT" }
 
+type adjustmentNotifierTradingPosition struct {
+	adjustmentTradingPosition
+	notifier func(time.Duration)
+}
+
+func (p *adjustmentNotifierTradingPosition) SetAdjustmentNotifier(notifier func(time.Duration)) {
+	p.notifier = notifier
+}
+
 type staticMarginGateMonitor struct {
 	mu        sync.RWMutex
 	ready     bool
@@ -879,6 +888,88 @@ func (p *concurrentTradingPosition) counts() (adjust, cancel int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.adjustCalls, p.cancelCalls
+}
+
+type observedAdjustCall struct {
+	number int
+	at     time.Time
+}
+
+type observedTradingPosition struct {
+	mu            sync.Mutex
+	adjustCalls   int
+	activeAdjusts int
+	maxActive     int
+	blockCall     int
+	release       <-chan struct{}
+	onAdjust      func(int)
+	calls         chan observedAdjustCall
+}
+
+func newObservedTradingPosition() *observedTradingPosition {
+	return &observedTradingPosition{calls: make(chan observedAdjustCall, 32)}
+}
+
+func (p *observedTradingPosition) CancelAllBuyOrders() error { return nil }
+
+func (p *observedTradingPosition) AdjustOrders(float64) error {
+	p.mu.Lock()
+	p.adjustCalls++
+	callNumber := p.adjustCalls
+	p.activeAdjusts++
+	if p.activeAdjusts > p.maxActive {
+		p.maxActive = p.activeAdjusts
+	}
+	block := callNumber == p.blockCall
+	release := p.release
+	onAdjust := p.onAdjust
+	p.mu.Unlock()
+
+	p.calls <- observedAdjustCall{number: callNumber, at: time.Now()}
+	if onAdjust != nil {
+		onAdjust(callNumber)
+	}
+	if block && release != nil {
+		<-release
+	}
+
+	p.mu.Lock()
+	p.activeAdjusts--
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *observedTradingPosition) GetSymbol() string { return "BTCUSDT" }
+
+func (p *observedTradingPosition) stats() (calls, maxActive int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.adjustCalls, p.maxActive
+}
+
+func waitObservedAdjustCall(t *testing.T, p *observedTradingPosition, want int, timeout time.Duration) observedAdjustCall {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case call := <-p.calls:
+			if call.number == want {
+				return call
+			}
+			if call.number > want {
+				t.Fatalf("observed AdjustOrders call %d before expected call %d", call.number, want)
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for AdjustOrders call %d", want)
+		}
+	}
+}
+
+func snapshotAdjustRequests(runtime *tradingGateRuntime) (bool, []time.Time) {
+	runtime.adjustMu.Lock()
+	defer runtime.adjustMu.Unlock()
+	return runtime.adjustImmediate, append([]time.Time(nil), runtime.adjustDeadlines...)
 }
 
 func newHealthyTradingGateTestRuntime(
@@ -1065,6 +1156,13 @@ func definiteAdjustmentRejection() error {
 	))
 }
 
+func reduceOnlySellMarginAdjustmentError() error {
+	return fmt.Errorf("batch placement failed: %w", errors.Join(
+		order.ErrReduceOnlySellMarginRejected,
+		order.NewOrderRejectedError(order.OrderRejectionMargin, errors.New("insufficient margin")),
+	))
+}
+
 func TestTradingGateInitialDefiniteRejectionKeepsGateEnabled(t *testing.T) {
 	positionManager := &adjustmentTradingPosition{adjustErr: definiteAdjustmentRejection()}
 	runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
@@ -1119,6 +1217,91 @@ func TestTradingGateRealtimeDefiniteRejectionKeepsGateEnabled(t *testing.T) {
 	}
 }
 
+func TestTradingGateOrdinaryBuyMarginRejectionKeepsGateEnabled(t *testing.T) {
+	marginErr := order.NewOrderRejectedError(
+		order.OrderRejectionMargin,
+		errors.New("insufficient margin"),
+	)
+	positionManager := &adjustmentTradingPosition{adjustErr: marginErr}
+	runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
+	if _, err := gate.Enable(); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+
+	if err := runtime.evaluate(context.Background(), true); err != nil {
+		t.Fatalf("evaluate() error = %v, want nil for ordinary BUY margin rejection", err)
+	}
+	if !gate.Enabled() || runtime.withdrawRequired.Load() || runtime.needsReconcile.Load() {
+		t.Fatalf("ordinary BUY margin rejection changed gate state: enabled=%v withdraw=%v reconcile=%v",
+			gate.Enabled(), runtime.withdrawRequired.Load(), runtime.needsReconcile.Load())
+	}
+	if !runtime.reconciler.IsHealthy() {
+		t.Fatal("ordinary BUY margin rejection invalidated the reconciler")
+	}
+	if positionManager.adjustCalls != 1 || positionManager.cancelCalls != 0 {
+		t.Fatalf("position calls = adjust:%d cancel:%d, want adjust:1 cancel:0",
+			positionManager.adjustCalls, positionManager.cancelCalls)
+	}
+	if enableCalls, stopCalls := executor.counts(); enableCalls != 1 || stopCalls != 0 {
+		t.Fatalf("executor calls = enable:%d stop:%d, want 1/0", enableCalls, stopCalls)
+	}
+}
+
+func TestTradingGateReduceOnlySellMarginRejectionRecoversFailClosed(t *testing.T) {
+	criticalErr := reduceOnlySellMarginAdjustmentError()
+	if order.IsDefiniteOrderRejection(criticalErr) {
+		t.Fatalf("critical SELL margin error = %v, want non-definite", criticalErr)
+	}
+	positionManager := &adjustmentTradingPosition{adjustErr: criticalErr}
+	runtime, gate, executor := newHealthyTradingGateTestRuntime(t, positionManager)
+	if _, err := gate.Enable(); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+
+	err := runtime.evaluate(context.Background(), true)
+	if !errors.Is(err, order.ErrReduceOnlySellMarginRejected) {
+		t.Fatalf("evaluate() error = %v, want ErrReduceOnlySellMarginRejected", err)
+	}
+	if gate.Enabled() {
+		t.Fatal("gate remained enabled after critical SELL margin rejection")
+	}
+	if !runtime.withdrawRequired.Load() || !runtime.needsReconcile.Load() {
+		t.Fatalf("recovery flags = withdraw:%v reconcile:%v, want both true",
+			runtime.withdrawRequired.Load(), runtime.needsReconcile.Load())
+	}
+	if runtime.reconciler.IsHealthy() {
+		t.Fatal("critical SELL margin rejection did not invalidate reconciler")
+	}
+	if positionManager.adjustCalls != 1 || positionManager.cancelCalls != 0 {
+		t.Fatalf("first position calls = adjust:%d cancel:%d, want adjust:1 cancel:0",
+			positionManager.adjustCalls, positionManager.cancelCalls)
+	}
+	if enableCalls, stopCalls := executor.counts(); enableCalls != 1 || stopCalls != 1 {
+		t.Fatalf("first executor calls = enable:%d stop:%d, want 1/1", enableCalls, stopCalls)
+	}
+
+	// 模拟关键拒绝原因已消失。下一次协调应先撤 BUY、强制对账，
+	// 然后重新放行并执行恢复后的首次 AdjustOrders。
+	positionManager.adjustErr = nil
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("recovery evaluate() error = %v", err)
+	}
+	if !gate.Enabled() || runtime.withdrawRequired.Load() || runtime.needsReconcile.Load() {
+		t.Fatalf("recovered gate state: enabled=%v withdraw=%v reconcile=%v, want true/false/false",
+			gate.Enabled(), runtime.withdrawRequired.Load(), runtime.needsReconcile.Load())
+	}
+	if !runtime.reconciler.IsHealthy() {
+		t.Fatal("forced reconciliation did not restore reconciler health")
+	}
+	if positionManager.adjustCalls != 2 || positionManager.cancelCalls != 1 {
+		t.Fatalf("recovered position calls = adjust:%d cancel:%d, want adjust:2 cancel:1",
+			positionManager.adjustCalls, positionManager.cancelCalls)
+	}
+	if enableCalls, stopCalls := executor.counts(); enableCalls != 2 || stopCalls != 1 {
+		t.Fatalf("recovered executor calls = enable:%d stop:%d, want 2/1", enableCalls, stopCalls)
+	}
+}
+
 func TestTradingGateRealtimeUnknownAndOrdinaryErrorsEnterRecovery(t *testing.T) {
 	unknownErr := fmt.Errorf("gateway response lost: %w", exchange.ErrOrderPlacementUnknown)
 	ordinaryErr := errors.New("local state update failed")
@@ -1160,5 +1343,304 @@ func TestTradingGateRealtimeUnknownAndOrdinaryErrorsEnterRecovery(t *testing.T) 
 				t.Fatalf("executor calls = enable:%d stop:%d, want enable:1 stop:1", enableCalls, stopCalls)
 			}
 		})
+	}
+}
+
+func TestTradingGateInitialAdjustKeepsFutureRequestAndRequestDuringAdjust(t *testing.T) {
+	positionManager := newObservedTradingPosition()
+	runtime, gate, _ := newHealthyTradingGateTestRuntime(t, positionManager)
+	positionManager.onAdjust = func(callNumber int) {
+		if callNumber == 1 && !runtime.RequestAdjustOrders(0) {
+			t.Error("request made during initial AdjustOrders was rejected")
+		}
+	}
+
+	if !runtime.RequestAdjustOrders(time.Hour) {
+		t.Fatal("pre-existing delayed adjust request was rejected")
+	}
+	futureDeadline, ok := runtime.nextAdjustDeadline()
+	if !ok {
+		t.Fatal("pre-existing delayed adjust request was not queued")
+	}
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("initial evaluate() error = %v", err)
+	}
+	if !gate.Enabled() {
+		t.Fatal("gate was not enabled by initial evaluation")
+	}
+	if calls, _ := positionManager.stats(); calls != 1 {
+		t.Fatalf("initial AdjustOrders calls = %d, want 1", calls)
+	}
+	if deadline, ok := runtime.nextAdjustDeadline(); !ok || !deadline.Equal(futureDeadline) {
+		t.Fatalf("initial AdjustOrders consumed future deadline: got (%s, %v), want (%s, true)",
+			deadline, ok, futureDeadline)
+	}
+
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("requested evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 2 {
+		t.Fatalf("AdjustOrders calls after in-flight request = %d, want 2", calls)
+	}
+	if deadline, ok := runtime.nextAdjustDeadline(); !ok || !deadline.Equal(futureDeadline) {
+		t.Fatalf("immediate AdjustOrders consumed future deadline: got (%s, %v), want (%s, true)",
+			deadline, ok, futureDeadline)
+	}
+	if err := runtime.evaluate(context.Background(), true); err != nil {
+		t.Fatalf("price-change evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 3 {
+		t.Fatalf("price-change AdjustOrders calls = %d, want 3", calls)
+	}
+	if deadline, ok := runtime.nextAdjustDeadline(); !ok || !deadline.Equal(futureDeadline) {
+		t.Fatalf("price-change AdjustOrders consumed future deadline: got (%s, %v), want (%s, true)",
+			deadline, ok, futureDeadline)
+	}
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("idle evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 3 {
+		t.Fatalf("consumed request ran repeatedly: AdjustOrders calls = %d, want 3", calls)
+	}
+}
+
+func TestNewTradingGateRuntimeConnectsOptionalAdjustmentNotifier(t *testing.T) {
+	positionManager := &adjustmentNotifierTradingPosition{}
+	runtime := newTradingGateRuntime(
+		newSerializedOrderGate(&recordingNewOrderGate{}),
+		nil,
+		nil,
+		nil,
+		nil,
+		&safety.Reconciler{},
+		positionManager,
+		time.Second,
+		time.Second,
+	)
+	if positionManager.notifier == nil {
+		t.Fatal("optional adjustment notifier was not installed")
+	}
+	positionManager.notifier(time.Hour)
+	if _, ok := runtime.nextAdjustDeadline(); !ok {
+		t.Fatal("installed notifier did not enqueue a delayed adjust request")
+	}
+}
+
+func TestTradingGateUnhealthyEvaluationRetainsImmediateWithoutZeroTimer(t *testing.T) {
+	positionManager := newObservedTradingPosition()
+	runtime, gate, _ := newHealthyTradingGateTestRuntime(t, positionManager)
+	if _, err := gate.Enable(); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	runtime.margin = &staticMarginGateMonitor{}
+	if !runtime.RequestAdjustOrders(0) {
+		t.Fatal("immediate request was rejected")
+	}
+
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("unhealthy evaluate() error = %v", err)
+	}
+	runtime.adjustMu.Lock()
+	immediate := runtime.adjustImmediate
+	deadlines := len(runtime.adjustDeadlines)
+	runtime.adjustMu.Unlock()
+	if !immediate || deadlines != 0 {
+		t.Fatalf("unhealthy request state = immediate:%v deadlines:%d, want true/0", immediate, deadlines)
+	}
+	if _, ok := runtime.nextAdjustDeadline(); ok {
+		t.Fatal("retained immediate request incorrectly armed a zero-duration timer")
+	}
+	if calls, _ := positionManager.stats(); calls != 0 {
+		t.Fatalf("unhealthy evaluation called AdjustOrders %d times, want 0", calls)
+	}
+}
+
+func TestTradingGateAdjustRequestsCoalesceAndRunSerially(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBlockedAdjust := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(releaseBlockedAdjust)
+	positionManager := newObservedTradingPosition()
+	positionManager.blockCall = 2
+	positionManager.release = release
+	runtime, _, _ := newHealthyTradingGateTestRuntime(t, positionManager)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := runtime.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() {
+		releaseBlockedAdjust()
+		runtime.Stop()
+	})
+	waitObservedAdjustCall(t, positionManager, 1, time.Second)
+
+	if !runtime.RequestAdjustOrders(0) {
+		t.Fatal("immediate adjust request was rejected")
+	}
+	waitObservedAdjustCall(t, positionManager, 2, time.Second)
+	for i := 0; i < 64; i++ {
+		delay := time.Duration(i%2) * time.Hour
+		if !runtime.RequestAdjustOrders(delay) {
+			t.Fatalf("in-flight adjust request %d was rejected", i)
+		}
+	}
+	releaseBlockedAdjust()
+	waitObservedAdjustCall(t, positionManager, 3, time.Second)
+
+	time.Sleep(50 * time.Millisecond)
+	if calls, maxActive := positionManager.stats(); calls != 3 || maxActive != 1 {
+		t.Fatalf("AdjustOrders stats = calls:%d max-active:%d, want 3/1", calls, maxActive)
+	}
+}
+
+func TestTradingGateImmediateAdjustDoesNotConsumeFutureDeadline(t *testing.T) {
+	positionManager := newObservedTradingPosition()
+	runtime, _, _ := newHealthyTradingGateTestRuntime(t, positionManager)
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("initial evaluate() error = %v", err)
+	}
+
+	if !runtime.RequestAdjustOrders(time.Hour) {
+		t.Fatal("delayed request was rejected")
+	}
+	futureDeadline, ok := runtime.nextAdjustDeadline()
+	if !ok {
+		t.Fatal("delayed request was not queued")
+	}
+	if !runtime.RequestAdjustOrders(0) {
+		t.Fatal("immediate request was rejected")
+	}
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("immediate evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 2 {
+		t.Fatalf("AdjustOrders calls after immediate request = %d, want 2", calls)
+	}
+	if deadline, ok := runtime.nextAdjustDeadline(); !ok || !deadline.Equal(futureDeadline) {
+		t.Fatalf("immediate adjustment consumed future deadline: got (%s, %v), want (%s, true)",
+			deadline, ok, futureDeadline)
+	}
+
+	if !runtime.promoteDueAdjustRequests(futureDeadline) {
+		t.Fatal("future deadline did not become ready at its deadline")
+	}
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("delayed evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 3 {
+		t.Fatalf("AdjustOrders calls after delayed request = %d, want 3", calls)
+	}
+	if _, ok := runtime.nextAdjustDeadline(); ok {
+		t.Fatal("consumed delayed request remained queued")
+	}
+}
+
+func TestTradingGateMultipleDelayedDeadlinesRemainIndependent(t *testing.T) {
+	positionManager := newObservedTradingPosition()
+	runtime, _, _ := newHealthyTradingGateTestRuntime(t, positionManager)
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("initial evaluate() error = %v", err)
+	}
+
+	for _, delay := range []time.Duration{time.Hour, 2 * time.Hour, 3 * time.Hour} {
+		if !runtime.RequestAdjustOrders(delay) {
+			t.Fatalf("delayed request %s was rejected", delay)
+		}
+	}
+	immediate, deadlines := snapshotAdjustRequests(runtime)
+	if immediate || len(deadlines) != 3 {
+		t.Fatalf("initial delayed state = immediate:%v deadlines:%d, want false/3", immediate, len(deadlines))
+	}
+
+	for i, deadline := range deadlines {
+		if !runtime.promoteDueAdjustRequests(deadline) {
+			t.Fatalf("deadline %d was not promoted at its due time", i+1)
+		}
+		if err := runtime.evaluate(context.Background(), false); err != nil {
+			t.Fatalf("evaluate() for deadline %d error = %v", i+1, err)
+		}
+		immediate, remaining := snapshotAdjustRequests(runtime)
+		wantRemaining := len(deadlines) - i - 1
+		if immediate || len(remaining) != wantRemaining {
+			t.Fatalf("state after deadline %d = immediate:%v remaining:%d, want false/%d",
+				i+1, immediate, len(remaining), wantRemaining)
+		}
+		if wantRemaining > 0 && !remaining[0].Equal(deadlines[i+1]) {
+			t.Fatalf("deadline %d consumed next future deadline: got %s, want %s",
+				i+1, remaining[0], deadlines[i+1])
+		}
+	}
+	if calls, maxActive := positionManager.stats(); calls != 4 || maxActive != 1 {
+		t.Fatalf("delayed AdjustOrders stats = calls:%d max-active:%d, want 4/1", calls, maxActive)
+	}
+}
+
+func TestTradingGateRecoveryBeforeCooldownDoesNotConsumeDelayedRetry(t *testing.T) {
+	positionManager := newObservedTradingPosition()
+	runtime, gate, _ := newHealthyTradingGateTestRuntime(t, positionManager)
+
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("initial evaluate() error = %v", err)
+	}
+	if !gate.Disable() {
+		t.Fatal("test gate was not enabled before simulated recovery")
+	}
+
+	if !runtime.RequestAdjustOrders(time.Hour) {
+		t.Fatal("recovery delayed request was rejected")
+	}
+	originalDeadline, ok := runtime.nextAdjustDeadline()
+	if !ok {
+		t.Fatal("recovery delayed request was not queued")
+	}
+	// 在冷却期前手动执行恢复评估，避免测试依赖调度器是否及时处理 wake。
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("recovery evaluate() error = %v", err)
+	}
+	if !gate.Enabled() {
+		t.Fatal("gate did not recover before cooldown")
+	}
+
+	if deadline, ok := runtime.nextAdjustDeadline(); !ok || !deadline.Equal(originalDeadline) {
+		t.Fatalf("gate recovery consumed cooldown deadline: got (%s, %v), want (%s, true)",
+			deadline, ok, originalDeadline)
+	}
+	if calls, _ := positionManager.stats(); calls != 2 {
+		t.Fatalf("AdjustOrders calls after recovery = %d, want 2", calls)
+	}
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("post-recovery evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 2 {
+		t.Fatalf("future cooldown retried early: AdjustOrders calls = %d, want 2", calls)
+	}
+}
+
+func TestTradingGateStopCancelsDelayedAdjustAndRejectsNewRequests(t *testing.T) {
+	positionManager := newObservedTradingPosition()
+	runtime, _, _ := newHealthyTradingGateTestRuntime(t, positionManager)
+
+	if err := runtime.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	waitObservedAdjustCall(t, positionManager, 1, time.Second)
+	if !runtime.RequestAdjustOrders(100 * time.Millisecond) {
+		t.Fatal("delayed request before Stop was rejected")
+	}
+	runtime.Stop()
+
+	if runtime.RequestAdjustOrders(0) {
+		t.Fatal("adjust request after Stop was accepted")
+	}
+	time.Sleep(150 * time.Millisecond)
+	if calls, maxActive := positionManager.stats(); calls != 1 || maxActive != 1 {
+		t.Fatalf("post-Stop AdjustOrders stats = calls:%d max-active:%d, want 1/1", calls, maxActive)
+	}
+	if _, ok := runtime.nextAdjustDeadline(); ok {
+		t.Fatal("delayed adjust deadline remained armed after Stop")
 	}
 }

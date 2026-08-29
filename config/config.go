@@ -89,7 +89,7 @@ type Config struct {
 
 		// 订单执行相关
 		RateLimitRetryDelay  int `yaml:"rate_limit_retry_delay"` // 速率限制重试等待时间（秒，默认1）
-		OrderRetryDelay      int `yaml:"order_retry_delay"`      // 其他错误重试等待时间（毫秒，默认500）
+		OrderRetryDelay      int `yaml:"order_retry_delay"`      // 已弃用，仅为兼容旧配置保留；未分类错误按 UNKNOWN 处理
 		PricePollInterval    int `yaml:"price_poll_interval"`    // 等待获取价格的轮询间隔（毫秒，默认500）
 		StatusPrintInterval  int `yaml:"status_print_interval"`  // 定期打印状态的间隔（分钟，默认1）
 		OrderCleanupInterval int `yaml:"order_cleanup_interval"` // 订单清理检查间隔（秒，默认60）
@@ -222,7 +222,7 @@ func (c *Config) Validate() error {
 		c.Timing.RateLimitRetryDelay = 1 // 默认1秒
 	}
 	if c.Timing.OrderRetryDelay <= 0 {
-		c.Timing.OrderRetryDelay = 500 // 默认500毫秒
+		c.Timing.OrderRetryDelay = 500 // 兼容旧配置；执行器不再盲重试未分类错误
 	}
 	if c.Timing.PricePollInterval <= 0 {
 		c.Timing.PricePollInterval = 500 // 默认500毫秒

@@ -225,6 +225,12 @@ type SuperPositionManager struct {
 	executor OrderExecutorInterface
 	exchange IExchange
 
+	// adjustmentNotifier 将订单流状态变化和失败 reservation 的重试期限
+	// 非阻塞地交给外部串行协调器。回调不得直接重入 SuperPositionManager；
+	// delay<=0 表示尽快调整，delay>0 表示不早于该延迟再次调整。
+	adjustmentNotifierMu sync.RWMutex
+	adjustmentNotifier   func(delay time.Duration)
+
 	// 价格锚点（初始化时的市场价格）
 	anchorPrice float64
 	// 最后市场价格（用于打印状态）
@@ -310,6 +316,29 @@ func NewSuperPositionManager(
 	spm.lastReconcileTime.Store(time.Now())
 	spm.lastMarketPrice.Store(0.0)
 	return spm
+}
+
+// SetAdjustmentNotifier 注册网格重新调整通知。实际下单仍只能由外部串行
+// 协调器调用 AdjustOrders，订单流回调不会在槽位锁内直接重入交易逻辑。
+func (spm *SuperPositionManager) SetAdjustmentNotifier(notifier func(delay time.Duration)) {
+	if spm == nil {
+		return
+	}
+	spm.adjustmentNotifierMu.Lock()
+	spm.adjustmentNotifier = notifier
+	spm.adjustmentNotifierMu.Unlock()
+}
+
+func (spm *SuperPositionManager) notifyAdjustment(delay time.Duration) {
+	if spm == nil {
+		return
+	}
+	spm.adjustmentNotifierMu.RLock()
+	notifier := spm.adjustmentNotifier
+	spm.adjustmentNotifierMu.RUnlock()
+	if notifier != nil {
+		notifier(delay)
+	}
 }
 
 // Initialize 初始化管理器（设置价格锚点并创建初始槽位）
@@ -603,20 +632,23 @@ func sellCandidateEligibleLocked(slot *InventorySlot, now time.Time) bool {
 
 // releaseFailedReservation 只释放明确未提交且身份仍完全匹配的 reservation。
 // UNKNOWN 请求由调用方保留，等待订单流或对账给出确定结果。
-func (spm *SuperPositionManager) releaseFailedReservation(req *OrderRequest) {
+func (spm *SuperPositionManager) releaseFailedReservation(req *OrderRequest) time.Time {
 	price, _, valid := spm.parseClientOrderID(req.ClientOrderID)
 	if !valid {
-		return
+		return time.Time{}
 	}
 	slot := spm.getOrCreateSlot(price)
+	var retryAt time.Time
 	slot.mu.Lock()
 	if spm.matchesReservationLocked(slot, req) {
 		spm.clearReservationLocked(slot)
-		slot.placementRetryNotBefore = time.Now().Add(placementRetryCooldown)
+		retryAt = time.Now().Add(placementRetryCooldown)
+		slot.placementRetryNotBefore = retryAt
 		logger.Debug("🔓 [释放槽位] 明确未提交，释放槽位 %s 的 reservation (ClientOID: %s)",
 			formatPrice(price, spm.priceDecimals), req.ClientOrderID)
 	}
 	slot.mu.Unlock()
+	return retryAt
 }
 
 // placeInitialBuyOrders 设定初始槽位（并恢复持仓槽位）
@@ -638,8 +670,17 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	// 🔥 移除初始化检查：现在完全由 AdjustOrders 控制所有下单
 	// 初始化只负责恢复持仓状态，不再下单
 
+	var adjustmentDeadlines []time.Time
 	spm.mu.Lock()
-	defer spm.mu.Unlock()
+	defer func() {
+		spm.mu.Unlock()
+		// 失败 reservation 和保证金锁到期通知都延迟到全局锁释放之后。
+		// 生产回调只会向串行协调器入队；这里也从实现上杜绝未来回调
+		// 意外重入造成死锁。
+		for _, deadline := range adjustmentDeadlines {
+			spm.notifyAdjustment(time.Until(deadline))
+		}
+	}()
 
 	// 验证价格有效性
 	if currentPrice <= 0 {
@@ -810,11 +851,9 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 
 			// 候选收集后持仓可能已被终态修正。名义价值和提交数量都必须使用
 			// 当前锁内值，不能沿用候选快照。
-			minValue := spm.config.Trading.MinOrderValue
-			if minValue <= 0 {
-				minValue = 6.0
-			}
-			if sellPrice*currentQty < minValue {
+			// 已有持仓必须尽量挂出 ReduceOnly 卖单。数量精度四舍五入后名义价值
+			// 可能略低于 min_order_value，若因此跳过，槽位会永久有仓却补不出对向单。
+			if spm.reduceOnlyNotionalTooSmall(sellPrice, currentQty) {
 				slot.mu.Unlock()
 				continue
 			}
@@ -903,9 +942,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				continue
 			}
 
-			quantity := spm.config.Trading.OrderQuantity / price
-			// 使用从交易所获取的数量精度
-			quantity = roundPrice(quantity, spm.quantityDecimals)
+			quantity := spm.gridBuyQuantity(price)
+			if quantity <= 0 {
+				slot.mu.Unlock()
+				continue
+			}
 
 			// 生成 ClientOrderID
 			clientOID := spm.generateClientOrderID(price, "BUY")
@@ -955,7 +996,9 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		for _, req := range ordersToPlace {
 			if !placedClientOIDs[spm.canonicalClientOrderID(req.ClientOrderID)] &&
 				!req.isSubmissionUncertain() {
-				spm.releaseFailedReservation(req)
+				if retryAt := spm.releaseFailedReservation(req); !retryAt.IsZero() {
+					adjustmentDeadlines = append(adjustmentDeadlines, retryAt)
+				}
 			}
 		}
 
@@ -965,6 +1008,10 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 			logger.Warn("⚠️ [保证金不足] 检测到保证金不足错误，暂停新增买单 %d 秒，保留已有买单并继续减仓", int(spm.marginLockDuration.Seconds()))
 			spm.insufficientMargin = true
 			spm.marginLockTime = time.Now()
+			// 槽位的短冷却会先到期，但此时 BUY 仍受保证金锁保护。额外安排
+			// 锁到期调整，确保同价且没有其它行情/订单事件时也会恢复挂买单。
+			adjustmentDeadlines = append(adjustmentDeadlines,
+				spm.marginLockTime.Add(spm.marginLockDuration))
 		}
 
 		var acceptedOrderErrs []error
@@ -1167,7 +1214,20 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 
 	slot := spm.getOrCreateSlot(price)
 	slot.mu.Lock()
-	defer slot.mu.Unlock()
+	adjustmentNeeded := false
+	var adjustmentNotBefore time.Time
+	defer func() {
+		// 通知必须发生在槽位解锁之后；协调器收到通知后可能立即调用
+		// AdjustOrders，并再次获取当前槽位锁。
+		slot.mu.Unlock()
+		if adjustmentNeeded {
+			delay := time.Duration(0)
+			if !adjustmentNotBefore.IsZero() {
+				delay = time.Until(adjustmentNotBefore)
+			}
+			spm.notifyAdjustment(delay)
+		}
+	}()
 
 	// 完成成交后槽位会清空订单字段；该订单的任何后续重放都必须忽略，
 	// 否则迟到的 PARTIALLY_FILLED/终态推送会重新绑定槽位并重复累计。
@@ -1185,7 +1245,15 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 				update.OrderID, update.ClientOrderID, update.Status)
 			return
 		}
-		spm.applyTerminalOrderCorrection(slot, update, side, price, terminalProgress)
+		adjustmentNeeded = spm.applyTerminalOrderCorrection(slot, update, side, price, terminalProgress)
+		if adjustmentNeeded {
+			// 首次 REJECTED 可能已经给同方向重试设置冷却。若权威修正
+			// 证明下一单方向已经反转，不能让旧冷却阻塞止盈卖单或新买单。
+			if (side == "BUY" && slot.PositionQty > 0) ||
+				(side == "SELL" && slot.PositionQty <= 0) {
+				slot.placementRetryNotBefore = time.Time{}
+			}
+		}
 		return
 	}
 
@@ -1295,6 +1363,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		}
 
 		if update.Status == OrderStatusFilled {
+			adjustmentNeeded = true
 			realizedPNL := 0.0
 			if side == "SELL" {
 				realizedPNL = slot.orderAccumulatedPNL
@@ -1342,6 +1411,21 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 					formatPrice(price, spm.priceDecimals))
 				slot.PositionStatus = PositionStatusEmpty
 				slot.SlotStatus = SlotStatusFree
+			}
+		}
+
+		adjustmentNeeded = true
+		if update.Status == "REJECTED" {
+			// REJECTED 后若仍会重试同方向订单，先退避，避免订单流形成
+			// “拒绝 -> 立即补挂 -> 再拒绝”的紧循环。BUY 已有成交会转挂
+			// SELL，SELL 已完全成交会转挂 BUY，二者都必须立即调整。
+			retrySameSide := (side == "BUY" && slot.PositionQty <= 0 && slot.OrderFilledQty <= 0) ||
+				(side == "SELL" && slot.PositionQty > 0)
+			if retrySameSide {
+				adjustmentNotBefore = time.Now().Add(placementRetryCooldown)
+				slot.placementRetryNotBefore = adjustmentNotBefore
+			} else {
+				slot.placementRetryNotBefore = time.Time{}
 			}
 		}
 
@@ -1463,16 +1547,16 @@ func (spm *SuperPositionManager) applyTerminalOrderCorrection(
 	side string,
 	slotPrice float64,
 	progress terminalOrderProgress,
-) {
+) bool {
 	if math.IsNaN(update.ExecutedQty) || math.IsInf(update.ExecutedQty, 0) || update.ExecutedQty < 0 {
 		logger.Warn("⚠️ [忽略非法终态累计成交] 槽位 %s: 推送 %.12f, 状态 %s",
 			formatPrice(slotPrice, spm.priceDecimals), update.ExecutedQty, update.Status)
-		return
+		return false
 	}
 	if update.ExecutedQty+fillQtyTolerance < progress.ExecutedQty {
 		logger.Debug("⏭️ [忽略回退的终态推送] ID=%d, ClientOID=%s, 已记录=%.12f, 推送=%.12f",
 			update.OrderID, update.ClientOrderID, progress.ExecutedQty, update.ExecutedQty)
-		return
+		return false
 	}
 
 	deltaQty := update.ExecutedQty - progress.ExecutedQty
@@ -1489,7 +1573,7 @@ func (spm *SuperPositionManager) applyTerminalOrderCorrection(
 	if deltaQty == 0 && !acceptPNLCorrection {
 		logger.Debug("⏭️ [重复终态被忽略] ID=%d, ClientOID=%s, Status=%s",
 			update.OrderID, update.ClientOrderID, update.Status)
-		return
+		return false
 	}
 
 	if side == "BUY" {
@@ -1557,6 +1641,7 @@ func (spm *SuperPositionManager) applyTerminalOrderCorrection(
 		progress.UpdateTime = update.UpdateTime
 	}
 	spm.storeTerminalOrderProgress(update, progress)
+	return true
 }
 
 func filledOrderKey(update OrderUpdate) string {
@@ -1775,7 +1860,10 @@ func (spm *SuperPositionManager) getOrCreateSlot(price float64) *InventorySlot {
 		OrderStatus:    OrderStatusNotPlaced,
 		SlotStatus:     SlotStatusFree, // 🔥 初始化为FREE状态
 	}
-	spm.slots.Store(price, slot)
+	actual, loaded := spm.slots.LoadOrStore(price, slot)
+	if loaded {
+		return actual.(*InventorySlot)
+	}
 	return slot
 }
 
@@ -2405,10 +2493,79 @@ func (spm *SuperPositionManager) allocateMakerSafeSellPrice(
 	}
 }
 
+func (spm *SuperPositionManager) minOrderNotional() float64 {
+	if spm != nil && spm.config != nil && spm.config.Trading.MinOrderValue > 0 {
+		return spm.config.Trading.MinOrderValue
+	}
+	return 6.0
+}
+
+func (spm *SuperPositionManager) quantityStep() float64 {
+	decimals := 0
+	if spm != nil && spm.quantityDecimals > 0 {
+		decimals = spm.quantityDecimals
+	}
+	return math.Pow10(-decimals)
+}
+
+// gridBuyQuantity 按固定报价金额计算买入数量。四舍五入后若名义价值低于
+// min_order_value，则向上取整，避免成交后因卖单门槛把槽位卡死。
+func (spm *SuperPositionManager) gridBuyQuantity(price float64) float64 {
+	if spm == nil || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return 0
+	}
+	orderNotional := 0.0
+	if spm.config != nil {
+		orderNotional = spm.config.Trading.OrderQuantity
+	}
+	minValue := spm.minOrderNotional()
+	target := orderNotional
+	if minValue > target {
+		target = minValue
+	}
+	if target <= 0 {
+		return 0
+	}
+
+	raw := target / price
+	quantity := roundPrice(raw, spm.quantityDecimals)
+	if quantity <= 0 || quantity*price+fillQtyTolerance < minValue {
+		quantity = ceilPrice(raw, spm.quantityDecimals)
+	}
+	if quantity*price+fillQtyTolerance < minValue {
+		quantity = roundPrice(quantity+spm.quantityStep(), spm.quantityDecimals)
+	}
+	if quantity <= 0 || math.IsNaN(quantity) || math.IsInf(quantity, 0) ||
+		quantity*price+fillQtyTolerance < minValue {
+		return 0
+	}
+	return quantity
+}
+
+// reduceOnlyNotionalTooSmall 判断已有持仓是否小到不该再挂减仓单。
+// 少一个数量步长就能跨过阈值时视为精度损失，必须继续挂卖单。
+func (spm *SuperPositionManager) reduceOnlyNotionalTooSmall(sellPrice, qty float64) bool {
+	if qty <= fillQtyTolerance || sellPrice <= 0 ||
+		math.IsNaN(qty) || math.IsInf(qty, 0) ||
+		math.IsNaN(sellPrice) || math.IsInf(sellPrice, 0) {
+		return true
+	}
+	minValue := spm.minOrderNotional()
+	if sellPrice*qty+fillQtyTolerance >= minValue {
+		return false
+	}
+	return sellPrice*(qty+spm.quantityStep())+fillQtyTolerance < minValue
+}
+
 // roundPrice 价格四舍五入
 func roundPrice(price float64, decimals int) float64 {
 	multiplier := math.Pow(10, float64(decimals))
 	return math.Round(price*multiplier) / multiplier
+}
+
+func ceilPrice(price float64, decimals int) float64 {
+	multiplier := math.Pow(10, float64(decimals))
+	return math.Ceil(price*multiplier-1e-9) / multiplier
 }
 
 // formatPrice 格式化价格字符串，使用指定的小数位数

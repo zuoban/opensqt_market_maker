@@ -99,7 +99,6 @@ timing:
 
   # 订单执行相关
   rate_limit_retry_delay: 1         # 速率限制重试等待时间（秒，默认1）
-  order_retry_delay: 500            # 其他错误重试等待时间（毫秒，默认500）
   price_poll_interval: 500          # 等待获取价格的轮询间隔（毫秒，默认500）
   status_print_interval: 1          # 定期打印状态的间隔（分钟，默认1）
   order_cleanup_interval: 10        # 订单清理检查间隔（秒，默认10）
