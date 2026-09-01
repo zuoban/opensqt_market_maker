@@ -1,9 +1,17 @@
 (function () {
+    const SNAPSHOT_SILENCE_FLOOR_MS = 2500;
+    const SNAPSHOT_SILENCE_MULTIPLIER = 4;
+    const SNAPSHOT_INTERRUPTED_MS = 8000;
+    const REST_TIMEOUT_MS = 4000;
+
     if (typeof module !== "undefined" && module.exports) {
         module.exports = {
             buildKlineGridModel,
             buildHourlyFillModel,
             buildMarginUsageModel,
+            buildSnapshotHealthModel,
+            buildSnapshotAcceptanceModel,
+            buildFreshnessModel,
             centeredScrollLeft,
             formatRelativeTime,
             candleChangePct,
@@ -20,14 +28,24 @@
     let reconnectTimer = null;
     let restTimer = null;
     let freshnessTimer = null;
+    let restRequest = null;
     let renderFrame = null;
     let pendingSnapshot = null;
     let latestSnapshot = null;
     let showOutside = false;
     let authBlocked = false;
-    let lastSnapshotAt = 0;
+    let lastSnapshotReceivedAt = 0; // Any valid WS/REST snapshot, before rendering.
+    let lastWebSocketSnapshotReceivedAt = 0;
+    let latestSnapshotSourceOrder = null;
+    const retiredSnapshotInstances = new Set();
+    let displayedSnapshotReceivedAt = 0; // Receipt time paired with the rendered snapshot.
+    let socketOpenedAt = 0;
+    let dashboardPushIntervalMs = null;
     let lastPriceAgeBase = null;
     let lastPriceAgeAt = 0;
+    let lastPositionReady = null;
+    let lastPositionAgeBase = null;
+    let lastPositionAgeAt = 0;
     let lastRenderedPrice = null;
     let chartModel = null;
     let chartGeometry = null;
@@ -121,10 +139,12 @@
 
     function showTokenModal(message) {
         authBlocked = true;
-        clearTimeout(reconnectTimer);
+        clearReconnectTimer();
         if (ws) {
-            ws.close();
+            const socket = ws;
             ws = null;
+            socketOpenedAt = 0;
+            socket.close();
         }
         const mask = $("tokenMask");
         mask.classList.remove("hidden");
@@ -167,6 +187,187 @@
         return Math.round(ms / 60000) + "m 前";
     }
 
+    function snapshotSilenceThreshold(pushIntervalMs) {
+        const interval = Number(pushIntervalMs);
+        if (!Number.isFinite(interval) || interval <= 0) return SNAPSHOT_SILENCE_FLOOR_MS;
+        return Math.max(SNAPSHOT_SILENCE_FLOOR_MS, interval * SNAPSHOT_SILENCE_MULTIPLIER);
+    }
+
+    // Pure transport model shared by the browser watchdog and Node tests.
+    function buildSnapshotHealthModel(options) {
+        const source = options || {};
+        const nowValue = Number(source.nowMs);
+        const receivedValue = Number(source.lastReceivedAtMs);
+        const websocketReceivedValue = Number(source.lastWebSocketReceivedAtMs);
+        const openedValue = Number(source.socketOpenedAtMs);
+        const now = Number.isFinite(nowValue) ? nowValue : 0;
+        const lastReceivedAt = Number.isFinite(receivedValue) && receivedValue > 0 ? receivedValue : 0;
+        const lastWebSocketReceivedAt = Number.isFinite(websocketReceivedValue) && websocketReceivedValue > 0
+            ? websocketReceivedValue
+            : 0;
+        const socketOpenedAt = Number.isFinite(openedValue) && openedValue > 0 ? openedValue : 0;
+        const socketState = ["open", "connecting", "closed"].includes(source.socketState)
+            ? source.socketState
+            : "closed";
+        const silenceThresholdMs = snapshotSilenceThreshold(source.pushIntervalMs);
+        const snapshotAgeMs = lastReceivedAt > 0 ? Math.max(0, now - lastReceivedAt) : null;
+        const silenceReferenceAt = Math.max(lastWebSocketReceivedAt, socketOpenedAt);
+        const socketSilenceAgeMs = silenceReferenceAt > 0
+            ? Math.max(0, now - silenceReferenceAt)
+            : 0;
+        const socketSilent = socketState === "open" &&
+            silenceReferenceAt > 0 &&
+            socketSilenceAgeMs >= silenceThresholdMs;
+        const socketConnectTimedOut = socketState === "connecting" &&
+            socketOpenedAt > 0 &&
+            socketSilenceAgeMs >= SNAPSHOT_INTERRUPTED_MS;
+        const hasCurrentSocketSnapshot = lastWebSocketReceivedAt > 0 &&
+            (socketOpenedAt === 0 || lastWebSocketReceivedAt >= socketOpenedAt);
+        const snapshotRecent = snapshotAgeMs !== null && snapshotAgeMs < SNAPSHOT_INTERRUPTED_MS;
+
+        let connectionState = "down";
+        if (socketState === "open" && !socketSilent) {
+            connectionState = hasCurrentSocketSnapshot ? "live" : "connecting";
+        } else if (socketSilent || socketConnectTimedOut || snapshotRecent) {
+            connectionState = "fallback";
+        } else if (socketState === "connecting") {
+            connectionState = "connecting";
+        }
+
+        return {
+            connectionState,
+            silenceThresholdMs,
+            snapshotAgeMs,
+            socketSilenceAgeMs,
+            socketSilent,
+            socketConnectTimedOut,
+            shouldPoll: socketState !== "open" || socketSilent,
+            shouldReconnect: socketSilent || socketConnectTimedOut
+        };
+    }
+
+    function snapshotSourceOrder(snapshot) {
+        if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+            return null;
+        }
+
+        const instanceKey = typeof snapshot.startedAt === "string" && snapshot.startedAt.trim()
+            ? snapshot.startedAt.trim()
+            : null;
+        const sequence = Number(snapshot.sequence);
+        const hasSequence = Boolean(instanceKey) && Number.isSafeInteger(sequence) && sequence > 0;
+        const rawTime = snapshot.time;
+        if (typeof rawTime === "number") {
+            if (!Number.isFinite(rawTime) && !hasSequence) return null;
+            return {
+                instanceKey: hasSequence ? instanceKey : null,
+                sequence: hasSequence ? sequence : null,
+                timeMs: Number.isFinite(rawTime) ? rawTime : null,
+                subMillisecondNanoseconds: 0
+            };
+        }
+        const timeText = typeof rawTime === "string" ? rawTime.trim() : "";
+        const parts = timeText.match(/^(.*?)(?:\.([0-9]+))?(Z|[+-][0-9]{2}:[0-9]{2})$/i);
+        const fraction = parts && parts[2] ? parts[2] : "";
+        const normalizedTime = parts
+            ? parts[1] + "." + (fraction + "000").slice(0, 3) + parts[3]
+            : timeText;
+        const timeMs = normalizedTime ? Date.parse(normalizedTime) : NaN;
+        if (!Number.isFinite(timeMs) && !hasSequence) return null;
+        const nanoseconds = fraction ? Number((fraction + "000000000").slice(0, 9)) : 0;
+        return {
+            instanceKey: hasSequence ? instanceKey : null,
+            sequence: hasSequence ? sequence : null,
+            timeMs: Number.isFinite(timeMs) ? timeMs : null,
+            subMillisecondNanoseconds: nanoseconds % 1_000_000
+        };
+    }
+
+    function buildSnapshotAcceptanceModel(
+        snapshot,
+        latestSourceOrder,
+        retiredInstances,
+        allowInstanceChange
+    ) {
+        const sourceOrder = snapshotSourceOrder(snapshot);
+        const sourceSequenced = sourceOrder && sourceOrder.instanceKey &&
+            Number.isSafeInteger(sourceOrder.sequence) && sourceOrder.sequence > 0;
+        const latestSequenced = latestSourceOrder && latestSourceOrder.instanceKey &&
+            Number.isSafeInteger(latestSourceOrder.sequence) && latestSourceOrder.sequence > 0;
+        const sourceRetired = Boolean(sourceSequenced) && retiredInstances &&
+            (typeof retiredInstances.has === "function"
+                ? retiredInstances.has(sourceOrder.instanceKey)
+                : Array.isArray(retiredInstances) && retiredInstances.includes(sourceOrder.instanceKey));
+        const hasLatestTime = latestSourceOrder &&
+            Number.isFinite(latestSourceOrder.timeMs) &&
+            Number.isFinite(latestSourceOrder.subMillisecondNanoseconds);
+        const hasSourceTime = sourceOrder && Number.isFinite(sourceOrder.timeMs) &&
+            Number.isFinite(sourceOrder.subMillisecondNanoseconds);
+
+        let accepted = false;
+        let instanceChanged = false;
+        if (sourceSequenced && !sourceRetired) {
+            if (!latestSequenced) {
+                accepted = true;
+            } else if (sourceOrder.instanceKey === latestSourceOrder.instanceKey) {
+                accepted = sourceOrder.sequence > latestSourceOrder.sequence;
+            } else if (allowInstanceChange === true) {
+                // Only the active WebSocket may promote a new server instance. A REST response
+                // can outlive multiple reconnects and must never retire the current live stream.
+                accepted = true;
+                instanceChanged = true;
+            }
+        } else if (!sourceSequenced && !latestSequenced && hasSourceTime) {
+            accepted = !hasLatestTime ||
+                sourceOrder.timeMs > latestSourceOrder.timeMs ||
+                sourceOrder.timeMs === latestSourceOrder.timeMs &&
+                    sourceOrder.subMillisecondNanoseconds > latestSourceOrder.subMillisecondNanoseconds;
+        }
+        return {
+            valid: Boolean(sourceOrder),
+            accepted,
+            instanceChanged,
+            sourceOrder
+        };
+    }
+
+    function buildFreshnessModel(options) {
+        const source = options || {};
+        const snapshotValue = Number(source.snapshotAgeMs);
+        const tradeValue = Number(source.tradeAgeMs);
+        const positionValue = Number(source.positionAgeMs);
+        const thresholdValue = Number(source.positionThresholdMs);
+        const snapshotAgeMs = Number.isFinite(snapshotValue) ? Math.max(0, snapshotValue) : 0;
+        const tradeAgeMs = source.tradeAgeMs == null || !Number.isFinite(tradeValue)
+            ? null
+            : Math.max(0, tradeValue);
+        const positionAgeMs = source.positionAgeMs == null || !Number.isFinite(positionValue)
+            ? null
+            : Math.max(0, positionValue);
+        const positionThresholdMs = Number.isFinite(thresholdValue) && thresholdValue > 0
+            ? thresholdValue
+            : SNAPSHOT_SILENCE_FLOOR_MS;
+        const parts = [
+            tradeAgeMs == null ? "等待行情" : "行情 " + ago(tradeAgeMs),
+            "数据 " + ago(snapshotAgeMs)
+        ];
+
+        let positionStale = false;
+        if (source.positionReady === false) {
+            parts.push("仓位等待");
+            positionStale = true;
+        } else if (positionAgeMs !== null && positionAgeMs > positionThresholdMs) {
+            parts.push("仓位 " + ago(positionAgeMs));
+            positionStale = true;
+        }
+
+        return {
+            text: parts.join(" · "),
+            stale: snapshotAgeMs > 5000 || tradeAgeMs !== null && tradeAgeMs > 5000 || positionStale,
+            positionStale
+        };
+    }
+
     function isActive(status) {
         return status === "PLACED" || status === "CONFIRMED" || status === "PARTIALLY_FILLED";
     }
@@ -178,29 +379,49 @@
         setText(pill.querySelector("span"), label);
     }
 
-    function setFreshness(snapshot) {
-        lastSnapshotAt = Date.now();
+    function setFreshness(snapshot, receivedAt) {
+        const acceptedAt = Number(receivedAt);
+        displayedSnapshotReceivedAt = Number.isFinite(acceptedAt) && acceptedAt > 0
+            ? acceptedAt
+            : Date.now();
         const price = snapshot.price || {};
         lastPriceAgeBase = price.ageMs == null ? null : Number(price.ageMs);
-        lastPriceAgeAt = Date.now();
+        lastPriceAgeAt = displayedSnapshotReceivedAt;
+        lastPositionReady = Object.prototype.hasOwnProperty.call(snapshot, "positionReady")
+            ? Boolean(snapshot.positionReady)
+            : null;
+        lastPositionAgeBase = snapshot.positionAgeMs == null ? null : Number(snapshot.positionAgeMs);
+        lastPositionAgeAt = displayedSnapshotReceivedAt;
         updateFreshness();
     }
 
     function updateFreshness() {
-        if (!latestSnapshot) return;
         const now = Date.now();
-        const snapshotAge = now - lastSnapshotAt;
-        const quoteAge = lastPriceAgeBase == null ? null : lastPriceAgeBase + (now - lastPriceAgeAt);
-        const meta = $("priceMeta");
-        meta.textContent = quoteAge == null
-            ? "等待价格 · 数据 " + ago(snapshotAge)
-            : "报价 " + ago(quoteAge) + " · 数据 " + ago(snapshotAge);
-        meta.classList.toggle("stale", snapshotAge > 5000 || quoteAge > 5000);
-
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-            if (snapshotAge > 8000) setConnectionState("down", "数据已中断");
-            else if (!authBlocked) setConnectionState("fallback", "轮询回退");
+        const health = currentSnapshotHealth(now);
+        if (health.shouldReconnect) {
+            recoverUnhealthySocket();
+        } else {
+            applyConnectionHealth(health);
         }
+        if (!latestSnapshot) return;
+
+        const snapshotAge = Math.max(0, now - displayedSnapshotReceivedAt);
+        const tradeAge = lastPriceAgeBase == null
+            ? null
+            : Math.max(0, lastPriceAgeBase + (now - lastPriceAgeAt));
+        const positionAge = lastPositionAgeBase == null
+            ? null
+            : Math.max(0, lastPositionAgeBase + (now - lastPositionAgeAt));
+        const freshness = buildFreshnessModel({
+            snapshotAgeMs: snapshotAge,
+            tradeAgeMs: tradeAge,
+            positionReady: lastPositionReady,
+            positionAgeMs: positionAge,
+            positionThresholdMs: health.silenceThresholdMs
+        });
+        const meta = $("priceMeta");
+        meta.textContent = freshness.text;
+        meta.classList.toggle("stale", freshness.stale);
         updateRelativeTimes(now);
     }
 
@@ -235,22 +456,46 @@
         callback();
     }
 
-    function scheduleRender(snapshot) {
+    function acceptSnapshot(snapshot, receivedAt, transport, allowInstanceChange) {
+        const order = buildSnapshotAcceptanceModel(
+            snapshot,
+            latestSnapshotSourceOrder,
+            retiredSnapshotInstances,
+            allowInstanceChange
+        );
+        if (!order.valid) return false;
+        const acceptedAt = Number(receivedAt);
+        const localReceivedAt = Number.isFinite(acceptedAt) && acceptedAt > 0 ? acceptedAt : Date.now();
+        lastSnapshotReceivedAt = localReceivedAt;
+        if (transport === "ws") lastWebSocketSnapshotReceivedAt = localReceivedAt;
+        // A valid stale frame still proves its transport is alive, but must not roll the UI back.
+        if (!order.accepted) return true;
+        if (order.instanceChanged && latestSnapshotSourceOrder && latestSnapshotSourceOrder.instanceKey) {
+            retiredSnapshotInstances.add(latestSnapshotSourceOrder.instanceKey);
+        }
+        latestSnapshotSourceOrder = order.sourceOrder;
+        const pushInterval = Number(snapshot.app && snapshot.app.dashboardPushIntervalMs);
+        dashboardPushIntervalMs = Number.isFinite(pushInterval) && pushInterval > 0 ? pushInterval : null;
+        scheduleRender(snapshot, localReceivedAt);
+        return true;
+    }
+
+    function scheduleRender(snapshot, receivedAt) {
         if (!snapshot) return;
-        pendingSnapshot = snapshot;
+        pendingSnapshot = { snapshot, receivedAt };
         if (renderFrame !== null) return;
         renderFrame = requestAnimationFrame(() => {
             renderFrame = null;
             const next = pendingSnapshot;
             pendingSnapshot = null;
-            render(next);
+            if (next) render(next.snapshot, next.receivedAt);
         });
     }
 
-    function render(snapshot) {
+    function render(snapshot, receivedAt) {
         if (!snapshot) return;
         latestSnapshot = snapshot;
-        setFreshness(snapshot);
+        setFreshness(snapshot, receivedAt);
 
         const app = snapshot.app || {};
         const pos = snapshot.position || {};
@@ -2069,11 +2314,71 @@
         return (number > 0 ? "+" : "") + fmt(number, digits);
     }
 
-    async function pullRest() {
+    function websocketState() {
+        if (!ws) return "closed";
+        if (ws.readyState === WebSocket.OPEN) return "open";
+        if (ws.readyState === WebSocket.CONNECTING) return "connecting";
+        return "closed";
+    }
+
+    function currentSnapshotHealth(now) {
+        return buildSnapshotHealthModel({
+            nowMs: now == null ? Date.now() : now,
+            lastReceivedAtMs: lastSnapshotReceivedAt,
+            lastWebSocketReceivedAtMs: lastWebSocketSnapshotReceivedAt,
+            socketOpenedAtMs: socketOpenedAt,
+            socketState: websocketState(),
+            pushIntervalMs: dashboardPushIntervalMs
+        });
+    }
+
+    function applyConnectionHealth(health) {
+        if (authBlocked || !health) return;
+        if (health.connectionState === "live") {
+            setConnectionState("live", "实时连接");
+        } else if (health.connectionState === "fallback") {
+            const reason = health.socketSilent
+                ? "快照超时 · 轮询回退"
+                : (health.socketConnectTimedOut ? "连接超时 · 轮询回退" : "轮询回退");
+            setConnectionState("fallback", reason);
+        } else if (health.connectionState === "connecting") {
+            setConnectionState("connecting", latestSnapshot ? "正在重连" : "等待实时快照");
+        } else {
+            setConnectionState("down", "数据已中断");
+        }
+    }
+
+    function clearReconnectTimer() {
+        if (reconnectTimer === null) return;
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    function recoverUnhealthySocket() {
+        const health = currentSnapshotHealth(Date.now());
+        if (authBlocked || !health.shouldReconnect) return;
+        const socket = ws;
+        ws = null;
+        socketOpenedAt = 0;
+        if (socket) socket.close();
+        setConnectionState(
+            "fallback",
+            health.socketSilent ? "快照超时 · 轮询回退" : "连接超时 · 轮询回退"
+        );
+        pullRest();
+        scheduleReconnect();
+    }
+
+    async function pullRestOnce() {
+        const abortController = typeof AbortController === "undefined" ? null : new AbortController();
+        const abortTimer = abortController
+            ? setTimeout(() => abortController.abort(), REST_TIMEOUT_MS)
+            : null;
         try {
             const response = await fetch("/api/snapshot", {
                 headers: snapshotHeaders(),
-                cache: "no-store"
+                cache: "no-store",
+                signal: abortController ? abortController.signal : undefined
             });
             if (response.status === 401) {
                 showTokenModal("令牌无效，请重新输入");
@@ -2082,55 +2387,87 @@
             }
             if (!response.ok) throw new Error("snapshot " + response.status);
             if (token) saveSessionToken(token);
-            scheduleRender(await response.json());
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
+            const snapshot = await response.json();
+            if (!acceptSnapshot(snapshot, Date.now(), "rest")) throw new Error("invalid snapshot");
+            if (currentSnapshotHealth(Date.now()).connectionState !== "live") {
                 setConnectionState("fallback", "轮询回退");
             }
             return true;
         } catch (_error) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                const recent = lastSnapshotAt && Date.now() - lastSnapshotAt < 8000;
+            const health = currentSnapshotHealth(Date.now());
+            if (!authBlocked && health.connectionState !== "live") {
+                const recent = health.snapshotAgeMs !== null && health.snapshotAgeMs < SNAPSHOT_INTERRUPTED_MS;
                 setConnectionState(recent ? "fallback" : "down", recent ? "轮询异常" : "数据已中断");
             }
             return false;
+        } finally {
+            if (abortTimer !== null) clearTimeout(abortTimer);
         }
+    }
+
+    function pullRest() {
+        if (restRequest) return restRequest;
+        restRequest = pullRestOnce().finally(() => {
+            restRequest = null;
+        });
+        return restRequest;
     }
 
     function connect() {
         if (authBlocked) return;
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+        clearReconnectTimer();
         if (ws) {
-            ws.close();
+            const previous = ws;
             ws = null;
+            previous.close();
         }
         setConnectionState("connecting", latestSnapshot ? "正在重连" : "连接中");
+        let socket;
         try {
-            ws = new WebSocket(websocketURL());
+            socket = new WebSocket(websocketURL());
+            ws = socket;
+            socketOpenedAt = Date.now();
+            lastWebSocketSnapshotReceivedAt = 0;
         } catch (_error) {
-            setConnectionState(lastSnapshotAt ? "fallback" : "down", lastSnapshotAt ? "轮询回退" : "连接失败");
+            const recent = currentSnapshotHealth(Date.now()).snapshotAgeMs;
+            setConnectionState(recent !== null && recent < SNAPSHOT_INTERRUPTED_MS ? "fallback" : "down", recent !== null ? "轮询回退" : "连接失败");
+            pullRest();
             scheduleReconnect();
             return;
         }
 
-        ws.onopen = () => {
-            setConnectionState("live", "实时连接");
+        socket.onopen = () => {
+            if (ws !== socket) return;
+            socketOpenedAt = Date.now();
+            setConnectionState("connecting", "等待实时快照");
             hideTokenModal();
         };
-        ws.onclose = () => {
+        socket.onclose = () => {
+            if (ws !== socket) return;
+            ws = null;
+            socketOpenedAt = 0;
             if (authBlocked) return;
-            const recent = lastSnapshotAt && Date.now() - lastSnapshotAt < 8000;
-            setConnectionState(recent ? "fallback" : "connecting", recent ? "轮询回退" : "正在重连");
+            applyConnectionHealth(currentSnapshotHealth(Date.now()));
+            pullRest();
             scheduleReconnect();
         };
-        ws.onerror = () => {
-            if (!authBlocked) {
-                const recent = lastSnapshotAt && Date.now() - lastSnapshotAt < 8000;
-                setConnectionState(recent ? "fallback" : "down", recent ? "轮询回退" : "连接异常");
-            }
+        socket.onerror = () => {
+            if (authBlocked || ws !== socket) return;
+            const age = currentSnapshotHealth(Date.now()).snapshotAgeMs;
+            const recent = age !== null && age < SNAPSHOT_INTERRUPTED_MS;
+            setConnectionState(recent ? "fallback" : "down", recent ? "轮询回退" : "连接异常");
         };
-        ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
+            if (ws !== socket) return;
+            const receivedAt = Date.now();
             try {
                 const message = JSON.parse(event.data);
-                scheduleRender(message && message.type === "snapshot" ? message.data : message);
+                if (message && message.type && message.type !== "snapshot") return;
+                const snapshot = message && message.type === "snapshot" ? message.data : message;
+                if (acceptSnapshot(snapshot, receivedAt, "ws", true)) {
+                    setConnectionState("live", "实时连接");
+                }
             } catch (_error) {
                 // Ignore malformed frames and keep the last valid snapshot visible.
             }
@@ -2138,10 +2475,19 @@
     }
 
     function scheduleReconnect() {
-        clearTimeout(reconnectTimer);
+        if (authBlocked || reconnectTimer !== null) return;
         reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
             if (!authBlocked) connect();
         }, 2000);
+    }
+
+    function probeVisibleDashboard() {
+        if (document.visibilityState !== "visible" || authBlocked) return;
+        updateFreshness();
+        const health = currentSnapshotHealth(Date.now());
+        if (health.shouldPoll) pullRest();
+        if (websocketState() === "closed") connect();
     }
 
     initKlineChart();
@@ -2151,15 +2497,24 @@
     pullRest();
     connect();
     restTimer = setInterval(() => {
-        if (!authBlocked && (!ws || ws.readyState !== WebSocket.OPEN)) pullRest();
+        if (authBlocked) return;
+        const health = currentSnapshotHealth(Date.now());
+        if (health.shouldReconnect) recoverUnhealthySocket();
+        else if (health.shouldPoll) pullRest();
     }, 2000);
-    freshnessTimer = setInterval(updateFreshness, 1000);
+    freshnessTimer = setInterval(updateFreshness, 500);
+    document.addEventListener("visibilitychange", probeVisibleDashboard);
 
     window.addEventListener("beforeunload", () => {
-        clearTimeout(reconnectTimer);
+        authBlocked = true;
+        clearReconnectTimer();
         clearInterval(restTimer);
         clearInterval(freshnessTimer);
         if (chartResizeObserver) chartResizeObserver.disconnect();
-        if (ws) ws.close();
+        if (ws) {
+            const socket = ws;
+            ws = null;
+            socket.close();
+        }
     });
 })();

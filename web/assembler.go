@@ -2,6 +2,7 @@ package web
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"opensqt/config"
@@ -13,18 +14,22 @@ import (
 
 // Snapshot 面板完整读数
 type Snapshot struct {
-	Time      time.Time                 `json:"time"`
-	Version   string                    `json:"version"`
-	StartedAt time.Time                 `json:"startedAt"`
-	UptimeSec float64                   `json:"uptimeSec"`
-	App       SafeAppConfig             `json:"app"`
-	Price     PriceView                 `json:"price"`
-	Kline     KlineView                 `json:"kline"`
-	Position  position.PositionSnapshot `json:"position"`
-	Risk      safety.RiskSnapshot       `json:"risk"`
-	Margin    safety.MarginSnapshot     `json:"margin"`
-	Account   AccountView               `json:"account"`
-	Logs      []logger.LogEntry         `json:"logs"`
+	Time              time.Time                 `json:"time"`
+	Sequence          uint64                    `json:"sequence"`
+	Version           string                    `json:"version"`
+	StartedAt         time.Time                 `json:"startedAt"`
+	UptimeSec         float64                   `json:"uptimeSec"`
+	App               SafeAppConfig             `json:"app"`
+	Price             PriceView                 `json:"price"`
+	Kline             KlineView                 `json:"kline"`
+	Position          position.PositionSnapshot `json:"position"`
+	PositionReady     bool                      `json:"positionReady"`
+	PositionUpdatedAt time.Time                 `json:"positionUpdatedAt"`
+	PositionAgeMs     int64                     `json:"positionAgeMs"`
+	Risk              safety.RiskSnapshot       `json:"risk"`
+	Margin            safety.MarginSnapshot     `json:"margin"`
+	Account           AccountView               `json:"account"`
+	Logs              []logger.LogEntry         `json:"logs"`
 }
 
 // PriceView 最新价格
@@ -56,14 +61,16 @@ type CandleView struct {
 }
 
 type assembler struct {
-	cfg     *config.Config
-	version string
-	started time.Time
-	price   *monitor.PriceMonitor
-	pos     *position.SuperPositionManager
-	risk    *safety.RiskMonitor
-	margin  *safety.MarginMonitor
-	account *AccountCache
+	cfg      *config.Config
+	version  string
+	started  time.Time
+	sequence atomic.Uint64
+	price    *monitor.PriceMonitor
+	position *PositionCache
+	pos      *position.SuperPositionManager
+	risk     *safety.RiskMonitor
+	margin   *safety.MarginMonitor
+	account  *AccountCache
 }
 
 func (a *assembler) Build() *Snapshot {
@@ -74,6 +81,7 @@ func (a *assembler) Build() *Snapshot {
 	}
 	snap := &Snapshot{
 		Time:      now,
+		Sequence:  a.sequence.Add(1),
 		Version:   a.version,
 		StartedAt: started,
 		UptimeSec: now.Sub(started).Seconds(),
@@ -84,8 +92,19 @@ func (a *assembler) Build() *Snapshot {
 	if a.account != nil {
 		snap.Account = a.account.View()
 	}
-	if a.pos != nil {
+	if a.position != nil {
+		snap.Position, snap.PositionUpdatedAt, snap.PositionReady = a.position.View()
+		if snap.PositionReady {
+			snap.PositionAgeMs = now.Sub(snap.PositionUpdatedAt).Milliseconds()
+			if snap.PositionAgeMs < 0 {
+				snap.PositionAgeMs = 0
+			}
+		}
+	} else if a.pos != nil {
+		// 仅保留给尚未接入异步缓存的测试和兼容调用；生产环境应设置 position。
 		snap.Position = a.pos.Snapshot()
+		snap.PositionReady = true
+		snap.PositionUpdatedAt = time.Now()
 	}
 	if a.risk != nil {
 		snap.Risk = a.risk.Snapshot()

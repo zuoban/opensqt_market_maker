@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 	"opensqt/config"
 	"opensqt/logger"
+	"opensqt/position"
 )
 
 func testDashCfg(listen, token string) *config.Config {
@@ -55,6 +57,56 @@ func startServer(t *testing.T, token string) *Server {
 	}
 	t.Fatal("server did not start")
 	return s
+}
+
+func TestNewWiresPositionCacheToDashboardPushInterval(t *testing.T) {
+	cfg := testDashCfg("127.0.0.1:0", "")
+	cfg.Dashboard.PushIntervalMS = 275
+	manager := &position.SuperPositionManager{}
+	s := New(Options{Cfg: cfg, Position: manager})
+
+	if s.position == nil {
+		t.Fatal("position cache was not created")
+	}
+	if s.position.interval != 275*time.Millisecond {
+		t.Fatalf("position refresh interval = %v, want 275ms", s.position.interval)
+	}
+	if s.assembler.position != s.position || s.assembler.pos != manager {
+		t.Fatal("assembler was not wired to the position cache with manager fallback")
+	}
+}
+
+func TestShutdownWhileListenIsPendingPreventsLateServerStart(t *testing.T) {
+	s := New(Options{Cfg: testDashCfg("127.0.0.1:0", "")})
+	listenStarted := make(chan struct{})
+	releaseListen := make(chan struct{})
+	s.listenFunc = func(network, address string) (net.Listener, error) {
+		close(listenStarted)
+		<-releaseListen
+		return net.Listen(network, address)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start() }()
+	select {
+	case <-listenStarted:
+	case <-time.After(time.Second):
+		t.Fatal("dashboard listen did not start")
+	}
+
+	s.Shutdown(100 * time.Millisecond)
+	close(releaseListen)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("start after shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dashboard Start did not stop after pending listen was released")
+	}
+	if addr := s.Addr(); addr != "" {
+		t.Fatalf("dashboard published a late listener after shutdown: %s", addr)
+	}
 }
 
 func TestHealthAndSnapshotAndAuth(t *testing.T) {
@@ -128,6 +180,61 @@ func TestHealthAndSnapshotAndAuth(t *testing.T) {
 	if env.Type != "snapshot" || env.Data == nil || env.Data.Version != "test-ver" {
 		t.Fatalf("ws env = %+v", env)
 	}
+}
+
+func TestWebSocketClientLifecycle(t *testing.T) {
+	s := startServer(t, "")
+	defer s.Shutdown(time.Second)
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+s.Addr()+"/ws", nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var env wsEnvelope
+	if err := conn.ReadJSON(&env); err != nil {
+		t.Fatalf("ws initial snapshot: %v", err)
+	}
+	waitForDashboardClientCount(t, s.hub, 1)
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("ws close: %v", err)
+	}
+	waitForDashboardClientCount(t, s.hub, 0)
+}
+
+func TestShutdownClosesWebSocketClients(t *testing.T) {
+	s := startServer(t, "")
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+s.Addr()+"/ws", nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var env wsEnvelope
+	if err := conn.ReadJSON(&env); err != nil {
+		t.Fatalf("ws initial snapshot: %v", err)
+	}
+	waitForDashboardClientCount(t, s.hub, 1)
+
+	s.Shutdown(time.Second)
+	waitForDashboardClientCount(t, s.hub, 0)
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("websocket remained open after server shutdown")
+	}
+}
+
+func waitForDashboardClientCount(t *testing.T, h *hub, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := h.clientCount(); got == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("dashboard client count = %d, want %d", h.clientCount(), want)
 }
 
 func TestIsNonLocalListen(t *testing.T) {

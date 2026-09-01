@@ -6,6 +6,9 @@ const {
     buildKlineGridModel,
     buildHourlyFillModel,
     buildMarginUsageModel,
+    buildSnapshotHealthModel,
+    buildSnapshotAcceptanceModel,
+    buildFreshnessModel,
     centeredScrollLeft,
     formatRelativeTime,
     candleChangePct,
@@ -75,6 +78,287 @@ test("fill timestamps are formatted relative to now", () => {
     assert.equal(formatRelativeTime(new Date(now.getTime() - 3 * 3_600_000), now), "3 小时前");
     assert.equal(formatRelativeTime(new Date(now.getTime() + 2 * 86_400_000), now), "2 天后");
     assert.equal(formatRelativeTime("not-a-date", now), "—");
+});
+
+test("snapshot health detects an open but silent websocket at the dynamic threshold", () => {
+    const healthy = buildSnapshotHealthModel({
+        nowMs: 3_999,
+        lastReceivedAtMs: 1_500,
+        lastWebSocketReceivedAtMs: 1_500,
+        socketOpenedAtMs: 1_000,
+        socketState: "open",
+        pushIntervalMs: 400
+    });
+    assert.equal(healthy.silenceThresholdMs, 2_500);
+    assert.equal(healthy.socketSilent, false);
+    assert.equal(healthy.connectionState, "live");
+    assert.equal(healthy.shouldPoll, false);
+    assert.equal(healthy.shouldReconnect, false);
+
+    const silent = buildSnapshotHealthModel({
+        nowMs: 4_000,
+        lastReceivedAtMs: 1_500,
+        lastWebSocketReceivedAtMs: 1_500,
+        socketOpenedAtMs: 1_000,
+        socketState: "open",
+        pushIntervalMs: 400
+    });
+    assert.equal(silent.socketSilenceAgeMs, 2_500);
+    assert.equal(silent.socketSilent, true);
+    assert.equal(silent.connectionState, "fallback");
+    assert.equal(silent.shouldPoll, true);
+    assert.equal(silent.shouldReconnect, true);
+});
+
+test("snapshot health scales the watchdog and classifies fallback states", () => {
+    const scaled = buildSnapshotHealthModel({
+        nowMs: 5_999,
+        lastReceivedAtMs: 2_000,
+        lastWebSocketReceivedAtMs: 2_000,
+        socketOpenedAtMs: 1_000,
+        socketState: "open",
+        pushIntervalMs: 1_000
+    });
+    assert.equal(scaled.silenceThresholdMs, 4_000);
+    assert.equal(scaled.socketSilent, false);
+    assert.equal(scaled.connectionState, "live");
+
+    const awaitingFirstSnapshot = buildSnapshotHealthModel({
+        nowMs: 3_499,
+        lastReceivedAtMs: 0,
+        lastWebSocketReceivedAtMs: 0,
+        socketOpenedAtMs: 1_000,
+        socketState: "open"
+    });
+    assert.equal(awaitingFirstSnapshot.socketSilent, false);
+    assert.equal(awaitingFirstSnapshot.connectionState, "connecting");
+    assert.equal(awaitingFirstSnapshot.shouldPoll, false);
+
+    const noFirstSnapshot = buildSnapshotHealthModel({
+        nowMs: 3_500,
+        lastReceivedAtMs: 0,
+        lastWebSocketReceivedAtMs: 0,
+        socketOpenedAtMs: 1_000,
+        socketState: "open"
+    });
+    assert.equal(noFirstSnapshot.silenceThresholdMs, 2_500);
+    assert.equal(noFirstSnapshot.socketSilent, true);
+    assert.equal(noFirstSnapshot.connectionState, "fallback");
+
+    const restCannotMasqueradeAsWebSocket = buildSnapshotHealthModel({
+        nowMs: 3_500,
+        lastReceivedAtMs: 3_400,
+        lastWebSocketReceivedAtMs: 0,
+        socketOpenedAtMs: 1_000,
+        socketState: "open"
+    });
+    assert.equal(restCannotMasqueradeAsWebSocket.snapshotAgeMs, 100);
+    assert.equal(restCannotMasqueradeAsWebSocket.socketSilent, true);
+    assert.equal(restCannotMasqueradeAsWebSocket.connectionState, "fallback");
+
+    const connectingTimedOut = buildSnapshotHealthModel({
+        nowMs: 9_000,
+        lastReceivedAtMs: 8_900,
+        lastWebSocketReceivedAtMs: 0,
+        socketOpenedAtMs: 1_000,
+        socketState: "connecting"
+    });
+    assert.equal(connectingTimedOut.socketConnectTimedOut, true);
+    assert.equal(connectingTimedOut.shouldReconnect, true);
+    assert.equal(connectingTimedOut.connectionState, "fallback");
+
+    const closedWithRecentData = buildSnapshotHealthModel({
+        nowMs: 5_000,
+        lastReceivedAtMs: 4_500,
+        socketState: "closed"
+    });
+    assert.equal(closedWithRecentData.connectionState, "fallback");
+    assert.equal(closedWithRecentData.shouldPoll, true);
+
+    const interrupted = buildSnapshotHealthModel({
+        nowMs: 12_001,
+        lastReceivedAtMs: 4_000,
+        socketState: "closed"
+    });
+    assert.equal(interrupted.connectionState, "down");
+});
+
+test("freshness copy reports market data and only surfaces abnormal position freshness", () => {
+    const normal = buildFreshnessModel({
+        snapshotAgeMs: 600,
+        tradeAgeMs: 800,
+        positionReady: true,
+        positionAgeMs: 2_500,
+        positionThresholdMs: 2_500
+    });
+    assert.equal(normal.text, "行情 800ms 前 · 数据 600ms 前");
+    assert.equal(normal.stale, false);
+    assert.equal(normal.positionStale, false);
+
+    const waiting = buildFreshnessModel({
+        snapshotAgeMs: 100,
+        tradeAgeMs: 200,
+        positionReady: false,
+        positionAgeMs: 100,
+        positionThresholdMs: 2_500
+    });
+    assert.equal(waiting.text, "行情 200ms 前 · 数据 100ms 前 · 仓位等待");
+    assert.equal(waiting.stale, true);
+    assert.equal(waiting.positionStale, true);
+
+    const stalePosition = buildFreshnessModel({
+        snapshotAgeMs: 100,
+        tradeAgeMs: 200,
+        positionReady: true,
+        positionAgeMs: 2_501,
+        positionThresholdMs: 2_500
+    });
+    assert.equal(stalePosition.text, "行情 200ms 前 · 数据 100ms 前 · 仓位 3s 前");
+    assert.equal(stalePosition.stale, true);
+
+    const backwardCompatible = buildFreshnessModel({
+        snapshotAgeMs: 100,
+        tradeAgeMs: null
+    });
+    assert.equal(backwardCompatible.text, "等待行情 · 数据 100ms 前");
+    assert.equal(backwardCompatible.positionStale, false);
+});
+
+test("startup keeps a newer websocket snapshot when the initial REST request finishes late", () => {
+    const websocket = buildSnapshotAcceptanceModel(
+        { time: "2026-09-02T08:00:00.400900Z" },
+        null
+    );
+    assert.equal(websocket.valid, true);
+    assert.equal(websocket.accepted, true);
+
+    const delayedRest = buildSnapshotAcceptanceModel(
+        { time: "2026-09-02T08:00:00.400100Z" },
+        websocket.sourceOrder
+    );
+    assert.equal(Date.parse("2026-09-02T08:00:00.400900Z"), Date.parse("2026-09-02T08:00:00.400100Z"));
+    assert.equal(delayedRest.valid, true);
+    assert.equal(delayedRest.accepted, false);
+
+    const duplicate = buildSnapshotAcceptanceModel(
+        { time: "2026-09-02T08:00:00.400900Z" },
+        websocket.sourceOrder
+    );
+    assert.equal(duplicate.accepted, false);
+});
+
+test("fallback and visibility recovery accept snapshots monotonically across transports", () => {
+    const instance = "2026-09-02T08:00:00Z";
+    const initialWebSocket = buildSnapshotAcceptanceModel({
+        startedAt: instance,
+        sequence: 1,
+        time: "2026-09-02T08:01:00.000Z"
+    }, null);
+    const fallbackRest = buildSnapshotAcceptanceModel(
+        { startedAt: instance, sequence: 2, time: "2026-09-02T08:01:00.200Z" },
+        initialWebSocket.sourceOrder
+    );
+    assert.equal(fallbackRest.accepted, true);
+
+    const resumedWebSocket = buildSnapshotAcceptanceModel(
+        { startedAt: instance, sequence: 3, time: "2026-09-02T08:01:00.600Z" },
+        fallbackRest.sourceOrder
+    );
+    assert.equal(resumedWebSocket.accepted, true);
+
+    // This response can have the latest client receipt time while carrying an older server snapshot.
+    const delayedVisibilityRest = buildSnapshotAcceptanceModel(
+        { startedAt: instance, sequence: 2, time: "2026-09-02T08:01:00.300Z" },
+        resumedWebSocket.sourceOrder
+    );
+    assert.equal(delayedVisibilityRest.accepted, false);
+
+    const healthySocket = buildSnapshotHealthModel({
+        nowMs: 10_500,
+        lastReceivedAtMs: 10_400,
+        lastWebSocketReceivedAtMs: 10_400,
+        socketOpenedAtMs: 10_000,
+        socketState: "open",
+        pushIntervalMs: 400
+    });
+    assert.equal(healthySocket.connectionState, "live");
+    assert.equal(healthySocket.shouldPoll, false);
+});
+
+test("snapshot sequence survives clock rollback and changes server generations safely", () => {
+    const firstInstance = "2026-09-02T08:00:00Z";
+    const secondInstance = "2026-09-02T07:00:00Z";
+    const first = buildSnapshotAcceptanceModel({
+        startedAt: firstInstance,
+        sequence: 41,
+        time: "2026-09-02T10:00:00Z"
+    }, null);
+    assert.equal(first.accepted, true);
+
+    const clockRolledBack = buildSnapshotAcceptanceModel({
+        startedAt: firstInstance,
+        sequence: 42,
+        time: "2026-09-02T09:00:00Z"
+    }, first.sourceOrder);
+    assert.equal(clockRolledBack.accepted, true);
+
+    const duplicate = buildSnapshotAcceptanceModel({
+        startedAt: firstInstance,
+        sequence: 42,
+        time: "2026-09-02T09:00:01Z"
+    }, clockRolledBack.sourceOrder);
+    assert.equal(duplicate.accepted, false);
+
+    const restarted = buildSnapshotAcceptanceModel({
+        startedAt: secondInstance,
+        sequence: 1,
+        time: "2026-09-02T08:00:00Z"
+    }, clockRolledBack.sourceOrder, new Set(), true);
+    assert.equal(restarted.accepted, true);
+    assert.equal(restarted.instanceChanged, true);
+
+    const delayedOldInstance = buildSnapshotAcceptanceModel({
+        startedAt: firstInstance,
+        sequence: 43,
+        time: "2026-09-02T11:00:00Z"
+    }, restarted.sourceOrder, new Set([firstInstance]));
+    assert.equal(delayedOldInstance.valid, true);
+    assert.equal(delayedOldInstance.accepted, false);
+});
+
+test("a delayed REST instance cannot retire the current websocket generation", () => {
+    const instanceA = "instance-a";
+    const instanceB = "instance-b";
+    const instanceC = "instance-c";
+    const first = buildSnapshotAcceptanceModel({
+        startedAt: instanceA,
+        sequence: 10,
+        time: "2026-09-02T10:00:00Z"
+    }, null, new Set(), true);
+
+    const currentWebSocket = buildSnapshotAcceptanceModel({
+        startedAt: instanceC,
+        sequence: 1,
+        time: "2026-09-02T10:00:02Z"
+    }, first.sourceOrder, new Set(), true);
+    assert.equal(currentWebSocket.accepted, true);
+    assert.equal(currentWebSocket.instanceChanged, true);
+
+    const retired = new Set([instanceA]);
+    const delayedMiddleRest = buildSnapshotAcceptanceModel({
+        startedAt: instanceB,
+        sequence: 5,
+        time: "2026-09-02T10:00:01Z"
+    }, currentWebSocket.sourceOrder, retired, false);
+    assert.equal(delayedMiddleRest.valid, true);
+    assert.equal(delayedMiddleRest.accepted, false);
+
+    const nextCurrentWebSocket = buildSnapshotAcceptanceModel({
+        startedAt: instanceC,
+        sequence: 2,
+        time: "2026-09-02T10:00:03Z"
+    }, currentWebSocket.sourceOrder, retired, true);
+    assert.equal(nextCurrentWebSocket.accepted, true);
 });
 
 test("event stream follows execution tape at the end of the dashboard", () => {

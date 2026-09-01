@@ -38,13 +38,16 @@ type Server struct {
 	cfg        *config.Config
 	version    string
 	listen     string
+	listenFunc func(network, address string) (net.Listener, error)
 	assembler  *assembler
 	account    *AccountCache
+	position   *PositionCache
 	hub        *hub
 	httpServer *http.Server
 	cancel     context.CancelFunc
 	addr       string
 	started    time.Time
+	stopping   bool
 	runtimeMu  sync.RWMutex
 }
 
@@ -79,6 +82,7 @@ func New(opt Options) *Server {
 		started = time.Now()
 	}
 	interval := 10 * time.Second
+	positionInterval := defaultPositionRefreshInterval
 	listen := "127.0.0.1:8787"
 	if opt.Cfg != nil {
 		if opt.Cfg.Dashboard.AccountRefreshSec > 0 {
@@ -86,6 +90,9 @@ func New(opt Options) *Server {
 		}
 		if opt.Cfg.Dashboard.Listen != "" {
 			listen = opt.Cfg.Dashboard.Listen
+		}
+		if opt.Cfg.Dashboard.PushIntervalMS > 0 {
+			positionInterval = time.Duration(opt.Cfg.Dashboard.PushIntervalMS) * time.Millisecond
 		}
 	}
 	var src AccountSource
@@ -97,22 +104,29 @@ func New(opt Options) *Server {
 		symbol = opt.Cfg.Trading.Symbol
 	}
 	cache := newAccountCache(src, symbol, interval)
+	var positionCache *PositionCache
+	if opt.Position != nil {
+		positionCache = newPositionCache(opt.Position, positionInterval)
+	}
 	return &Server{
-		cfg:     opt.Cfg,
-		version: opt.Version,
-		listen:  listen,
-		account: cache,
-		hub:     newHub(),
-		started: started,
+		cfg:        opt.Cfg,
+		version:    opt.Version,
+		listen:     listen,
+		listenFunc: net.Listen,
+		account:    cache,
+		position:   positionCache,
+		hub:        newHub(),
+		started:    started,
 		assembler: &assembler{
-			cfg:     opt.Cfg,
-			version: opt.Version,
-			started: started,
-			price:   opt.Price,
-			pos:     opt.Position,
-			risk:    opt.Risk,
-			margin:  opt.Margin,
-			account: cache,
+			cfg:      opt.Cfg,
+			version:  opt.Version,
+			started:  started,
+			price:    opt.Price,
+			position: positionCache,
+			pos:      opt.Position,
+			risk:     opt.Risk,
+			margin:   opt.Margin,
+			account:  cache,
 		},
 	}
 }
@@ -133,16 +147,16 @@ func (s *Server) Start() error {
 	if s == nil || s.cfg != nil && !s.cfg.DashboardEnabled() {
 		return nil
 	}
+	s.runtimeMu.RLock()
+	stopping := s.stopping
+	s.runtimeMu.RUnlock()
+	if stopping {
+		return nil
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	s.runtimeMu.Lock()
-	s.cancel = cancel
-	s.runtimeMu.Unlock()
-
-	go s.hub.run()
-	go s.account.Run(ctx)
-	go s.pushLoop(ctx)
-	go s.loadKlines(ctx)
+	defer cancel()
+	defer s.hub.close()
 
 	mux := http.NewServeMux()
 	staticRoot, err := fs.Sub(staticFS, "static")
@@ -155,17 +169,33 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/snapshot", s.requireToken(s.handleSnapshot))
 	mux.HandleFunc("/ws", s.requireToken(s.handleWS))
 
-	ln, err := net.Listen("tcp", s.listen)
+	listenFunc := s.listenFunc
+	if listenFunc == nil {
+		listenFunc = net.Listen
+	}
+	ln, err := listenFunc("tcp", s.listen)
 	if err != nil {
-		cancel()
 		return err
 	}
 	addr := ln.Addr().String()
 	httpServer := &http.Server{Handler: mux}
 	s.runtimeMu.Lock()
+	if s.stopping {
+		s.runtimeMu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
+	s.cancel = cancel
 	s.addr = addr
 	s.httpServer = httpServer
 	s.runtimeMu.Unlock()
+
+	go s.account.Run(ctx)
+	if s.position != nil {
+		go s.position.Run(ctx)
+	}
+	go s.pushLoop(ctx)
+	go s.loadKlines(ctx)
 	if isNonLocalListen(s.listen) {
 		logger.Warn("⚠️ 监控面板监听 %s，账户与仓位可被局域网访问。建议改回 127.0.0.1 或设置 dashboard.token", s.listen)
 	}
@@ -194,13 +224,15 @@ func (s *Server) Shutdown(timeout time.Duration) {
 	if s == nil {
 		return
 	}
-	s.runtimeMu.RLock()
+	s.runtimeMu.Lock()
+	s.stopping = true
 	cancelRuntime := s.cancel
 	httpServer := s.httpServer
-	s.runtimeMu.RUnlock()
+	s.runtimeMu.Unlock()
 	if cancelRuntime != nil {
 		cancelRuntime()
 	}
+	s.hub.close()
 	if httpServer == nil {
 		return
 	}
@@ -224,7 +256,7 @@ func (s *Server) pushLoop(ctx context.Context) {
 			if s.hub.clientCount() == 0 {
 				continue
 			}
-			s.hub.broadcast <- wsEnvelope{Type: "snapshot", Data: s.assembler.Build()}
+			s.hub.broadcast(wsEnvelope{Type: "snapshot", Data: s.assembler.Build()})
 		}
 	}
 }
@@ -266,15 +298,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		logger.Debug("监控面板 WS upgrade 失败: %v", err)
 		return
 	}
-	client := &wsClient{conn: conn}
-	s.hub.register <- client
-	_ = client.writeJSON(wsEnvelope{Type: "snapshot", Data: s.assembler.Build()})
-	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
-			s.hub.unregister <- client
-			return
-		}
+	client := newWSClient(s.hub, conn)
+	client.enqueue(wsEnvelope{Type: "snapshot", Data: s.assembler.Build()})
+	if !s.hub.register(client) {
+		client.shutdown()
+		return
 	}
+	go client.writePump()
+	client.readPump()
 }
 
 func (s *Server) requireToken(next http.HandlerFunc) http.HandlerFunc {

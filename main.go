@@ -22,7 +22,7 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.5.6"
+var Version = "v3.5.7"
 
 func main() {
 	programStartedAt := time.Now()
