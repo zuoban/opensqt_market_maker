@@ -349,12 +349,26 @@ func (spm *SuperPositionManager) Initialize(initialPrice float64, initialPriceSt
 	if initialPrice <= 0 {
 		return fmt.Errorf("初始价格无效: %.2f", initialPrice)
 	}
+	if err := ValidateGridPriceInterval(spm.config.Trading.PriceInterval, spm.priceTickSize); err != nil {
+		return err
+	}
+	anchorTick, ok := priceTickIndexNearest(initialPrice, spm.priceTickSize)
+	if !ok {
+		return fmt.Errorf("初始价格 %g 无法按交易所价格步长 %g 建立网格锚点",
+			initialPrice, spm.priceTickSize)
+	}
+	anchorPrice := roundPrice(float64(anchorTick)*spm.priceTickSize, spm.priceDecimals)
+	if math.Abs(anchorPrice-initialPrice) > fillQtyTolerance {
+		logger.Info("ℹ️ 价格锚点按交易所步长对齐: %s -> %s",
+			formatPrice(initialPrice, spm.priceDecimals),
+			formatPrice(anchorPrice, spm.priceDecimals))
+	}
 
 	// 1. 设置价格锚点（精度信息已经在构造函数中设置，从交易所获取）
-	spm.anchorPrice = initialPrice
+	spm.anchorPrice = anchorPrice
 	spm.lastMarketPrice.Store(initialPrice) // 初始化最后市场价格
 	logger.Info("✅ 价格锚点已设置: %s, 价格精度:%d, 数量精度:%d",
-		formatPrice(initialPrice, spm.priceDecimals), spm.priceDecimals, spm.quantityDecimals)
+		formatPrice(anchorPrice, spm.priceDecimals), spm.priceDecimals, spm.quantityDecimals)
 
 	// 2. 直接使用锚点价格作为网格价格（不再对齐到整数）
 	initialGridPrice := spm.anchorPrice
@@ -2454,42 +2468,161 @@ func priceTickIndexUp(price, tickSize float64) (int64, bool) {
 		return 0, false
 	}
 	nearest := math.Round(ratio)
-	// 容差必须以“tick 个数”为固定尺度，不能随价格/tick 的比值放大。
-	// 否则在高价格或很小 tick 下，真实相差多个 tick 的价格也会被误吸附。
-	const tolerance = 1e-9
+	tolerance, ok := tickRatioTolerance(ratio)
+	if !ok || nearest < 1 || nearest > float64(math.MaxInt64-1) {
+		return 0, false
+	}
 	if math.Abs(ratio-nearest) <= tolerance {
 		return int64(nearest), true
 	}
 	return int64(math.Ceil(ratio)), true
 }
 
+func priceTickIndexNearest(price, tickSize float64) (int64, bool) {
+	if price <= 0 || tickSize <= 0 || math.IsNaN(price) || math.IsInf(price, 0) ||
+		math.IsNaN(tickSize) || math.IsInf(tickSize, 0) {
+		return 0, false
+	}
+	ratio := price / tickSize
+	if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio > float64(math.MaxInt64-1) {
+		return 0, false
+	}
+	nearest := math.Round(ratio)
+	if _, ok := tickRatioTolerance(ratio); !ok || nearest < 1 || nearest > float64(math.MaxInt64-1) {
+		return 0, false
+	}
+	return int64(nearest), true
+}
+
+// tickRatioTolerance 只容纳 float64 在当前数量级的若干个 ULP，不使用
+// 随数值线性放大的相对误差。这样既能吸附合法的高 tick-index 价格，也不会
+// 把真实相差显著 tick 分数的价格误认为整数 tick。
+func tickRatioTolerance(ratio float64) (float64, bool) {
+	if ratio <= 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+		return 0, false
+	}
+	ulp := math.Nextafter(ratio, math.Inf(1)) - ratio
+	if ulp <= 0 || math.IsNaN(ulp) || math.IsInf(ulp, 0) {
+		return 0, false
+	}
+	tolerance := 4 * ulp
+	if tolerance < 1e-9 {
+		tolerance = 1e-9
+	}
+	// 到达四分之一 tick 时，float64 已不足以安全地区分合法 tick 与邻近价格。
+	if tolerance >= 0.25 {
+		return 0, false
+	}
+	return tolerance, true
+}
+
+func gridIntervalTickCount(priceInterval, tickSize float64) (int64, bool) {
+	if priceInterval <= 0 || tickSize <= 0 ||
+		math.IsNaN(priceInterval) || math.IsInf(priceInterval, 0) ||
+		math.IsNaN(tickSize) || math.IsInf(tickSize, 0) {
+		return 0, false
+	}
+	ratio := priceInterval / tickSize
+	if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio > float64(math.MaxInt64-1) {
+		return 0, false
+	}
+	nearest := math.Round(ratio)
+	tolerance, ok := tickRatioTolerance(ratio)
+	if !ok || nearest < 1 || nearest > float64(math.MaxInt64-1) ||
+		math.Abs(ratio-nearest) > tolerance {
+		return 0, false
+	}
+	return int64(nearest), true
+}
+
+func sellPriceTickConflicts(priceTick, intervalTicks int64, occupied map[int64]struct{}) bool {
+	for occupiedTick := range occupied {
+		var distance int64
+		if occupiedTick >= priceTick {
+			distance = occupiedTick - priceTick
+		} else {
+			distance = priceTick - occupiedTick
+		}
+		if distance < intervalTicks {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateGridPriceInterval 确保配置的网格步长能被交易所真实 tickSize 精确表示。
+// 否则不可能同时满足“固定网格”和“交易所合法价格”，必须在开始交易前失败。
+func ValidateGridPriceInterval(priceInterval, tickSize float64) error {
+	if _, ok := gridIntervalTickCount(priceInterval, tickSize); ok {
+		return nil
+	}
+	return fmt.Errorf("网格价格间隔 %g 必须是交易所价格步长 %g 的正整数倍",
+		priceInterval, tickSize)
+}
+
 // allocateMakerSafeSellPrice 保留原网格盈利目标和 Maker 安全价作为下限，
-// 再以交易所真实 tickSize 向上寻找未被现有订单或本批 reservation 占用的价位。
+// 再沿启动锚点定义的 priceInterval 网格向上寻找未被现有订单或本批
+// reservation 占用的价位。交易所 tickSize 只用于合法价格表示，不能替代
+// 用户配置的网格步长，否则 0.02 网格会退化成 0.01 的卖价序列。
 func (spm *SuperPositionManager) allocateMakerSafeSellPrice(
 	targetPrice, currentPrice, priceInterval float64,
 	occupied map[int64]struct{},
 ) (float64, int64, bool) {
 	tickSize := spm.priceTickSize
-	safetyBuffer := priceInterval * 0.1
-	if safetyBuffer < tickSize {
-		safetyBuffer = tickSize
-	}
-	lowerBound := math.Max(targetPrice, currentPrice+safetyBuffer)
-	priceTick, ok := priceTickIndexUp(lowerBound, tickSize)
+	intervalTicks, ok := gridIntervalTickCount(priceInterval, tickSize)
 	if !ok {
 		return 0, 0, false
 	}
+	anchorTick, ok := priceTickIndexNearest(spm.anchorPrice, tickSize)
+	if !ok {
+		return 0, 0, false
+	}
+	targetTick, ok := priceTickIndexUp(targetPrice, tickSize)
+	if !ok {
+		return 0, 0, false
+	}
+	currentTick, ok := priceTickIndexUp(currentPrice, tickSize)
+	if !ok {
+		return 0, 0, false
+	}
+	safetyTicks := intervalTicks / 10
+	if intervalTicks%10 != 0 {
+		safetyTicks++
+	}
+	if safetyTicks < 1 {
+		safetyTicks = 1
+	}
+	if currentTick > math.MaxInt64-safetyTicks {
+		return 0, 0, false
+	}
+	lowerBoundTick := currentTick + safetyTicks
+	if targetTick > lowerBoundTick {
+		lowerBoundTick = targetTick
+	}
+
+	priceTick := lowerBoundTick
+	remainder := (lowerBoundTick - anchorTick) % intervalTicks
+	if remainder < 0 {
+		remainder += intervalTicks
+	}
+	if remainder != 0 {
+		advance := intervalTicks - remainder
+		if priceTick > math.MaxInt64-advance {
+			return 0, 0, false
+		}
+		priceTick += advance
+	}
 	for {
-		if _, exists := occupied[priceTick]; !exists {
+		if !sellPriceTickConflicts(priceTick, intervalTicks, occupied) {
 			price := roundPrice(float64(priceTick)*tickSize, spm.priceDecimals)
 			if price > currentPrice && price+fillQtyTolerance >= targetPrice {
 				return price, priceTick, true
 			}
 		}
-		if priceTick == math.MaxInt64 {
+		if priceTick > math.MaxInt64-intervalTicks {
 			return 0, 0, false
 		}
-		priceTick++
+		priceTick += intervalTicks
 	}
 }
 

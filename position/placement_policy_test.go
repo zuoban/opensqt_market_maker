@@ -2,6 +2,7 @@ package position
 
 import (
 	"errors"
+	"math"
 	"sort"
 	"testing"
 	"time"
@@ -264,11 +265,8 @@ func TestAdjustOrdersRepricesCrossedSellAndSubmitsReduceOnlyFirst(t *testing.T) 
 	if first.Side != "SELL" || !first.ReduceOnly || !first.PostOnly {
 		t.Fatalf("first submitted order = %+v, want PostOnly ReduceOnly SELL", first)
 	}
-	if first.Price <= 110 {
-		t.Fatalf("crossed sell price = %.2f, want above current price 110", first.Price)
-	}
-	if first.Price < 101 {
-		t.Fatalf("repriced sell %.2f fell below grid target 101", first.Price)
+	if first.Price != 111 {
+		t.Fatalf("crossed sell price = %.2f, want next anchor-aligned grid price 111", first.Price)
 	}
 	if executor.orders[1].Side != "BUY" {
 		t.Fatalf("second submitted side = %s, want BUY after reduce-only sells", executor.orders[1].Side)
@@ -472,12 +470,99 @@ func assertSellRequestInvariants(
 		t.Fatalf("SELL price %.12f is not aligned to tick %.12f (quantized %.12f)",
 			order.Price, tickSize, got)
 	}
+	anchorTick, anchorOK := priceTickIndexNearest(spm.anchorPrice, tickSize)
+	intervalTicks, intervalOK := gridIntervalTickCount(priceInterval, tickSize)
+	if !anchorOK || !intervalOK || (priceTick-anchorTick)%intervalTicks != 0 {
+		t.Fatalf("SELL tick %d left anchor tick %d grid with interval %d ticks",
+			priceTick, anchorTick, intervalTicks)
+	}
 	return slotPrice, priceTick
 }
 
-func TestAdjustOrdersAllocatesDistinctTicksForCrossedSellSlots(t *testing.T) {
+func TestValidateGridPriceInterval(t *testing.T) {
 	tests := []struct {
 		name          string
+		priceInterval float64
+		tickSize      float64
+		wantErr       bool
+	}{
+		{name: "SOL grid", priceInterval: 0.02, tickSize: 0.01},
+		{name: "non power of ten tick", priceInterval: 1, tickSize: 0.25},
+		{name: "floating point integer ratio", priceInterval: 0.3, tickSize: 0.1},
+		{name: "fractional tick ratio", priceInterval: 0.015, tickSize: 0.01, wantErr: true},
+		{name: "interval below tick", priceInterval: 0.005, tickSize: 0.01, wantErr: true},
+		{name: "zero interval", tickSize: 0.01, wantErr: true},
+		{name: "invalid tick", priceInterval: 0.02, tickSize: math.NaN(), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateGridPriceInterval(tt.priceInterval, tt.tickSize)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateGridPriceInterval(%v, %v) error = %v, wantErr %v",
+					tt.priceInterval, tt.tickSize, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestAllocateMakerSafeSellPriceRejectsUnrepresentableGrid(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 4, 2, 0.01)
+	spm.anchorPrice = 100
+	price, priceTick, ok := spm.allocateMakerSafeSellPrice(100.03, 100.02, 0.015, nil)
+	if ok || price != 0 || priceTick != 0 {
+		t.Fatalf("allocateMakerSafeSellPrice() = (%v, %v, %v), want fail-closed zero result",
+			price, priceTick, ok)
+	}
+}
+
+func TestInitializeSnapsMarketPriceToExchangeTick(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.PriceInterval = 0.02
+	spm := NewSuperPositionManager(cfg, stubExecutor{}, stubEx{}, 4, 2, 0.01)
+
+	if err := spm.Initialize(104.423, "104.423"); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if spm.anchorPrice != 104.42 {
+		t.Fatalf("anchor price = %.12f, want nearest valid tick 104.42", spm.anchorPrice)
+	}
+	if got := spm.lastMarketPrice.Load().(float64); got != 104.423 {
+		t.Fatalf("last market price = %.12f, want raw market price 104.423", got)
+	}
+}
+
+func TestHighTickIndexGridPriceDoesNotSkipLevel(t *testing.T) {
+	const (
+		anchorPrice   = 35.41357750
+		priceInterval = 0.0001
+		tickSize      = 0.00000001
+	)
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 8, 4, tickSize)
+	spm.anchorPrice = anchorPrice
+	targetPrice := anchorPrice + priceInterval
+
+	price, priceTick, ok := spm.allocateMakerSafeSellPrice(
+		targetPrice,
+		anchorPrice,
+		priceInterval,
+		nil,
+	)
+	if !ok {
+		t.Fatal("allocateMakerSafeSellPrice() rejected a representable high tick-index grid")
+	}
+	anchorTick, _ := priceTickIndexNearest(anchorPrice, tickSize)
+	wantTick := anchorTick + 10000
+	if priceTick != wantTick || price != roundPrice(targetPrice, 8) {
+		t.Fatalf("allocated = price %.12f tick %d, want target %.12f tick %d",
+			price, priceTick, roundPrice(targetPrice, 8), wantTick)
+	}
+}
+
+func TestAdjustOrdersAllocatesDistinctGridPricesForCrossedSellSlots(t *testing.T) {
+	tests := []struct {
+		name          string
+		anchorPrice   float64
 		currentPrice  float64
 		priceInterval float64
 		tickSize      float64
@@ -487,24 +572,48 @@ func TestAdjustOrdersAllocatesDistinctTicksForCrossedSellSlots(t *testing.T) {
 		wantTicks     []int64
 	}{
 		{
-			name:          "screenshot SOL parameters",
+			name:          "wide interval stays on grid",
+			anchorPrice:   100,
 			currentPrice:  103.81,
 			priceInterval: 0.5,
 			tickSize:      0.01,
 			priceDecimals: 4,
 			slotPrices:    []float64{102, 102.5, 103},
 			quantity:      0.48,
-			wantTicks:     []int64{10386, 10387, 10388},
+			wantTicks:     []int64{10400, 10450, 10500},
 		},
 		{
 			name:          "non power of ten tick",
+			anchorPrice:   100,
 			currentPrice:  100,
 			priceInterval: 1,
 			tickSize:      0.25,
 			priceDecimals: 2,
 			slotPrices:    []float64{97, 98, 99},
 			quantity:      0.1,
-			wantTicks:     []int64{401, 402, 403},
+			wantTicks:     []int64{404, 408, 412},
+		},
+		{
+			name:          "SOL interval does not collapse to single ticks",
+			anchorPrice:   104.38,
+			currentPrice:  104.42,
+			priceInterval: 0.02,
+			tickSize:      0.01,
+			priceDecimals: 4,
+			slotPrices:    []float64{104.38, 104.40},
+			quantity:      0.10,
+			wantTicks:     []int64{10444, 10446},
+		},
+		{
+			name:          "non-zero grid phase is preserved",
+			anchorPrice:   100.03,
+			currentPrice:  100.06,
+			priceInterval: 0.02,
+			tickSize:      0.01,
+			priceDecimals: 4,
+			slotPrices:    []float64{100.03, 100.05},
+			quantity:      0.10,
+			wantTicks:     []int64{10007, 10009},
 		},
 	}
 
@@ -519,7 +628,7 @@ func TestAdjustOrdersAllocatesDistinctTicksForCrossedSellSlots(t *testing.T) {
 			spm := NewSuperPositionManager(
 				cfg, executor, stubEx{}, tt.priceDecimals, 3, tt.tickSize,
 			)
-			spm.anchorPrice = tt.currentPrice
+			spm.anchorPrice = tt.anchorPrice
 
 			wantSlots := make(map[string]struct{}, len(tt.slotPrices))
 			for _, slotPrice := range tt.slotPrices {
@@ -588,7 +697,7 @@ func TestAdjustOrdersDoesNotReusePlacedLockedSellTick(t *testing.T) {
 	cfg.Trading.MinOrderValue = 1
 	executor := &recordingExecutor{}
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 4, 3, tickSize)
-	spm.anchorPrice = currentPrice
+	spm.anchorPrice = 100
 
 	occupied := prepareFilledSellSlot(spm, 103.5, 0.48)
 	occupied.OrderID = 77
@@ -619,7 +728,7 @@ func TestAdjustOrdersDoesNotReusePlacedLockedSellTick(t *testing.T) {
 		}
 		seenTicks[priceTick] = struct{}{}
 	}
-	for _, wantTick := range []int64{10387, 10388} {
+	for _, wantTick := range []int64{10450, 10500} {
 		if _, exists := seenTicks[wantTick]; !exists {
 			t.Fatalf("allocated ticks = %v, missing %d", seenTicks, wantTick)
 		}
@@ -665,7 +774,7 @@ func TestAdjustOrdersTreatsPendingAndCancelRequestedSellPricesAsOccupied(t *test
 			cfg.Trading.MinOrderValue = 1
 			executor := &recordingExecutor{}
 			spm := NewSuperPositionManager(cfg, executor, stubEx{}, 4, 3, tickSize)
-			spm.anchorPrice = currentPrice
+			spm.anchorPrice = 100
 
 			occupied := prepareFilledSellSlot(spm, 103.5, 0.48)
 			occupied.OrderID = tt.orderID
@@ -688,8 +797,8 @@ func TestAdjustOrdersTreatsPendingAndCancelRequestedSellPricesAsOccupied(t *test
 			_, priceTick := assertSellRequestInvariants(
 				t, spm, sells[0], currentPrice, priceInterval, tickSize,
 			)
-			if priceTick != 10387 {
-				t.Fatalf("new SELL tick = %d, want 10387 after occupied 10386", priceTick)
+			if priceTick != 10450 {
+				t.Fatalf("new SELL tick = %d, want 10450 beyond legacy off-grid price 10386", priceTick)
 			}
 			if occupied.OrderID != tt.orderID || occupied.ClientOID != occupiedClientOID ||
 				occupied.OrderStatus != tt.orderStatus || occupied.SlotStatus != tt.slotStatus ||

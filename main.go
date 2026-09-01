@@ -113,6 +113,9 @@ func main() {
 	if priceTickSize <= 0 || math.IsNaN(priceTickSize) || math.IsInf(priceTickSize, 0) {
 		logger.Fatalf("❌ 交易所返回无效价格步长: %v", priceTickSize)
 	}
+	if err := position.ValidateGridPriceInterval(cfg.Trading.PriceInterval, priceTickSize); err != nil {
+		logger.Fatalf("❌ %v", err)
+	}
 	logger.Info("ℹ️ 交易精度 - 价格精度:%d, 价格步长:%g, 数量精度:%d",
 		priceDecimals, priceTickSize, quantityDecimals)
 	logger.Debug("📊 当前价格: %.*f", priceDecimals, currentPrice)

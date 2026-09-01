@@ -412,9 +412,10 @@ CancelAllBuyOrders()
 
 #### 卖价唯一性
 
-- 卖价下限为 `max(原网格盈利目标, Maker 安全价)`，然后按交易所真实 tick 向上量化。
+- `price_interval` 必须是交易所真实 tick 的正整数倍，否则启动时拒绝交易。
+- 卖价下限为 `max(原网格盈利目标, Maker 安全价)`，然后向上对齐到启动锚点定义的网格。
 - 每个持仓槽位仍保持一张独立 `ReduceOnly + PostOnly` 卖单，不合并数量。
-- 已活跃、`PENDING/UNKNOWN` 和 `CANCEL_REQUESTED` 的 SELL 都持续占用其价格 tick；新卖单逐 tick 向上寻找未占用价位。
+- 已活跃、`PENDING/UNKNOWN` 和 `CANCEL_REQUESTED` 的 SELL 都持续占用其实际价格 tick；网格价被占用时，新卖单按完整 `price_interval` 向上寻找下一格，不能退化成逐 tick 排列。
 - 候选收集后会再次检查槽位订单身份，防止订单流的异步绑定被新 reservation 覆盖。
 
 **典型操作流程**:
