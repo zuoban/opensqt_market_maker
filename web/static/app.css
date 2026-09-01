@@ -1252,6 +1252,8 @@ main { display: block; }
     z-index: 3;
     top: 0;
     left: 0;
+    display: grid;
+    gap: 1px;
     min-width: 188px;
     padding: 9px 11px;
     border: 1px solid var(--line-strong);
@@ -1263,11 +1265,22 @@ main { display: block; }
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     line-height: 1.65;
-    white-space: pre;
+    white-space: nowrap;
     pointer-events: none;
 }
 
 .chart-tooltip[hidden] { display: none; }
+
+.chart-tooltip-time { color: var(--muted); }
+
+.chart-tooltip-change {
+    margin-top: 2px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+.chart-tooltip-change.pos { color: var(--positive); }
+.chart-tooltip-change.neg { color: var(--negative); }
 
 .chart-inspect {
     display: grid;
@@ -1309,6 +1322,18 @@ main { display: block; }
     font-size: 11px;
     font-variant-numeric: tabular-nums;
 }
+
+.kline-inspect-copy {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.ladder-detail .kline-change {
+    font-weight: 700;
+    white-space: nowrap;
+}
+.ladder-detail .kline-change.pos { color: var(--positive); }
+.ladder-detail .kline-change.neg { color: var(--negative); }
 
 .ladder-detail::before {
     content: "INSPECT";

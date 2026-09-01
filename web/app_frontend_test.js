@@ -7,7 +7,10 @@ const {
     buildHourlyFillModel,
     buildMarginUsageModel,
     centeredScrollLeft,
-    formatRelativeTime
+    formatRelativeTime,
+    candleChangePct,
+    formatCandleChange,
+    candleDetail
 } = require("./static/app.js");
 
 function fixture() {
@@ -269,6 +272,55 @@ test("candles are normalized, ordered and summarized", () => {
     assert.equal(model.candleHigh, 104);
     assert.ok(model.priceMin < 98);
     assert.ok(model.priceMax > 104);
+});
+
+test("single candle change percent is close versus open", () => {
+    assert.equal(candleChangePct({ open: 100, close: 101 }), 1);
+    assert.equal(candleChangePct({ open: 100, close: 99 }), -1);
+    assert.equal(candleChangePct({ open: 100, close: 100 }), 0);
+    assert.equal(candleChangePct({ open: 0, close: 1 }), null);
+    assert.equal(candleChangePct({ open: 103.15, close: 103.32 }), (103.32 - 103.15) / 103.15 * 100);
+
+    const up = formatCandleChange({ open: 103.15, close: 103.32 });
+    assert.equal(up.text, "涨 +0.16%");
+    assert.equal(up.tone, "pos");
+    assert.equal(up.direction, "涨");
+
+    const down = formatCandleChange({ open: 103.32, close: 103.15 });
+    assert.equal(down.text, "跌 -0.16%");
+    assert.equal(down.tone, "neg");
+    assert.equal(down.direction, "跌");
+
+    const flat = formatCandleChange({ open: 100, close: 100 });
+    assert.equal(flat.text, "平 0.00%");
+    assert.equal(flat.tone, "");
+    assert.equal(flat.direction, "平");
+
+    const tiny = formatCandleChange({ open: 100, close: 100.001 });
+    assert.equal(tiny.text, "平 0.00%");
+    assert.equal(tiny.tone, "");
+});
+
+test("kline inspect and tooltip include the candle change percent", () => {
+    const js = fs.readFileSync(__dirname + "/static/app.js", "utf8");
+    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
+    const detail = candleDetail({
+        time: Date.UTC(2026, 8, 1, 8, 15, 0),
+        open: 103.15,
+        high: 103.38,
+        low: 103.14,
+        close: 103.32,
+        isClosed: true
+    }, 4);
+
+    assert.match(detail, /涨 \+0\.16%/);
+    assert.match(detail, /已完结/);
+    assert.match(js, /function renderKlineDetail/);
+    assert.match(js, /function positionChartTooltip[\s\S]*formatCandleChange\(candle\)/);
+    assert.match(cssBlock(css, ".chart-tooltip-change.pos"), /var\(--positive\)/);
+    assert.match(cssBlock(css, ".chart-tooltip-change.neg"), /var\(--negative\)/);
+    assert.match(cssBlock(css, ".ladder-detail .kline-change.pos"), /var\(--positive\)/);
+    assert.match(cssBlock(css, ".ladder-detail .kline-change.neg"), /var\(--negative\)/);
 });
 
 test("grid orders and positions become distinct K-line overlays", () => {

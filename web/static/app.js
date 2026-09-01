@@ -5,7 +5,10 @@
             buildHourlyFillModel,
             buildMarginUsageModel,
             centeredScrollLeft,
-            formatRelativeTime
+            formatRelativeTime,
+            candleChangePct,
+            formatCandleChange,
+            candleDetail
         };
         return;
     }
@@ -792,7 +795,7 @@
         $("klineCanvas").setAttribute("aria-label", summary + "。可使用左右方向键或两侧按钮逐根查看。");
         renderKlineStats(chartModel, decimals);
         if ((chartTooltipActive || chartPinned) && chartSelection !== null) updateSelectedCandle();
-        else setText($("klineDetail"), candleDetail(latest, decimals));
+        else renderKlineDetail(latest, decimals);
         syncKlineStepper();
         drawKlineChart();
     }
@@ -1344,7 +1347,29 @@
         const decimals = latestSnapshot && latestSnapshot.position
             ? (latestSnapshot.position.priceDecimals ?? 2)
             : 2;
-        setText($("klineDetail"), candleDetail(candle, decimals));
+        renderKlineDetail(candle, decimals);
+    }
+
+    function candleChangePct(candle) {
+        const open = Number(candle && candle.open);
+        const close = Number(candle && candle.close);
+        if (!Number.isFinite(open) || open <= 0 || !Number.isFinite(close)) return null;
+        return (close - open) / open * 100;
+    }
+
+    function formatCandleChange(candle) {
+        const pct = candleChangePct(candle);
+        if (pct == null) {
+            return { pct: null, text: "—", tone: "", direction: "" };
+        }
+        const rounded = Number(pct.toFixed(2));
+        if (rounded === 0) {
+            return { pct, text: "平 0.00%", tone: "", direction: "平" };
+        }
+        if (rounded > 0) {
+            return { pct, text: "涨 " + fmtSigned(rounded, 2) + "%", tone: "pos", direction: "涨" };
+        }
+        return { pct, text: "跌 " + fmtSigned(rounded, 2) + "%", tone: "neg", direction: "跌" };
     }
 
     function candleDetail(candle, decimals) {
@@ -1354,7 +1379,32 @@
             " · 高 " + fmt(candle.high, decimals) +
             " · 低 " + fmt(candle.low, decimals) +
             " · 收 " + fmt(candle.close, decimals) +
+            " · " + formatCandleChange(candle).text +
             " · " + (candle.isClosed ? "已完结" : "进行中");
+    }
+
+    function renderKlineDetail(candle, decimals) {
+        const node = $("klineDetail");
+        if (!node) return;
+        if (!candle) {
+            setText(node, "暂无 K 线明细");
+            return;
+        }
+        const change = formatCandleChange(candle);
+        const copy = element("span", "kline-inspect-copy");
+        copy.append(
+            document.createTextNode(
+                formatCompactDateTime(candle.time) +
+                " · 开 " + fmt(candle.open, decimals) +
+                " · 高 " + fmt(candle.high, decimals) +
+                " · 低 " + fmt(candle.low, decimals) +
+                " · 收 " + fmt(candle.close, decimals) +
+                " · "
+            ),
+            element("span", "kline-change" + (change.tone ? " " + change.tone : ""), change.text),
+            document.createTextNode(" · " + (candle.isClosed ? "已完结" : "进行中"))
+        );
+        node.replaceChildren(copy);
     }
 
     function positionChartTooltip(x, y, width, height, candle) {
@@ -1365,11 +1415,27 @@
         const decimals = latestSnapshot && latestSnapshot.position
             ? (latestSnapshot.position.priceDecimals ?? 2)
             : 2;
-        tooltip.textContent = formatCompactDateTime(candle.time) + "\n" +
-            "O " + fmt(candle.open, decimals) + "  H " + fmt(candle.high, decimals) + "\n" +
-            "L " + fmt(candle.low, decimals) + "  C " + fmt(candle.close, decimals);
-        const tooltipWidth = tooltip.offsetWidth || 178;
-        const tooltipHeight = tooltip.offsetHeight || 58;
+        const change = formatCandleChange(candle);
+        tooltip.replaceChildren(
+            element("div", "chart-tooltip-time", formatCompactDateTime(candle.time)),
+            element(
+                "div",
+                "chart-tooltip-row",
+                "O " + fmt(candle.open, decimals) + "  H " + fmt(candle.high, decimals)
+            ),
+            element(
+                "div",
+                "chart-tooltip-row",
+                "L " + fmt(candle.low, decimals) + "  C " + fmt(candle.close, decimals)
+            ),
+            element(
+                "div",
+                "chart-tooltip-change" + (change.tone ? " " + change.tone : ""),
+                change.text
+            )
+        );
+        const tooltipWidth = tooltip.offsetWidth || 188;
+        const tooltipHeight = tooltip.offsetHeight || 76;
         const preferLeft = x > width * 0.58;
         const left = preferLeft
             ? Math.max(8, x - tooltipWidth - 12)
