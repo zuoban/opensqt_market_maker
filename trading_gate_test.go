@@ -792,14 +792,14 @@ type emptyTradingGateReconcilePosition struct {
 	reconcileCount int64
 }
 
-func (p *emptyTradingGateReconcilePosition) IterateSlots(func(float64, interface{}) bool) {}
-func (p *emptyTradingGateReconcilePosition) GetTotalBuyQty() float64                      { return 0 }
-func (p *emptyTradingGateReconcilePosition) GetTotalSellQty() float64                     { return 0 }
-func (p *emptyTradingGateReconcilePosition) GetReconcileCount() int64                     { return p.reconcileCount }
-func (p *emptyTradingGateReconcilePosition) IncrementReconcileCount()                     { p.reconcileCount++ }
-func (p *emptyTradingGateReconcilePosition) UpdateLastReconcileTime(time.Time)            {}
-func (p *emptyTradingGateReconcilePosition) GetSymbol() string                            { return "BTCUSDT" }
-func (p *emptyTradingGateReconcilePosition) GetPriceInterval() float64                    { return 1 }
+func (p *emptyTradingGateReconcilePosition) IterateSlots(func(float64, safety.SlotInfo) bool) {}
+func (p *emptyTradingGateReconcilePosition) GetTotalBuyQty() float64                          { return 0 }
+func (p *emptyTradingGateReconcilePosition) GetTotalSellQty() float64                         { return 0 }
+func (p *emptyTradingGateReconcilePosition) GetReconcileCount() int64                         { return p.reconcileCount }
+func (p *emptyTradingGateReconcilePosition) IncrementReconcileCount()                         { p.reconcileCount++ }
+func (p *emptyTradingGateReconcilePosition) UpdateLastReconcileTime(time.Time)                {}
+func (p *emptyTradingGateReconcilePosition) GetSymbol() string                                { return "BTCUSDT" }
+func (p *emptyTradingGateReconcilePosition) GetPriceInterval() float64                        { return 1 }
 
 type adjustmentTradingPosition struct {
 	adjustErr   error
@@ -896,14 +896,21 @@ type observedAdjustCall struct {
 }
 
 type observedTradingPosition struct {
-	mu            sync.Mutex
-	adjustCalls   int
-	activeAdjusts int
-	maxActive     int
-	blockCall     int
-	release       <-chan struct{}
-	onAdjust      func(int)
-	calls         chan observedAdjustCall
+	mu                sync.Mutex
+	adjustCalls       int
+	activeAdjusts     int
+	maxActive         int
+	blockCall         int
+	release           <-chan struct{}
+	onAdjust          func(int)
+	calls             chan observedAdjustCall
+	skipUnchangedGrid bool
+}
+
+func (p *observedTradingPosition) ShouldSkipUnchangedGrid(float64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.skipUnchangedGrid
 }
 
 func newObservedTradingPosition() *observedTradingPosition {
@@ -1401,6 +1408,45 @@ func TestTradingGateInitialAdjustKeepsFutureRequestAndRequestDuringAdjust(t *tes
 	}
 	if calls, _ := positionManager.stats(); calls != 3 {
 		t.Fatalf("consumed request ran repeatedly: AdjustOrders calls = %d, want 3", calls)
+	}
+}
+
+func TestTradingGateSkipsPriceTickWhenGridUnchanged(t *testing.T) {
+	positionManager := newObservedTradingPosition()
+	runtime, _, _ := newHealthyTradingGateTestRuntime(t, positionManager)
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("initial evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 1 {
+		t.Fatalf("initial AdjustOrders calls = %d, want 1", calls)
+	}
+
+	positionManager.mu.Lock()
+	positionManager.skipUnchangedGrid = true
+	positionManager.mu.Unlock()
+
+	if err := runtime.evaluate(context.Background(), true); err != nil {
+		t.Fatalf("skipped price-tick evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 1 {
+		t.Fatalf("unchanged-grid price tick AdjustOrders calls = %d, want 1", calls)
+	}
+
+	if !runtime.RequestAdjustOrders(0) {
+		t.Fatal("explicit adjust request was rejected")
+	}
+	if err := runtime.evaluate(context.Background(), false); err != nil {
+		t.Fatalf("explicit-request evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 2 {
+		t.Fatalf("explicit adjust request AdjustOrders calls = %d, want 2", calls)
+	}
+
+	if err := runtime.evaluate(context.Background(), true); err != nil {
+		t.Fatalf("second skipped price-tick evaluate() error = %v", err)
+	}
+	if calls, _ := positionManager.stats(); calls != 2 {
+		t.Fatalf("price tick after explicit request AdjustOrders calls = %d, want 2", calls)
 	}
 }
 

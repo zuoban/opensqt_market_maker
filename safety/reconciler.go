@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"opensqt/config"
+	"opensqt/exchange"
 	"opensqt/logger"
 )
 
@@ -53,9 +54,8 @@ type managedOrderSnapshot struct {
 
 // IPositionManager 定义对账所需的仓位管理器接口方法
 type IPositionManager interface {
-	// 遍历所有槽位（封装 sync.Map.Range）
-	// 注意：slot 为 interface{} 类型，需要转换为 SlotInfo
-	IterateSlots(fn func(price float64, slot interface{}) bool)
+	// 遍历所有槽位。回调收到只读拷贝。
+	IterateSlots(fn func(price float64, slot SlotInfo) bool)
 	// 获取统计数据
 	GetTotalBuyQty() float64
 	GetTotalSellQty() float64
@@ -206,41 +206,17 @@ func (r *Reconciler) Reconcile() (retErr error) {
 		PositionStatusFilled       = "FILLED"
 	)
 
-	r.pm.IterateSlots(func(price float64, slotRaw interface{}) bool {
-		// 使用反射提取槽位字段
-		v := dereference(reflect.ValueOf(slotRaw))
-		if v.Kind() != reflect.Struct {
-			localStateErr = fmt.Errorf("槽位 %.12f 类型无效: %T", price, slotRaw)
-			return false
-		}
-
-		// 提取字段的辅助函数
-		getStringField := func(name string) string {
-			field := v.FieldByName(name)
-			if field.IsValid() && field.Kind() == reflect.String {
-				return field.String()
-			}
-			return ""
-		}
-
-		getFloat64Field := func(name string) float64 {
-			field := v.FieldByName(name)
-			if field.IsValid() && field.CanFloat() {
-				return field.Float()
-			}
-			return 0.0
-		}
-
-		positionStatus := getStringField("PositionStatus")
-		positionQty := getFloat64Field("PositionQty")
-		orderSide := getStringField("OrderSide")
-		orderStatus := getStringField("OrderStatus")
-		slotStatus := getStringField("SlotStatus")
-		orderID := getInt64Field(v, "OrderID")
-		clientOrderID := getStringField("ClientOID")
-		orderPrice := getFloat64Field("OrderPrice")
-		orderQuantity := getFloat64Field("OrderQuantity")
-		orderFilledQty := getFloat64Field("OrderFilledQty")
+	r.pm.IterateSlots(func(price float64, slot SlotInfo) bool {
+		positionStatus := slot.PositionStatus
+		positionQty := slot.PositionQty
+		orderSide := slot.OrderSide
+		orderStatus := slot.OrderStatus
+		slotStatus := slot.SlotStatus
+		orderID := slot.OrderID
+		clientOrderID := slot.ClientOID
+		orderPrice := slot.OrderPrice
+		orderQuantity := slot.OrderQuantity
+		orderFilledQty := slot.OrderFilledQty
 
 		if math.IsNaN(positionQty) || math.IsInf(positionQty, 0) || positionQty < 0 {
 			localStateErr = fmt.Errorf("槽位 %.12f 的 PositionQty=%v 非法", price, positionQty)
@@ -435,6 +411,133 @@ func (r *Reconciler) Reconcile() (retErr error) {
 	return nil
 }
 
+func sumTypedPositions(raw interface{}, symbol string) (float64, bool, error) {
+	add := func(itemSymbol string, size float64) (float64, error) {
+		if itemSymbol != symbol {
+			return 0, nil
+		}
+		if math.IsNaN(size) || math.IsInf(size, 0) {
+			return 0, fmt.Errorf("持仓 Size=%v 非法", size)
+		}
+		return size, nil
+	}
+	var total float64
+	switch positions := raw.(type) {
+	case []*exchange.Position:
+		for i, pos := range positions {
+			if pos == nil {
+				continue
+			}
+			size, err := add(pos.Symbol, pos.Size)
+			if err != nil {
+				return 0, true, fmt.Errorf("第 %d 个持仓无效: %w", i, err)
+			}
+			total += size
+		}
+		return total, true, nil
+	case []exchange.Position:
+		for i, pos := range positions {
+			size, err := add(pos.Symbol, pos.Size)
+			if err != nil {
+				return 0, true, fmt.Errorf("第 %d 个持仓无效: %w", i, err)
+			}
+			total += size
+		}
+		return total, true, nil
+	default:
+		return 0, false, nil
+	}
+}
+
+type remoteOrderFields struct {
+	OrderID       int64
+	ClientOrderID string
+	Symbol        string
+	Side          string
+	Status        string
+	Type          string
+	Price         float64
+	Quantity      float64
+	ExecutedQty   float64
+}
+
+func typedOrderSlice(raw interface{}) ([]remoteOrderFields, bool) {
+	switch orders := raw.(type) {
+	case []*exchange.Order:
+		out := make([]remoteOrderFields, 0, len(orders))
+		for _, order := range orders {
+			if order == nil {
+				continue
+			}
+			out = append(out, remoteOrderFields{
+				OrderID:       order.OrderID,
+				ClientOrderID: order.ClientOrderID,
+				Symbol:        order.Symbol,
+				Side:          string(order.Side),
+				Status:        string(order.Status),
+				Type:          string(order.Type),
+				Price:         order.Price,
+				Quantity:      order.Quantity,
+				ExecutedQty:   order.ExecutedQty,
+			})
+		}
+		return out, true
+	case []exchange.Order:
+		out := make([]remoteOrderFields, 0, len(orders))
+		for _, order := range orders {
+			out = append(out, remoteOrderFields{
+				OrderID:       order.OrderID,
+				ClientOrderID: order.ClientOrderID,
+				Symbol:        order.Symbol,
+				Side:          string(order.Side),
+				Status:        string(order.Status),
+				Type:          string(order.Type),
+				Price:         order.Price,
+				Quantity:      order.Quantity,
+				ExecutedQty:   order.ExecutedQty,
+			})
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func collectManagedRemoteOrders(
+	orders []remoteOrderFields,
+	localOrders map[int64]managedOrderSnapshot,
+) (map[int64]managedOrderSnapshot, error) {
+	result := make(map[int64]managedOrderSnapshot)
+	for i, item := range orders {
+		if item.OrderID <= 0 {
+			return nil, fmt.Errorf("第 %d 个挂单缺少有效 OrderID", i)
+		}
+		_, isLocal := localOrders[item.OrderID]
+		if !isLocal && !isOpenSQTClientOrderID(item.ClientOrderID) {
+			continue
+		}
+		if _, duplicate := result[item.OrderID]; duplicate {
+			return nil, fmt.Errorf("远端存在重复 OrderID=%d", item.OrderID)
+		}
+		remote := managedOrderSnapshot{
+			OrderID:       item.OrderID,
+			ClientOrderID: item.ClientOrderID,
+			Symbol:        item.Symbol,
+			Side:          strings.ToUpper(item.Side),
+			Status:        strings.ToUpper(item.Status),
+			Type:          strings.ToUpper(item.Type),
+			Price:         item.Price,
+			Quantity:      item.Quantity,
+			ExecutedQty:   item.ExecutedQty,
+		}
+		if err := validateRemoteManagedOrder(remote); err != nil {
+			return nil, fmt.Errorf("受管订单 %d 无效: %w", item.OrderID, err)
+		}
+		result[item.OrderID] = remote
+	}
+	return result, nil
+}
+
 func getInt64Field(v reflect.Value, name string) int64 {
 	field := v.FieldByName(name)
 	if field.IsValid() && field.CanInt() {
@@ -463,6 +566,9 @@ func dereference(v reflect.Value) reflect.Value {
 }
 
 func extractRemotePosition(raw interface{}, symbol string) (float64, error) {
+	if total, ok, err := sumTypedPositions(raw, symbol); ok {
+		return total, err
+	}
 	v := dereference(reflect.ValueOf(raw))
 	if !v.IsValid() {
 		return 0, nil
@@ -499,6 +605,9 @@ func extractManagedRemoteOrders(
 	raw interface{},
 	localOrders map[int64]managedOrderSnapshot,
 ) (map[int64]managedOrderSnapshot, error) {
+	if orders, ok := typedOrderSlice(raw); ok {
+		return collectManagedRemoteOrders(orders, localOrders)
+	}
 	v := dereference(reflect.ValueOf(raw))
 	result := make(map[int64]managedOrderSnapshot)
 	if !v.IsValid() {

@@ -46,6 +46,7 @@ vendor/
 # IDE / 编辑器文件
 .vscode/
 .idea/
+.serena/
 *.iml
 
 # 系统文件

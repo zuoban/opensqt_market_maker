@@ -375,11 +375,14 @@ func (b *BinanceAdapter) confirmOrderByClientID(ctx context.Context, symbol, cli
 	// 原下单上下文可能已经超时。确认查询必须使用新的有界上下文，且只做只读对账。
 	confirmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
+	return b.confirmOrderByClientIDWithContext(confirmCtx, symbol, clientOrderID)
+}
 
+func (b *BinanceAdapter) confirmOrderByClientIDWithContext(ctx context.Context, symbol, clientOrderID string) (*Order, error) {
 	order, err := b.client.NewGetOrderService().
 		Symbol(symbol).
 		OrigClientOrderID(clientOrderID).
-		Do(confirmCtx)
+		Do(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +460,8 @@ func isUnknownPlacementResult(err error) bool {
 		return true
 	}
 	var bodyLimitErr *responseBodyTooLargeError
-	if errors.As(err, &bodyLimitErr) && bodyLimitErr.Method == http.MethodPost && bodyLimitErr.Path == createOrderEndpoint {
+	if errors.As(err, &bodyLimitErr) && bodyLimitErr.Method == http.MethodPost &&
+		(bodyLimitErr.Path == createOrderEndpoint || bodyLimitErr.Path == batchCreateOrderEndpoint) {
 		return true
 	}
 	var netErr net.Error
@@ -498,28 +502,6 @@ func isCreateResponseDecodeError(err error) bool {
 	var syntaxErr *json.SyntaxError
 	var typeErr *json.UnmarshalTypeError
 	return errors.As(err, &syntaxErr) || errors.As(err, &typeErr)
-}
-
-// BatchPlaceOrders 批量下单
-func (b *BinanceAdapter) BatchPlaceOrders(ctx context.Context, orders []*OrderRequest) ([]*Order, bool) {
-	placedOrders := make([]*Order, 0, len(orders))
-	hasMarginError := false
-
-	for _, orderReq := range orders {
-		order, err := b.PlaceOrder(ctx, orderReq)
-		if err != nil {
-			logger.Warn("⚠️ [Binance] 下单失败 %.2f %s: %v",
-				orderReq.Price, orderReq.Side, err)
-
-			if strings.Contains(err.Error(), "-2019") || strings.Contains(err.Error(), "insufficient") {
-				hasMarginError = true
-			}
-			continue
-		}
-		placedOrders = append(placedOrders, order)
-	}
-
-	return placedOrders, hasMarginError
 }
 
 // CancelOrder 取消订单
@@ -568,32 +550,38 @@ func (b *BinanceAdapter) BatchCancelOrders(ctx context.Context, symbol string, o
 			continue
 		}
 
-		_, err := b.client.NewCancelMultipleOrdersService().
+		results, err := b.client.NewCancelMultipleOrdersService().
 			Symbol(symbol).
 			OrderIDList(batch).
 			Do(ctx)
 
 		if err != nil {
 			logger.Warn("⚠️ [Binance] 批量撤单失败 (共%d个): %v", len(batch), err)
-			cancelErrs = append(cancelErrs, fmt.Errorf("Binance 批量撤单失败（%d 个）: %w", len(batch), err))
+			batchErr := fmt.Errorf("Binance 批量撤单失败（%d 个）: %w", len(batch), err)
 			if ctx.Err() != nil {
+				cancelErrs = append(cancelErrs, batchErr)
 				return errors.Join(cancelErrs...)
 			}
 			// 失败时尝试单个撤单
 			logger.Info("🔄 [Binance] 改为逐个撤单...")
-			for index, orderID := range batch {
-				if fallbackErr := b.CancelOrder(ctx, symbol, orderID); fallbackErr != nil {
-					cancelErrs = append(cancelErrs, fmt.Errorf("Binance 批量撤单回退取消订单 %d 失败: %w", orderID, fallbackErr))
-				}
-				if index < len(batch)-1 {
-					if waitErr := waitWithContext(ctx, 100*time.Millisecond); waitErr != nil {
-						cancelErrs = append(cancelErrs, fmt.Errorf("Binance 批量撤单回退等待被取消: %w", waitErr))
-						return errors.Join(cancelErrs...)
-					}
-				}
+			if fallbackErr := b.cancelOrdersIndividually(ctx, symbol, batch); fallbackErr != nil {
+				cancelErrs = append(cancelErrs, batchErr, fallbackErr)
+			} else {
+				logger.Info("✅ [Binance] 批量撤单回退成功: %d 个订单", len(batch))
 			}
 		} else {
-			logger.Info("✅ [Binance] 批量撤单成功: %d 个订单", len(batch))
+			unconfirmed := unconfirmedBatchCancelOrderIDs(symbol, batch, results)
+			if len(unconfirmed) == 0 {
+				logger.Info("✅ [Binance] 批量撤单成功: %d 个订单", len(batch))
+			} else {
+				resultErr := fmt.Errorf("Binance 批量撤单响应未确认订单 %v", unconfirmed)
+				logger.Warn("⚠️ [Binance] %v，改为逐个撤单", resultErr)
+				if fallbackErr := b.cancelOrdersIndividually(ctx, symbol, unconfirmed); fallbackErr != nil {
+					cancelErrs = append(cancelErrs, resultErr, fallbackErr)
+				} else {
+					logger.Info("✅ [Binance] 未确认订单逐个撤单成功: %d 个", len(unconfirmed))
+				}
+			}
 		}
 
 		// 避免限频
@@ -605,6 +593,49 @@ func (b *BinanceAdapter) BatchCancelOrders(ctx context.Context, symbol string, o
 		}
 	}
 
+	return errors.Join(cancelErrs...)
+}
+
+func unconfirmedBatchCancelOrderIDs(symbol string, requested []int64, results []*futures.CancelOrderResponse) []int64 {
+	requestedSet := make(map[int64]struct{}, len(requested))
+	for _, orderID := range requested {
+		requestedSet[orderID] = struct{}{}
+	}
+	confirmed := make(map[int64]struct{}, len(results))
+	for _, result := range results {
+		if result == nil {
+			continue
+		}
+		if !strings.EqualFold(result.Symbol, symbol) || result.Status != futures.OrderStatusTypeCanceled {
+			continue
+		}
+		if _, ok := requestedSet[result.OrderID]; ok {
+			confirmed[result.OrderID] = struct{}{}
+		}
+	}
+
+	unconfirmed := make([]int64, 0, len(requested)-len(confirmed))
+	for _, orderID := range requested {
+		if _, ok := confirmed[orderID]; !ok {
+			unconfirmed = append(unconfirmed, orderID)
+		}
+	}
+	return unconfirmed
+}
+
+func (b *BinanceAdapter) cancelOrdersIndividually(ctx context.Context, symbol string, orderIDs []int64) error {
+	var cancelErrs []error
+	for index, orderID := range orderIDs {
+		if err := b.CancelOrder(ctx, symbol, orderID); err != nil {
+			cancelErrs = append(cancelErrs, fmt.Errorf("Binance 批量撤单回退取消订单 %d 失败: %w", orderID, err))
+		}
+		if index < len(orderIDs)-1 {
+			if err := waitWithContext(ctx, 100*time.Millisecond); err != nil {
+				cancelErrs = append(cancelErrs, fmt.Errorf("Binance 批量撤单回退等待被取消: %w", err))
+				return errors.Join(cancelErrs...)
+			}
+		}
+	}
 	return errors.Join(cancelErrs...)
 }
 
@@ -999,41 +1030,9 @@ func parseFiniteFloat(field, value string) (float64, error) {
 
 // StartOrderStream 启动订单流（WebSocket）
 func (b *BinanceAdapter) StartOrderStream(ctx context.Context, callback func(interface{})) error {
-	// 转换回调函数：将 binance.OrderUpdate 转换为通用格式
-	localCallback := func(update OrderUpdate) {
-		// 构造通用的 OrderUpdate 结构（避免导入 exchange 包）
-		genericUpdate := struct {
-			OrderID                int64
-			ClientOrderID          string
-			Symbol                 string
-			Side                   string
-			Type                   string
-			Status                 string
-			Price                  float64
-			Quantity               float64
-			ExecutedQty            float64
-			AvgPrice               float64
-			UpdateTime             int64
-			RealizedPNL            float64
-			RealizedPNLIncremental bool
-		}{
-			OrderID:                update.OrderID,
-			ClientOrderID:          update.ClientOrderID, // 🔥 关键：传递 ClientOrderID
-			Symbol:                 update.Symbol,
-			Side:                   string(update.Side),
-			Type:                   string(update.Type),
-			Status:                 string(update.Status),
-			Price:                  update.Price,
-			Quantity:               update.Quantity,
-			ExecutedQty:            update.ExecutedQty,
-			AvgPrice:               update.AvgPrice,
-			UpdateTime:             update.UpdateTime,
-			RealizedPNL:            update.RealizedPNL,
-			RealizedPNLIncremental: update.RealizedPNLIncremental,
-		}
-		callback(genericUpdate)
-	}
-	return b.wsManager.Start(ctx, localCallback)
+	return b.wsManager.Start(ctx, func(update OrderUpdate) {
+		callback(update)
+	})
 }
 
 // StopOrderStream 停止订单流

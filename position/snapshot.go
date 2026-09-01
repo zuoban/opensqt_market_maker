@@ -64,6 +64,25 @@ func isActiveOrderStatus(status string) bool {
 	return status == OrderStatusPlaced || status == OrderStatusConfirmed || status == OrderStatusPartiallyFilled
 }
 
+func snapshotSlotVisible(item SlotSnapshot, gridPrice float64, priceDecimals int) bool {
+	if item.InBuyWindow || item.InSellWindow {
+		return true
+	}
+	if gridPrice > 0 && item.PriceText == formatPrice(gridPrice, priceDecimals) {
+		return true
+	}
+	if item.PositionStatus == PositionStatusFilled && item.PositionQty > 0.001 {
+		return true
+	}
+	if isActiveOrderStatus(item.OrderStatus) || item.OrderStatus == OrderStatusCancelRequested {
+		return true
+	}
+	if item.SlotStatus == SlotStatusPending || item.SlotStatus == SlotStatusLocked {
+		return true
+	}
+	return item.OrderID != 0 || item.ClientOID != ""
+}
+
 // GetLastReconcileTime 最近一次对账时间
 func (spm *SuperPositionManager) GetLastReconcileTime() time.Time {
 	if v := spm.lastReconcileTime.Load(); v != nil {
@@ -153,9 +172,7 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	}
 
 	slots := make([]SlotSnapshot, 0, 32)
-	spm.slots.Range(func(key, value interface{}) bool {
-		price := key.(float64)
-		slot := value.(*InventorySlot)
+	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
 		item := SlotSnapshot{
 			Price:             price,
@@ -189,7 +206,9 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 				snap.ActiveSellOrders++
 			}
 		}
-		slots = append(slots, item)
+		if snapshotSlotVisible(item, snap.GridPrice, snap.PriceDecimals) {
+			slots = append(slots, item)
+		}
 		return true
 	})
 

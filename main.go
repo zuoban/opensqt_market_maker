@@ -7,7 +7,6 @@ import (
 	"math"
 	"os"
 	"os/signal"
-	"reflect"
 	"strings"
 	"syscall"
 	"time"
@@ -23,7 +22,7 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.5.5"
+var Version = "v3.5.6"
 
 func main() {
 	programStartedAt := time.Now()
@@ -201,64 +200,22 @@ func main() {
 	// - 订单流与价格流共用同一个 WebSocket 连接（对于支持的交易所）
 	// - 订单更新通过回调函数实时推送给 SuperPositionManager
 	logger.Info("🔗 启动 WebSocket 订单流...")
-	if err := ex.StartOrderStream(ctx, func(updateInterface interface{}) {
-		// 使用反射提取字段（兼容匿名结构体）
-		v := reflect.ValueOf(updateInterface)
-		if v.Kind() != reflect.Struct {
-			logger.Warn("⚠️ [main.go] 订单更新不是结构体类型: %T", updateInterface)
-			return
-		}
-
-		// 提取字段值的辅助函数
-		getInt64Field := func(name string) int64 {
-			field := v.FieldByName(name)
-			if field.IsValid() && field.CanInt() {
-				return field.Int()
-			}
-			return 0
-		}
-
-		getStringField := func(name string) string {
-			field := v.FieldByName(name)
-			if field.IsValid() && field.Kind() == reflect.String {
-				return field.String()
-			}
-			return ""
-		}
-
-		getFloat64Field := func(name string) float64 {
-			field := v.FieldByName(name)
-			if field.IsValid() && field.CanFloat() {
-				return field.Float()
-			}
-			return 0.0
-		}
-
-		getBoolField := func(name string) bool {
-			field := v.FieldByName(name)
-			if field.IsValid() && field.Kind() == reflect.Bool {
-				return field.Bool()
-			}
-			return false
-		}
-
-		// 提取所有字段
+	if err := ex.StartOrderStream(ctx, func(update exchange.OrderUpdate) {
 		posUpdate := position.OrderUpdate{
-			OrderID:                getInt64Field("OrderID"),
-			ClientOrderID:          getStringField("ClientOrderID"), // 🔥 关键：传递 ClientOrderID
-			Symbol:                 getStringField("Symbol"),
-			Status:                 getStringField("Status"),
-			Quantity:               getFloat64Field("Quantity"),
-			ExecutedQty:            getFloat64Field("ExecutedQty"),
-			Price:                  getFloat64Field("Price"),
-			AvgPrice:               getFloat64Field("AvgPrice"),
-			Side:                   getStringField("Side"),
-			Type:                   getStringField("Type"),
-			UpdateTime:             getInt64Field("UpdateTime"),
-			RealizedPNL:            getFloat64Field("RealizedPNL"),
-			RealizedPNLIncremental: getBoolField("RealizedPNLIncremental"),
+			OrderID:                update.OrderID,
+			ClientOrderID:          update.ClientOrderID,
+			Symbol:                 update.Symbol,
+			Status:                 string(update.Status),
+			Quantity:               update.Quantity,
+			ExecutedQty:            update.ExecutedQty,
+			Price:                  update.Price,
+			AvgPrice:               update.AvgPrice,
+			Side:                   string(update.Side),
+			Type:                   string(update.Type),
+			UpdateTime:             update.UpdateTime,
+			RealizedPNL:            update.RealizedPNL,
+			RealizedPNLIncremental: update.RealizedPNLIncremental,
 		}
-
 		logger.Debug("🔍 [main.go] 收到订单更新回调: ID=%d, ClientOID=%s, Price=%.2f, Status=%s",
 			posUpdate.OrderID, posUpdate.ClientOrderID, posUpdate.Price, posUpdate.Status)
 		superPositionManager.OnOrderUpdate(posUpdate)
@@ -588,21 +545,7 @@ type positionExchangeAdapter struct {
 }
 
 func (a *positionExchangeAdapter) GetPositions(ctx context.Context, symbol string) (interface{}, error) {
-	positions, err := a.exchange.GetPositions(ctx, symbol)
-	if err != nil {
-		return nil, err
-	}
-
-	// 转换为 position.PositionInfo 切片
-	result := make([]*position.PositionInfo, len(positions))
-	for i, pos := range positions {
-		result[i] = &position.PositionInfo{
-			Symbol: pos.Symbol,
-			Size:   pos.Size,
-		}
-	}
-
-	return result, nil
+	return a.exchange.GetPositions(ctx, symbol)
 }
 
 func (a *positionExchangeAdapter) GetOpenOrders(ctx context.Context, symbol string) (interface{}, error) {

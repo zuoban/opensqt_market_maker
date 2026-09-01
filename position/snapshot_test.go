@@ -96,8 +96,8 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	if snap.RealizedPNL != 0.42 {
 		t.Fatalf("realized pnl = %v", snap.RealizedPNL)
 	}
-	if len(snap.Slots) != 3 {
-		t.Fatalf("slots = %d", len(snap.Slots))
+	if len(snap.Slots) != 2 {
+		t.Fatalf("slots = %d, want window/occupied only", len(snap.Slots))
 	}
 	if snap.Slots[0].Price < snap.Slots[1].Price {
 		t.Fatal("slots should be price desc")
@@ -112,8 +112,8 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	if !byPrice[99].InBuyWindow {
 		t.Fatal("99 should be in buy window")
 	}
-	if byPrice[98].InBuyWindow || byPrice[98].InSellWindow {
-		t.Fatal("98 should be outside both windows")
+	if _, ok := byPrice[98]; ok {
+		t.Fatal("idle slot outside the window should be omitted from the dashboard snapshot")
 	}
 	foundOID := false
 	for _, sl := range snap.Slots {
@@ -123,6 +123,35 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	}
 	if !foundOID {
 		t.Fatal("missing client oid")
+	}
+}
+
+func TestSnapshotKeepsOccupiedSlotsOutsideWindow(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
+	spm.anchorPrice = 100
+	spm.lastMarketPrice.Store(100.0)
+
+	filled := spm.getOrCreateSlot(80)
+	filled.PositionStatus = PositionStatusFilled
+	filled.PositionQty = 0.2
+	pending := spm.getOrCreateSlot(70)
+	pending.SlotStatus = SlotStatusPending
+	pending.ClientOID = "pending-70"
+	pending.OrderSide = "BUY"
+
+	snap := spm.Snapshot()
+	byPrice := map[float64]SlotSnapshot{}
+	for _, sl := range snap.Slots {
+		byPrice[sl.Price] = sl
+	}
+	if snap.FilledSlotCount != 1 || snap.PositionQty != 0.2 {
+		t.Fatalf("occupied totals = filled:%d qty:%v", snap.FilledSlotCount, snap.PositionQty)
+	}
+	if _, ok := byPrice[80]; !ok {
+		t.Fatal("filled slot outside the window was omitted")
+	}
+	if _, ok := byPrice[70]; !ok {
+		t.Fatal("pending slot outside the window was omitted")
 	}
 }
 

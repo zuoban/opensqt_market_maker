@@ -4,7 +4,6 @@ import (
 	"context"
 	"opensqt/config"
 	"opensqt/logger"
-	"reflect"
 	"sort"
 	"time"
 )
@@ -25,8 +24,7 @@ type IOrderExecutor interface {
 
 // IOrderCleanerPositionManager 订单清理所需的仓位管理器接口
 type IOrderCleanerPositionManager interface {
-	// 遍历所有槽位
-	IterateSlots(fn func(price float64, slot interface{}) bool)
+	IterateSlots(fn func(price float64, slot SlotInfo) bool)
 	// 仅当槽位仍属于被撤订单且状态未变化时，更新槽位状态。
 	CompareAndSwapSlotOrderStatus(price float64, orderID int64, clientOID, expectedStatus, newStatus string) bool
 }
@@ -81,34 +79,11 @@ func (oc *OrderCleaner) CleanupOrders() {
 	var buyOrders []OrderCleanerSlotInfo
 	var sellOrders []OrderCleanerSlotInfo
 
-	oc.pm.IterateSlots(func(price float64, slotRaw interface{}) bool {
-		// 使用反射提取槽位字段
-		v := reflect.ValueOf(slotRaw)
-		if v.Kind() != reflect.Struct {
-			return true
-		}
-
-		// 提取字段
-		getStringField := func(name string) string {
-			field := v.FieldByName(name)
-			if field.IsValid() && field.Kind() == reflect.String {
-				return field.String()
-			}
-			return ""
-		}
-
-		getInt64Field := func(name string) int64 {
-			field := v.FieldByName(name)
-			if field.IsValid() && field.CanInt() {
-				return field.Int()
-			}
-			return 0
-		}
-
-		orderID := getInt64Field("OrderID")
-		clientOID := getStringField("ClientOID")
-		orderSide := getStringField("OrderSide")
-		orderStatus := getStringField("OrderStatus")
+	oc.pm.IterateSlots(func(price float64, slot SlotInfo) bool {
+		orderID := slot.OrderID
+		clientOID := slot.ClientOID
+		orderSide := slot.OrderSide
+		orderStatus := slot.OrderStatus
 
 		// 🔥 修复：排除部分成交的订单（PARTIALLY_FILLED不能撤销，会造成资金悬空）
 		if orderStatus == OrderStatusPlaced || orderStatus == OrderStatusConfirmed {

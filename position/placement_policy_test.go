@@ -192,12 +192,12 @@ func TestMarginLockKeepsExistingBuysAndStillPlacesReduceOnlySells(t *testing.T) 
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3)
 	spm.anchorPrice = 100
 
-	existingBuy := spm.getOrCreateSlot(97)
+	existingBuy := spm.getOrCreateSlot(99)
 	existingBuy.OrderID = 77
-	existingBuy.ClientOID = spm.generateClientOrderID(97, "BUY")
+	existingBuy.ClientOID = spm.generateClientOrderID(99, "BUY")
 	existingBuy.OrderSide = "BUY"
 	existingBuy.OrderStatus = OrderStatusPlaced
-	existingBuy.OrderPrice = 97
+	existingBuy.OrderPrice = 99
 	existingBuy.OrderQuantity = 0.3
 	existingBuy.SlotStatus = SlotStatusLocked
 
@@ -236,9 +236,11 @@ func TestMarginLockKeepsExistingBuysAndStillPlacesReduceOnlySells(t *testing.T) 
 			t.Fatalf("order submitted during margin lock = %+v, want PostOnly ReduceOnly SELL", req)
 		}
 	}
-	if existingBuy.OrderID != 77 || existingBuy.OrderStatus != OrderStatusPlaced ||
-		existingBuy.SlotStatus != SlotStatusLocked {
-		t.Fatalf("existing buy changed during margin lock: %+v", existingBuy)
+	if existingBuy.OrderID != 77 || existingBuy.OrderStatus != OrderStatusCancelRequested {
+		t.Fatalf("buy that left the window was not marked for cancel: %+v", existingBuy)
+	}
+	if executor.cancelCalls == 0 {
+		t.Fatal("grid move during margin lock did not cancel the out-of-window buy")
 	}
 }
 
@@ -357,6 +359,35 @@ func TestDefinitePlacementFailureUsesPerSlotRetryCooldown(t *testing.T) {
 	if slot.OrderID == 0 || slot.SlotStatus != SlotStatusLocked ||
 		!slot.placementRetryNotBefore.IsZero() {
 		t.Fatalf("successful retry retained stale cooldown or was not bound: %+v", slot)
+	}
+}
+
+func TestSellCandidateScanDoesNotClearExpiredCooldownUnderRLock(t *testing.T) {
+	expired := time.Now().Add(-time.Millisecond)
+	slot := &InventorySlot{
+		PositionStatus:          PositionStatusFilled,
+		PositionQty:             0.1,
+		SlotStatus:              SlotStatusFree,
+		placementRetryNotBefore: expired,
+	}
+	slot.mu.RLock()
+	if !sellCandidateEligibleLocked(slot, time.Now()) {
+		slot.mu.RUnlock()
+		t.Fatal("expired cooldown should still be sell-eligible")
+	}
+	slot.mu.RUnlock()
+	if !slot.placementRetryNotBefore.Equal(expired) {
+		t.Fatal("planning scan cleared placementRetryNotBefore under RLock")
+	}
+
+	slot.mu.Lock()
+	if !placementRetryReadyLocked(slot, time.Now()) {
+		slot.mu.Unlock()
+		t.Fatal("write path should accept expired cooldown")
+	}
+	slot.mu.Unlock()
+	if !slot.placementRetryNotBefore.IsZero() {
+		t.Fatal("write path did not clear expired cooldown")
 	}
 }
 
@@ -737,6 +768,58 @@ func TestAdjustOrdersDoesNotReusePlacedLockedSellTick(t *testing.T) {
 		occupied.OrderStatus != OrderStatusPlaced || occupied.SlotStatus != SlotStatusLocked ||
 		occupied.OrderPrice != 103.86 {
 		t.Fatalf("occupied SELL was mutated: %+v", occupied)
+	}
+}
+
+func TestAdjustOrdersRefreshesSellPriceOccupancyAfterCandidateScan(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.BuyWindowSize = 0
+	cfg.Trading.SellWindowSize = 1
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.MinOrderValue = 1
+	executor := &recordingExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3, 0.01)
+	spm.anchorPrice = 100
+
+	remote := prepareFilledSellSlot(spm, 99, 0.1)
+	prepareFilledSellSlot(spm, 100, 0.1)
+	remoteClientOID := spm.generateClientOrderID(remote.Price, "SELL")
+
+	// Deterministically bind a remote SELL after the initial occupancy scan but
+	// while AdjustOrders is still planning. The new candidate at slot 100 must
+	// observe that late update before reserving its own sell price.
+	spm.afterSellCandidateScan = func() {
+		done := make(chan struct{})
+		go func() {
+			spm.OnOrderUpdate(OrderUpdate{
+				OrderID:       92,
+				ClientOrderID: remoteClientOID,
+				Status:        "NEW",
+				Price:         101,
+				Quantity:      0.1,
+			})
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent order update did not complete")
+		}
+	}
+
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	sells := recordedSellOrders(executor.orders)
+	if len(sells) != 1 {
+		t.Fatalf("recorded SELL requests = %d, want 1: %+v", len(sells), sells)
+	}
+	if sells[0].Price != 102 {
+		t.Fatalf("new SELL price = %v, want 102 beyond concurrently occupied 101", sells[0].Price)
+	}
+	if remote.OrderID != 92 || remote.OrderPrice != 101 ||
+		remote.OrderStatus != OrderStatusConfirmed || remote.SlotStatus != SlotStatusLocked {
+		t.Fatalf("concurrent remote SELL was not preserved: %+v", remote)
 	}
 }
 

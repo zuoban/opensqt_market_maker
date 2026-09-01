@@ -2,7 +2,9 @@ package exchange
 
 import (
 	"context"
+
 	"opensqt/exchange/gate"
+	"opensqt/logger"
 	"opensqt/utils"
 )
 
@@ -239,8 +241,32 @@ func (w *gateWrapper) GetBalance(ctx context.Context, asset string) (float64, er
 	return w.adapter.GetBalance(ctx, asset)
 }
 
-func (w *gateWrapper) StartOrderStream(ctx context.Context, callback func(interface{})) error {
-	return w.adapter.StartOrderStream(ctx, callback)
+func (w *gateWrapper) StartOrderStream(ctx context.Context, callback OrderUpdateCallback) error {
+	return w.adapter.StartOrderStream(ctx, func(update interface{}) {
+		ou, ok := gateStreamUpdate(update)
+		if !ok {
+			logger.Warn("⚠️ [Gate] 订单更新类型无法识别: %T", update)
+			return
+		}
+		callback(ou)
+	})
+}
+
+func gateStreamUpdate(update interface{}) (OrderUpdate, bool) {
+	switch u := update.(type) {
+	case gate.OrderUpdate:
+		return NewOrderUpdate(u.OrderID, u.ClientOrderID, u.Symbol, string(u.Side), string(u.Type), string(u.Status),
+			u.Price, u.Quantity, u.ExecutedQty, u.AvgPrice, u.UpdateTime, u.RealizedPNL, u.RealizedPNLIncremental), true
+	case *gate.OrderUpdate:
+		if u == nil {
+			return OrderUpdate{}, false
+		}
+		return gateStreamUpdate(*u)
+	case OrderUpdate:
+		return u, true
+	default:
+		return OrderUpdate{}, false
+	}
 }
 
 func (w *gateWrapper) StopOrderStream() error {

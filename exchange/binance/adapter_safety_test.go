@@ -338,6 +338,105 @@ func TestBatchCancelOrdersReturnsBatchAndFallbackErrors(t *testing.T) {
 	}
 }
 
+func TestBatchCancelOrdersReturnsNilWhenFallbackSucceeds(t *testing.T) {
+	var fallbackCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fapi/v1/batchOrders":
+			writeJSON(t, w, http.StatusInternalServerError, map[string]any{"code": -1000, "msg": "batch failed"})
+		case "/fapi/v1/order":
+			fallbackCalls.Add(1)
+			canceled := orderFixture(1, "cancelled")
+			canceled["status"] = "CANCELED"
+			writeJSON(t, w, http.StatusOK, canceled)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	adapter := testAdapter(t, server.URL, "USDT")
+	if err := adapter.BatchCancelOrders(context.Background(), "TESTUSDT", []int64{1, 2}); err != nil {
+		t.Fatalf("BatchCancelOrders() error = %v, want nil after successful fallback", err)
+	}
+	if got := fallbackCalls.Load(); got != 2 {
+		t.Fatalf("fallback calls = %d, want 2", got)
+	}
+}
+
+func TestBatchCancelOrdersFallsBackForMixedItemResults(t *testing.T) {
+	tests := []struct {
+		name           string
+		fallbackStatus int
+		fallbackCode   int
+		fallbackMsg    string
+		wantErr        bool
+	}{
+		{
+			name:           "failed item is already absent",
+			fallbackStatus: http.StatusBadRequest,
+			fallbackCode:   -2011,
+			fallbackMsg:    "Unknown order sent.",
+		},
+		{
+			name:           "failed item cannot be canceled individually",
+			fallbackStatus: http.StatusInternalServerError,
+			fallbackCode:   -1000,
+			fallbackMsg:    "single cancel failed",
+			wantErr:        true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var fallbackCalls atomic.Int32
+			var fallbackOrderID atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/fapi/v1/batchOrders":
+					canceled := orderFixture(1, "cancelled-1")
+					canceled["status"] = "CANCELED"
+					writeJSON(t, w, http.StatusOK, []any{
+						canceled,
+						map[string]any{"code": -2010, "msg": "cancel rejected"},
+					})
+				case "/fapi/v1/order":
+					fallbackCalls.Add(1)
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Errorf("read fallback request: %v", err)
+					}
+					form, err := url.ParseQuery(string(body))
+					if err != nil {
+						t.Errorf("parse fallback request: %v", err)
+					}
+					orderID, err := strconv.ParseInt(form.Get("orderId"), 10, 64)
+					if err != nil {
+						t.Errorf("parse fallback order ID: %v", err)
+					}
+					fallbackOrderID.Store(orderID)
+					writeJSON(t, w, tt.fallbackStatus, map[string]any{"code": tt.fallbackCode, "msg": tt.fallbackMsg})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			adapter := testAdapter(t, server.URL, "USDT")
+			err := adapter.BatchCancelOrders(context.Background(), "TESTUSDT", []int64{1, 2})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("BatchCancelOrders() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got := fallbackCalls.Load(); got != 1 {
+				t.Fatalf("fallback calls = %d, want 1", got)
+			}
+			if got := fallbackOrderID.Load(); got != 2 {
+				t.Fatalf("fallback order ID = %d, want 2", got)
+			}
+		})
+	}
+}
+
 func TestBatchCancelOrdersRetryDelayRespectsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

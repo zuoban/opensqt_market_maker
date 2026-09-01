@@ -416,6 +416,8 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 		return nil
 	}
 
+	var cancelErrs []error
+
 	// Gate.io 批量撤单API一次最多20个
 	for i := 0; i < len(orderIDs); i += 20 {
 		end := i + 20
@@ -424,6 +426,14 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 		}
 
 		batch := orderIDs[i:end]
+		if len(batch) == 1 {
+			if err := g.CancelOrder(ctx, symbol, batch[0]); err != nil {
+				logger.Warn("⚠️ [Gate] 取消订单失败 %d: %v", batch[0], err)
+				cancelErrs = append(cancelErrs, fmt.Errorf("取消 Gate 订单 %d 失败: %w", batch[0], err))
+			}
+			continue
+		}
+
 		orderIDStrs := make([]string, len(batch))
 		for j, id := range batch {
 			orderIDStrs[j] = strconv.FormatInt(id, 10)
@@ -432,6 +442,26 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 		results, err := g.client.BatchCancelOrders(ctx, g.settle, orderIDStrs)
 		if err != nil {
 			logger.Warn("⚠️ [Gate] 批量撤单请求失败: %v", err)
+			batchErr := fmt.Errorf("Gate 批量撤单失败（%d 个）: %w", len(batch), err)
+			if ctx.Err() != nil {
+				cancelErrs = append(cancelErrs, batchErr)
+				return errors.Join(cancelErrs...)
+			}
+
+			logger.Info("🔄 [Gate] 改为逐个撤单...")
+			var fallbackErrs []error
+			for index, orderID := range batch {
+				if fallbackErr := g.CancelOrder(ctx, symbol, orderID); fallbackErr != nil {
+					fallbackErrs = append(fallbackErrs, fmt.Errorf("Gate 批量撤单回退取消订单 %d 失败: %w", orderID, fallbackErr))
+				}
+				if index < len(batch)-1 {
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+			if len(fallbackErrs) > 0 {
+				cancelErrs = append(cancelErrs, batchErr)
+				cancelErrs = append(cancelErrs, fallbackErrs...)
+			}
 			continue
 		}
 
@@ -439,22 +469,55 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 		successCount := 0
 		notFoundCount := 0
 		failCount := 0
+		requested := make(map[string]struct{}, len(orderIDStrs))
+		for _, orderID := range orderIDStrs {
+			requested[orderID] = struct{}{}
+		}
+		covered := make(map[string]struct{}, len(orderIDStrs))
 
 		for _, result := range results {
-			orderID, _ := result["id"].(string)
+			orderID := gateBatchCancelResultOrderID(result)
+			if orderID == "" {
+				failCount++
+				cancelErrs = append(cancelErrs, fmt.Errorf("Gate 批量撤单返回缺少订单 ID"))
+				continue
+			}
+			if _, ok := requested[orderID]; !ok {
+				failCount++
+				cancelErrs = append(cancelErrs, fmt.Errorf("Gate 批量撤单返回未请求的订单 %s", orderID))
+				continue
+			}
+			if _, duplicate := covered[orderID]; duplicate {
+				failCount++
+				cancelErrs = append(cancelErrs, fmt.Errorf("Gate 批量撤单重复返回订单 %s", orderID))
+				continue
+			}
+			covered[orderID] = struct{}{}
+
 			succeeded, _ := result["succeeded"].(bool)
-			message, _ := result["message"].(string)
+			message := gateBatchCancelResultMessage(result)
 
 			if succeeded {
 				successCount++
 				logger.Info("✅ [Gate] 取消订单成功: %s", orderID)
-			} else if strings.Contains(message, "not found") || strings.Contains(message, "ORDER_NOT_FOUND") {
+			} else if gateCancelResultIsNotFound(message) {
 				notFoundCount++
 				logger.Debug("ℹ️ [Gate] 订单 %s 已不存在(可能已成交/已撤销)", orderID)
 			} else {
 				failCount++
 				logger.Warn("⚠️ [Gate] 取消订单失败 %s: %s", orderID, message)
+				if message == "" {
+					message = "响应未标记成功"
+				}
+				cancelErrs = append(cancelErrs, fmt.Errorf("Gate 取消订单 %s 失败: %s", orderID, message))
 			}
+		}
+		for _, orderID := range orderIDStrs {
+			if _, ok := covered[orderID]; ok {
+				continue
+			}
+			failCount++
+			cancelErrs = append(cancelErrs, fmt.Errorf("Gate 批量撤单响应缺少订单 %s 的结果", orderID))
 		}
 
 		// 批次汇总
@@ -468,7 +531,23 @@ func (g *GateAdapter) BatchCancelOrders(ctx context.Context, symbol string, orde
 		}
 	}
 
-	return nil
+	return errors.Join(cancelErrs...)
+}
+
+func gateBatchCancelResultOrderID(result map[string]interface{}) string {
+	orderID, _ := result["id"].(string)
+	return strings.TrimSpace(orderID)
+}
+
+func gateBatchCancelResultMessage(result map[string]interface{}) string {
+	label, _ := result["label"].(string)
+	message, _ := result["message"].(string)
+	return strings.TrimSpace(strings.TrimSpace(label) + " " + strings.TrimSpace(message))
+}
+
+func gateCancelResultIsNotFound(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "not found") || strings.Contains(message, "order_not_found")
 }
 
 // GetOrder 查询订单

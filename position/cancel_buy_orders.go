@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"opensqt/exchange"
 	"opensqt/logger"
 )
 
@@ -105,15 +106,7 @@ func (spm *SuperPositionManager) cancelAllBuyOrders(ctx context.Context) error {
 
 func (spm *SuperPositionManager) markBuyOrdersCancelRequested() []buyCancelTarget {
 	targets := make([]buyCancelTarget, 0)
-	spm.slots.Range(func(key, value interface{}) bool {
-		price, ok := key.(float64)
-		if !ok {
-			return true
-		}
-		slot, ok := value.(*InventorySlot)
-		if !ok || slot == nil {
-			return true
-		}
+	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.Lock()
 		knownOrder := slot.OrderSide == "BUY" && slot.OrderID > 0
 		unknownReservation := slot.OrderSide == "BUY" && slot.OrderID == 0 &&
@@ -281,6 +274,9 @@ func (spm *SuperPositionManager) buyCancelTargetConverged(target buyCancelTarget
 }
 
 func (spm *SuperPositionManager) extractCanceledBuyUpdate(raw interface{}, target buyCancelTarget) (OrderUpdate, float64, error) {
+	if order, ok := asExchangeOrder(raw); ok {
+		return exchangeOrderToUpdate(order), order.Quantity, nil
+	}
 	v := dereferenceCancelOrder(reflect.ValueOf(raw))
 	if !v.IsValid() || v.Kind() != reflect.Struct {
 		return OrderUpdate{}, 0, fmt.Errorf("订单响应类型无效: %T", raw)
@@ -331,11 +327,94 @@ func (spm *SuperPositionManager) extractCanceledBuyUpdate(raw interface{}, targe
 	}, quantity, nil
 }
 
+func asExchangeOrder(raw interface{}) (*exchange.Order, bool) {
+	switch order := raw.(type) {
+	case *exchange.Order:
+		return order, order != nil
+	case exchange.Order:
+		copied := order
+		return &copied, true
+	default:
+		return nil, false
+	}
+}
+
+func exchangeOrderToUpdate(order *exchange.Order) OrderUpdate {
+	return OrderUpdate{
+		OrderID:       order.OrderID,
+		ClientOrderID: order.ClientOrderID,
+		Symbol:        order.Symbol,
+		Status:        strings.ToUpper(string(order.Status)),
+		Quantity:      order.Quantity,
+		ExecutedQty:   order.ExecutedQty,
+		Price:         order.Price,
+		AvgPrice:      order.AvgPrice,
+		Side:          strings.ToUpper(string(order.Side)),
+		Type:          string(order.Type),
+		UpdateTime:    order.UpdateTime,
+	}
+}
+
+func typedOpenOrders(raw interface{}) ([]*exchange.Order, bool) {
+	switch orders := raw.(type) {
+	case []*exchange.Order:
+		return orders, true
+	case []exchange.Order:
+		out := make([]*exchange.Order, len(orders))
+		for i := range orders {
+			item := orders[i]
+			out[i] = &item
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func (spm *SuperPositionManager) collectOpenBuyEvidence(
+	orders []*exchange.Order,
+	pending map[string]buyCancelTarget,
+) (map[string]openBuyEvidence, error) {
+	result := make(map[string]openBuyEvidence)
+	for i, order := range orders {
+		if order == nil {
+			return nil, fmt.Errorf("第 %d 个挂单为空", i)
+		}
+		matchedKey := ""
+		for key, target := range pending {
+			matchesID := target.orderID > 0 && target.orderID == order.OrderID
+			matchesClientID := target.orderID == 0 &&
+				spm.canceledBuyClientIDMatches(target.clientOrderID, order.ClientOrderID)
+			if !matchesID && !matchesClientID {
+				continue
+			}
+			if matchedKey != "" {
+				return nil, fmt.Errorf("远端订单 %d 同时匹配多个本地买单 reservation", order.OrderID)
+			}
+			matchedKey = key
+		}
+		if matchedKey == "" {
+			continue
+		}
+		if _, duplicate := result[matchedKey]; duplicate {
+			return nil, fmt.Errorf("本地 reservation %s 匹配多个远端订单", matchedKey)
+		}
+		result[matchedKey] = openBuyEvidence{
+			update:   exchangeOrderToUpdate(order),
+			quantity: order.Quantity,
+		}
+	}
+	return result, nil
+}
+
 func (spm *SuperPositionManager) extractOpenBuyEvidence(
 	raw interface{},
 	pending map[string]buyCancelTarget,
 ) (map[string]openBuyEvidence, error) {
 	result := make(map[string]openBuyEvidence)
+	if orders, ok := typedOpenOrders(raw); ok {
+		return spm.collectOpenBuyEvidence(orders, pending)
+	}
 	v := dereferenceCancelOrder(reflect.ValueOf(raw))
 	if !v.IsValid() {
 		return result, nil

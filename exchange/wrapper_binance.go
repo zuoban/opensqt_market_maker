@@ -2,7 +2,9 @@ package exchange
 
 import (
 	"context"
+
 	"opensqt/exchange/binance"
+	"opensqt/logger"
 )
 
 // binanceWrapper 包装 Binance 适配器以实现 IExchange 接口
@@ -88,6 +90,55 @@ func (w *binanceWrapper) BatchPlaceOrders(ctx context.Context, orders []*OrderRe
 
 	return result, hasMarginError
 }
+
+func (w *binanceWrapper) PlaceOrderBatchSize() int {
+	return BinanceUSDMPPlaceOrderBatchSize
+}
+
+func (w *binanceWrapper) PlaceOrderBatch(ctx context.Context, orders []*OrderRequest) ([]PlaceOrderBatchItem, error) {
+	native := make([]*binance.OrderRequest, len(orders))
+	for i, req := range orders {
+		if req == nil {
+			continue
+		}
+		native[i] = &binance.OrderRequest{
+			Symbol:        req.Symbol,
+			Side:          binance.Side(req.Side),
+			Type:          binance.OrderType(req.Type),
+			TimeInForce:   binance.TimeInForce(req.TimeInForce),
+			Quantity:      req.Quantity,
+			Price:         req.Price,
+			ReduceOnly:    req.ReduceOnly,
+			PostOnly:      req.PostOnly,
+			PriceDecimals: req.PriceDecimals,
+			ClientOrderID: req.ClientOrderID,
+		}
+	}
+	items, err := w.adapter.PlaceOrderBatch(ctx, native)
+	result := make([]PlaceOrderBatchItem, len(items))
+	for i, item := range items {
+		result[i].Err = item.Err
+		if item.Order != nil {
+			result[i].Order = &Order{
+				OrderID:       item.Order.OrderID,
+				ClientOrderID: item.Order.ClientOrderID,
+				Symbol:        item.Order.Symbol,
+				Side:          Side(item.Order.Side),
+				Type:          OrderType(item.Order.Type),
+				Price:         item.Order.Price,
+				Quantity:      item.Order.Quantity,
+				ExecutedQty:   item.Order.ExecutedQty,
+				AvgPrice:      item.Order.AvgPrice,
+				Status:        OrderStatus(item.Order.Status),
+				CreatedAt:     item.Order.CreatedAt,
+				UpdateTime:    item.Order.UpdateTime,
+			}
+		}
+	}
+	return result, err
+}
+
+var _ PlaceOrderBatcher = (*binanceWrapper)(nil)
 
 func (w *binanceWrapper) CancelOrder(ctx context.Context, symbol string, orderID int64) error {
 	return w.adapter.CancelOrder(ctx, symbol, orderID)
@@ -206,8 +257,32 @@ func (w *binanceWrapper) GetBalance(ctx context.Context, asset string) (float64,
 	return w.adapter.GetBalance(ctx, asset)
 }
 
-func (w *binanceWrapper) StartOrderStream(ctx context.Context, callback func(interface{})) error {
-	return w.adapter.StartOrderStream(ctx, callback)
+func (w *binanceWrapper) StartOrderStream(ctx context.Context, callback OrderUpdateCallback) error {
+	return w.adapter.StartOrderStream(ctx, func(update interface{}) {
+		ou, ok := binanceStreamUpdate(update)
+		if !ok {
+			logger.Warn("⚠️ [Binance] 订单更新类型无法识别: %T", update)
+			return
+		}
+		callback(ou)
+	})
+}
+
+func binanceStreamUpdate(update interface{}) (OrderUpdate, bool) {
+	switch u := update.(type) {
+	case binance.OrderUpdate:
+		return NewOrderUpdate(u.OrderID, u.ClientOrderID, u.Symbol, string(u.Side), string(u.Type), string(u.Status),
+			u.Price, u.Quantity, u.ExecutedQty, u.AvgPrice, u.UpdateTime, u.RealizedPNL, u.RealizedPNLIncremental), true
+	case *binance.OrderUpdate:
+		if u == nil {
+			return OrderUpdate{}, false
+		}
+		return binanceStreamUpdate(*u)
+	case OrderUpdate:
+		return u, true
+	default:
+		return OrderUpdate{}, false
+	}
 }
 
 func (w *binanceWrapper) StopOrderStream() error {

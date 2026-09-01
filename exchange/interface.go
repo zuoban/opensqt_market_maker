@@ -45,10 +45,9 @@ type IExchange interface {
 
 	// === WebSocket ===
 
-	// StartOrderStream 启动订单流（WebSocket）
-	// 使用 func(interface{}) 避免子包的循环导入问题
-	// 实际传递的是 OrderUpdate 类型
-	StartOrderStream(ctx context.Context, callback func(interface{})) error
+	// StartOrderStream 启动订单流（WebSocket）。
+	// 回调必须收到统一的 OrderUpdate，禁止再传匿名结构体。
+	StartOrderStream(ctx context.Context, callback OrderUpdateCallback) error
 
 	// StopOrderStream 停止订单流
 	StopOrderStream() error

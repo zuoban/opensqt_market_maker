@@ -12,6 +12,7 @@ const (
 	positionModeEndpoint                = "/fapi/v1/positionSide/dual"
 	exchangeInfoEndpoint                = "/fapi/v1/exchangeInfo"
 	createOrderEndpoint                 = "/fapi/v1/order"
+	batchCreateOrderEndpoint            = "/fapi/v1/batchOrders"
 	maxCapturedResponseBody             = 64 << 10
 	defaultSDKResponseBodyLimit   int64 = 1 << 20
 	exchangeInfoResponseBodyLimit int64 = 8 << 20
@@ -63,7 +64,8 @@ func (t *statusAwareTransport) RoundTrip(req *http.Request) (*http.Response, err
 			return nil, err
 		}
 	}
-	isCreateOrderAmbiguousStatus := req.Method == http.MethodPost && req.URL.Path == createOrderEndpoint &&
+	isCreateOrderAmbiguousStatus := req.Method == http.MethodPost &&
+		(req.URL.Path == createOrderEndpoint || req.URL.Path == batchCreateOrderEndpoint) &&
 		(resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusConflict ||
 			(resp.StatusCode >= http.StatusInternalServerError && resp.StatusCode <= 599))
 	// 保留原有的全端点 503 处理，并确保创建订单接口的歧义状态不会

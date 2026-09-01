@@ -137,6 +137,15 @@ type adjustmentNotifierPosition interface {
 	SetAdjustmentNotifier(func(delay time.Duration))
 }
 
+type unchangedGridPosition interface {
+	ShouldSkipUnchangedGrid(currentPrice float64) bool
+}
+
+func shouldSkipUnchangedGridPriceTick(position tradingPositionManager, price float64) bool {
+	skipper, ok := position.(unchangedGridPosition)
+	return ok && skipper.ShouldSkipUnchangedGrid(price)
+}
+
 type marginGateMonitor interface {
 	IsReady() bool
 	IsTriggered() bool
@@ -793,6 +802,9 @@ func (r *tradingGateRuntime) evaluate(ctx context.Context, priceChanged bool) er
 	}
 
 	adjustRequested := r.takeReadyAdjustRequest(time.Now())
+	if !adjustRequested && priceChanged && shouldSkipUnchangedGridPriceTick(r.position, r.price.GetLastPrice()) {
+		return nil
+	}
 	if priceChanged || adjustRequested {
 		if err := r.position.AdjustOrders(r.price.GetLastPrice()); err != nil {
 			if order.IsDefiniteOrderRejection(err) {

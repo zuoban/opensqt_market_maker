@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"opensqt/exchange/bitget"
+	"opensqt/logger"
 )
 
 // bitgetCancellationBackend 只暴露按交易对查询与撤单能力，避免 wrapper
@@ -102,6 +103,55 @@ func (w *bitgetWrapper) BatchPlaceOrders(ctx context.Context, orders []*OrderReq
 
 	return result, hasMarginError
 }
+
+func (w *bitgetWrapper) PlaceOrderBatchSize() int {
+	return BitgetPlaceOrderBatchSize
+}
+
+func (w *bitgetWrapper) PlaceOrderBatch(ctx context.Context, orders []*OrderRequest) ([]PlaceOrderBatchItem, error) {
+	native := make([]*bitget.OrderRequest, len(orders))
+	for i, req := range orders {
+		if req == nil {
+			continue
+		}
+		native[i] = &bitget.OrderRequest{
+			Symbol:        req.Symbol,
+			Side:          bitget.Side(req.Side),
+			Type:          bitget.OrderType(req.Type),
+			TimeInForce:   bitget.TimeInForce(req.TimeInForce),
+			Quantity:      req.Quantity,
+			Price:         req.Price,
+			ReduceOnly:    req.ReduceOnly,
+			PostOnly:      req.PostOnly,
+			PriceDecimals: req.PriceDecimals,
+			ClientOrderID: req.ClientOrderID,
+		}
+	}
+	items, err := w.adapter.PlaceOrderBatch(ctx, native)
+	result := make([]PlaceOrderBatchItem, len(items))
+	for i, item := range items {
+		result[i].Err = item.Err
+		if item.Order != nil {
+			result[i].Order = &Order{
+				OrderID:       item.Order.OrderID,
+				ClientOrderID: item.Order.ClientOrderID,
+				Symbol:        item.Order.Symbol,
+				Side:          Side(item.Order.Side),
+				Type:          OrderType(item.Order.Type),
+				Price:         item.Order.Price,
+				Quantity:      item.Order.Quantity,
+				ExecutedQty:   item.Order.ExecutedQty,
+				AvgPrice:      item.Order.AvgPrice,
+				Status:        OrderStatus(item.Order.Status),
+				CreatedAt:     item.Order.CreatedAt,
+				UpdateTime:    item.Order.UpdateTime,
+			}
+		}
+	}
+	return result, err
+}
+
+var _ PlaceOrderBatcher = (*bitgetWrapper)(nil)
 
 func (w *bitgetWrapper) CancelOrder(ctx context.Context, symbol string, orderID int64) error {
 	return w.adapter.CancelOrder(ctx, symbol, orderID)
@@ -251,8 +301,32 @@ func (w *bitgetWrapper) GetBalance(ctx context.Context, asset string) (float64, 
 	return w.adapter.GetBalance(ctx, asset)
 }
 
-func (w *bitgetWrapper) StartOrderStream(ctx context.Context, callback func(interface{})) error {
-	return w.adapter.StartOrderStream(ctx, callback)
+func (w *bitgetWrapper) StartOrderStream(ctx context.Context, callback OrderUpdateCallback) error {
+	return w.adapter.StartOrderStream(ctx, func(update interface{}) {
+		ou, ok := bitgetStreamUpdate(update)
+		if !ok {
+			logger.Warn("⚠️ [Bitget] 订单更新类型无法识别: %T", update)
+			return
+		}
+		callback(ou)
+	})
+}
+
+func bitgetStreamUpdate(update interface{}) (OrderUpdate, bool) {
+	switch u := update.(type) {
+	case bitget.OrderUpdate:
+		return NewOrderUpdate(u.OrderID, u.ClientOrderID, u.Symbol, string(u.Side), string(u.Type), string(u.Status),
+			u.Price, u.Quantity, u.ExecutedQty, u.AvgPrice, u.UpdateTime, u.RealizedPNL, u.RealizedPNLIncremental), true
+	case *bitget.OrderUpdate:
+		if u == nil {
+			return OrderUpdate{}, false
+		}
+		return bitgetStreamUpdate(*u)
+	case OrderUpdate:
+		return u, true
+	default:
+		return OrderUpdate{}, false
+	}
 }
 
 func (w *bitgetWrapper) StopOrderStream() error {

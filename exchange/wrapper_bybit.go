@@ -2,7 +2,9 @@ package exchange
 
 import (
 	"context"
+
 	"opensqt/exchange/bybit"
+	"opensqt/logger"
 )
 
 type bybitWrapper struct {
@@ -204,8 +206,32 @@ func (w *bybitWrapper) GetBalance(ctx context.Context, asset string) (float64, e
 	return w.adapter.GetBalance(ctx, asset)
 }
 
-func (w *bybitWrapper) StartOrderStream(ctx context.Context, callback func(interface{})) error {
-	return w.adapter.StartOrderStream(ctx, callback)
+func (w *bybitWrapper) StartOrderStream(ctx context.Context, callback OrderUpdateCallback) error {
+	return w.adapter.StartOrderStream(ctx, func(update interface{}) {
+		ou, ok := bybitStreamUpdate(update)
+		if !ok {
+			logger.Warn("⚠️ [Bybit] 订单更新类型无法识别: %T", update)
+			return
+		}
+		callback(ou)
+	})
+}
+
+func bybitStreamUpdate(update interface{}) (OrderUpdate, bool) {
+	switch u := update.(type) {
+	case bybit.OrderUpdate:
+		return NewOrderUpdate(u.OrderID, u.ClientOrderID, u.Symbol, string(u.Side), string(u.Type), string(u.Status),
+			u.Price, u.Quantity, u.ExecutedQty, u.AvgPrice, u.UpdateTime, u.RealizedPNL, u.RealizedPNLIncremental), true
+	case *bybit.OrderUpdate:
+		if u == nil {
+			return OrderUpdate{}, false
+		}
+		return bybitStreamUpdate(*u)
+	case OrderUpdate:
+		return u, true
+	default:
+		return OrderUpdate{}, false
+	}
 }
 
 func (w *bybitWrapper) StopOrderStream() error {

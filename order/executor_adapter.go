@@ -309,6 +309,83 @@ func acquireSubmissionLease(req *OrderRequest) (func(), bool) {
 	return release, true
 }
 
+func nativeExchangeRequest(req *OrderRequest) *exchange.OrderRequest {
+	return &exchange.OrderRequest{
+		Symbol:        req.Symbol,
+		Side:          exchange.Side(req.Side),
+		Type:          exchange.OrderTypeLimit,
+		TimeInForce:   exchange.TimeInForceGTC,
+		Quantity:      req.Quantity,
+		Price:         req.Price,
+		PriceDecimals: req.PriceDecimals,
+		ReduceOnly:    req.ReduceOnly,
+		PostOnly:      true,
+		ClientOrderID: req.ClientOrderID,
+	}
+}
+
+func copyExchangeOrder(req *OrderRequest, exchangeOrder *exchange.Order) *Order {
+	order := &Order{
+		OrderID:       exchangeOrder.OrderID,
+		ClientOrderID: exchangeOrder.ClientOrderID,
+		Symbol:        exchangeOrder.Symbol,
+		Side:          string(exchangeOrder.Side),
+		Type:          string(exchangeOrder.Type),
+		Price:         exchangeOrder.Price,
+		Quantity:      exchangeOrder.Quantity,
+		ExecutedQty:   exchangeOrder.ExecutedQty,
+		AvgPrice:      exchangeOrder.AvgPrice,
+		Status:        string(exchangeOrder.Status),
+		CreatedAt:     exchangeOrder.CreatedAt,
+		UpdateTime:    exchangeOrder.UpdateTime,
+	}
+	if order.Symbol == "" && req != nil {
+		order.Symbol = req.Symbol
+	}
+	if order.Side == "" && req != nil {
+		order.Side = req.Side
+	}
+	if order.CreatedAt.IsZero() {
+		order.CreatedAt = time.Now()
+	}
+	return order
+}
+
+func (oe *ExchangeOrderExecutor) interpretSubmittedResult(req *OrderRequest, exchangeOrder *exchange.Order, err error) (*Order, error) {
+	if err == nil {
+		if exchangeOrder == nil {
+			return nil, unknownSubmissionError(req, "下单返回空订单", fmt.Errorf("empty order"))
+		}
+		return copyExchangeOrder(req, exchangeOrder), nil
+	}
+	// 先尊重适配器给出的提交语义：UNKNOWN 始终最高优先；明确 REJECTED
+	// 即使保留了 context 取消/超时作为底层原因，也表示请求尚未发送。
+	if errors.Is(err, exchange.ErrOrderPlacementUnknown) {
+		return nil, unknownSubmissionError(req, "下单结果无法确认，禁止自动重试", err)
+	}
+	if !exchange.IsOrderPlacementRejected(err) &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return nil, unknownSubmissionError(req, "下单请求已取消或超时",
+			errors.Join(err, oe.placementContextError("交易门禁状态", err)))
+	}
+	rejectionKind, definitelyRejected := classifyDefiniteOrderRejection(err)
+	if rejectionKind == OrderRejectionRateLimit {
+		return nil, NewOrderRejectedError(rejectionKind, err)
+	}
+	if definitelyRejected {
+		rejectedErr := NewOrderRejectedError(rejectionKind, err)
+		if rejectionKind == OrderRejectionPostOnly {
+			logger.Warn("⚠️ [%s] PostOnly被拒: %s %.2f，严格Maker模式不降级且不做同价重试",
+				oe.exchange.GetName(), req.Side, req.Price)
+		}
+		if rejectionKind == OrderRejectionPositionMode {
+			return nil, fmt.Errorf("持仓模式不匹配: %w", rejectedErr)
+		}
+		return nil, rejectedErr
+	}
+	return nil, unknownSubmissionError(req, "下单返回未分类错误，禁止自动重试", err)
+}
+
 // PlaceOrder 下单（严格 PostOnly，仅对明确限流做有界重试）
 func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 	placeCtx, err := oe.newOrderContext()
@@ -383,157 +460,284 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			return oe.exchange.PlaceOrder(requestCtx, exchangeReq)
 		}()
 		cancel()
-		if err == nil {
-			// 转换回 Order 格式
-			order := &Order{
-				OrderID:       exchangeOrder.OrderID,
-				ClientOrderID: exchangeOrder.ClientOrderID,
-				Symbol:        exchangeOrder.Symbol,
-				Side:          string(exchangeOrder.Side),
-				Type:          string(exchangeOrder.Type),
-				Price:         exchangeOrder.Price,
-				Quantity:      exchangeOrder.Quantity,
-				ExecutedQty:   exchangeOrder.ExecutedQty,
-				AvgPrice:      exchangeOrder.AvgPrice,
-				Status:        string(exchangeOrder.Status),
-				CreatedAt:     exchangeOrder.CreatedAt,
-				UpdateTime:    exchangeOrder.UpdateTime,
-			}
-			if order.Symbol == "" {
-				order.Symbol = req.Symbol
-			}
-			if order.Side == "" {
-				order.Side = req.Side
-			}
-			if order.CreatedAt.IsZero() {
-				order.CreatedAt = time.Now()
-			}
-
-			logger.Info("✅ [%s] 下单成功(PostOnly): %s %.*f 数量: %.4f 订单ID: %d",
-				oe.exchange.GetName(), order.Side, req.PriceDecimals, order.Price, order.Quantity, exchangeOrder.OrderID)
+		order, submittedErr := oe.interpretSubmittedResult(req, exchangeOrder, err)
+		if submittedErr == nil {
+			logger.Debug("✅ [%s] 下单成功(PostOnly): %s %.*f 数量: %.4f 订单ID: %d",
+				oe.exchange.GetName(), order.Side, req.PriceDecimals, order.Price, order.Quantity, order.OrderID)
 			return order, nil
 		}
 
-		lastErr = err
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			// 已进入交易所调用边界后才收到取消/超时，无法证明请求没有被接受。
-			return nil, unknownSubmissionError(req, "下单请求已取消或超时",
-				errors.Join(err, oe.placementContextError("交易门禁状态", err)))
-		}
-		if errors.Is(err, exchange.ErrOrderPlacementUnknown) {
-			// 交易所可能已经接受订单。此时绝不能由执行器再次提交，否则会重复下单。
-			return nil, unknownSubmissionError(req, "下单结果无法确认，禁止自动重试", err)
-		}
-
-		// 明确业务拒绝可以安全地告诉上层“远端没有生成订单”。限流保留
-		// 既有退避重试；PostOnly 同价重试没有意义，首次拒绝即返回。
-		rejectionKind, definitelyRejected := classifyDefiniteOrderRejection(err)
-		if rejectionKind == OrderRejectionRateLimit {
-			lastErr = NewOrderRejectedError(rejectionKind, err)
-			// 速率限制，等待后重试
+		lastErr = submittedErr
+		var rejected *OrderRejectedError
+		if errors.As(submittedErr, &rejected) && rejected.Kind == OrderRejectionRateLimit {
 			logger.Warn("⚠️ 触发速率限制，等待后重试...")
 			if i < maxRateLimitRetries {
-				if err := waitWithContext(placeCtx, oe.rateLimitRetryDelay); err != nil {
-					return nil, oe.placementContextError("速率限制退避被取消", err)
+				if waitErr := waitWithContext(placeCtx, oe.rateLimitRetryDelay); waitErr != nil {
+					return nil, oe.placementContextError("速率限制退避被取消", waitErr)
 				}
 			}
 			continue
 		}
-		if definitelyRejected {
-			rejectedErr := NewOrderRejectedError(rejectionKind, err)
-			switch rejectionKind {
-			case OrderRejectionPostOnly:
-				logger.Warn("⚠️ [%s] PostOnly被拒: %s %.2f，严格Maker模式不降级且不做同价重试",
-					oe.exchange.GetName(), req.Side, req.Price)
-			case OrderRejectionPositionMode:
-				return nil, fmt.Errorf("持仓模式不匹配: %w", rejectedErr)
-			}
-			return nil, rejectedErr
-		}
-
-		// PlaceOrder 已经越过真实交易所边界。适配器若没有明确证明请求被拒绝，
-		// 执行器就不能假设远端没有生成订单，更不能换下一次尝试盲目重提。
-		return nil, unknownSubmissionError(req, "下单返回未分类错误，禁止自动重试", err)
+		return nil, submittedErr
 	}
 
 	return nil, fmt.Errorf("下单失败（限流重试%d次）: %w", maxRateLimitRetries, lastErr)
+}
+
+type batchPlaceState struct {
+	placed            []*Order
+	hasMarginError    bool
+	skipRemainingBuys bool
+	errs              []error
+}
+
+func (s *batchPlaceState) shouldSkipBuy(exchangeName string, req *OrderRequest) bool {
+	if s.skipRemainingBuys && strings.EqualFold(req.Side, "BUY") {
+		logger.Warn("⏭️ [%s] 本批已出现保证金不足，跳过后续买单 %.2f", exchangeName, req.Price)
+		return true
+	}
+	return false
+}
+
+func (s *batchPlaceState) note(exchangeName string, req *OrderRequest, order *Order, err error) bool {
+	if err == nil {
+		if order != nil {
+			s.placed = append(s.placed, order)
+		}
+		return false
+	}
+	if errors.Is(err, ErrOrderSubmissionStale) {
+		logger.Debug("⏭️ [%s] 跳过已失效 reservation: %.2f %s (ClientOID=%s)",
+			exchangeName, req.Price, req.Side, req.ClientOrderID)
+		return false
+	}
+	logger.Warn("⚠️ [%s] 下单失败 %.2f %s: %v", exchangeName, req.Price, req.Side, err)
+
+	mustStopBatch := errors.Is(err, exchange.ErrOrderPlacementUnknown) ||
+		errors.Is(err, ErrTradingHealthGuardRejected) ||
+		errors.Is(err, ErrNewOrdersStopped) || errors.Is(err, ErrOrderExecutorStopped) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	marginFailure := isMarginError(err)
+	var marginRejection *OrderRejectedError
+	definiteMarginFailure := IsDefiniteOrderRejection(err) &&
+		errors.As(err, &marginRejection) && marginRejection.Kind == OrderRejectionMargin
+	if definiteMarginFailure && req.ReduceOnly && strings.EqualFold(req.Side, "SELL") {
+		err = errors.Join(ErrReduceOnlySellMarginRejected, err)
+		mustStopBatch = true
+	}
+	if marginFailure {
+		s.hasMarginError = true
+		logger.Error("❌ [保证金不足] 订单 %.2f %s 因保证金不足失败", req.Price, req.Side)
+		if !mustStopBatch {
+			s.skipRemainingBuys = true
+		}
+	}
+	if !marginFailure || mustStopBatch {
+		s.errs = append(s.errs, fmt.Errorf("订单 %.12g %s 提交失败: %w", req.Price, req.Side, err))
+	}
+	if mustStopBatch {
+		return true
+	}
+	var rejected *OrderRejectedError
+	if IsDefiniteOrderRejection(err) && errors.As(err, &rejected) &&
+		rejected.Kind == OrderRejectionRateLimit {
+		logger.Warn("⚠️ [%s] 限流重试已耗尽，停止提交本批剩余订单", exchangeName)
+		return true
+	}
+	return false
+}
+
+func (oe *ExchangeOrderExecutor) nativeBatcher() (exchange.PlaceOrderBatcher, bool) {
+	batcher, ok := oe.exchange.(exchange.PlaceOrderBatcher)
+	return batcher, ok && batcher.PlaceOrderBatchSize() > 0
 }
 
 // BatchPlaceOrders 批量下单
 // 返回：成功下单的订单列表、是否出现保证金不足错误，以及其它下单错误。
 // 结果未知等错误必须向上传递，调用方才能关闭门禁并先对账，不能释放槽位后换新 ID 重下。
 func (oe *ExchangeOrderExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool, error) {
-	placedOrders := make([]*Order, 0, len(orders))
-	hasMarginError := false
-	skipRemainingBuys := false
-	var placementErrors []error
+	state := &batchPlaceState{placed: make([]*Order, 0, len(orders))}
+	exchangeName := oe.exchange.GetName()
+	if batcher, ok := oe.nativeBatcher(); ok {
+		size := batcher.PlaceOrderBatchSize()
+		for i := 0; i < len(orders); {
+			chunk := make([]*OrderRequest, 0, size)
+			for i < len(orders) && len(chunk) < size {
+				req := orders[i]
+				i++
+				if state.shouldSkipBuy(exchangeName, req) {
+					continue
+				}
+				chunk = append(chunk, req)
+			}
+			if len(chunk) == 0 {
+				continue
+			}
+			if oe.placeNativeChunk(state, chunk, batcher) {
+				break
+			}
+		}
+		return state.placed, state.hasMarginError, errors.Join(state.errs...)
+	}
 
 	for _, orderReq := range orders {
-		// 一次明确的保证金拒绝足以暂停本批剩余 BUY；继续扫描是为了让
-		// 非标准调用顺序中的 ReduceOnly SELL 仍有机会提交。
-		if skipRemainingBuys && strings.EqualFold(orderReq.Side, "BUY") {
-			logger.Warn("⏭️ [%s] 本批已出现保证金不足，跳过后续买单 %.2f",
-				oe.exchange.GetName(), orderReq.Price)
+		if state.shouldSkipBuy(exchangeName, orderReq) {
 			continue
 		}
 		order, err := oe.PlaceOrder(orderReq)
-		if err != nil {
-			if errors.Is(err, ErrOrderSubmissionStale) {
-				logger.Debug("⏭️ [%s] 跳过已失效 reservation: %.2f %s (ClientOID=%s)",
-					oe.exchange.GetName(), orderReq.Price, orderReq.Side, orderReq.ClientOrderID)
-				continue
-			}
-			logger.Warn("⚠️ [%s] 下单失败 %.2f %s: %v",
-				oe.exchange.GetName(), orderReq.Price, orderReq.Side, err)
+		if state.note(exchangeName, orderReq, order, err) {
+			break
+		}
+	}
+	return state.placed, state.hasMarginError, errors.Join(state.errs...)
+}
 
-			// UNKNOWN、门禁和上下文错误必须无条件向上传播。错误文本即使
-			// 同时含有 insufficient，也不能被保证金分支吞掉，否则槽位会
-			// 保持 PENDING 而门禁却不会进入对账恢复。
-			mustStopBatch := errors.Is(err, exchange.ErrOrderPlacementUnknown) ||
-				errors.Is(err, ErrTradingHealthGuardRejected) ||
-				errors.Is(err, ErrNewOrdersStopped) || errors.Is(err, ErrOrderExecutorStopped) ||
-				errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-			marginFailure := isMarginError(err)
-			var marginRejection *OrderRejectedError
-			definiteMarginFailure := IsDefiniteOrderRejection(err) &&
-				errors.As(err, &marginRejection) && marginRejection.Kind == OrderRejectionMargin
-			if definiteMarginFailure && orderReq.ReduceOnly && strings.EqualFold(orderReq.Side, "SELL") {
-				// BUY 保证金拒绝只需锁住后续开仓；连 ReduceOnly SELL 都被拒绝
-				// 则无法按预期降低风险，升级为非 definite 的门禁恢复错误。
-				// UNKNOWN 即使错误文本含 insufficient 也不能被降级成明确保证金拒绝。
-				err = errors.Join(ErrReduceOnlySellMarginRejected, err)
-				mustStopBatch = true
+func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk []*OrderRequest, batcher exchange.PlaceOrderBatcher) bool {
+	exchangeName := oe.exchange.GetName()
+	placeCtx, err := oe.newOrderContext()
+	if err != nil {
+		stop := false
+		for _, req := range chunk {
+			if state.note(exchangeName, req, nil, err) {
+				stop = true
 			}
-			if marginFailure {
-				hasMarginError = true
-				logger.Error("❌ [保证金不足] 订单 %.2f %s 因保证金不足失败", orderReq.Price, orderReq.Side)
-				if !mustStopBatch {
-					skipRemainingBuys = true
+		}
+		return stop
+	}
+	for range chunk {
+		if waitErr := oe.rateLimiter.Wait(placeCtx); waitErr != nil {
+			waitErr = oe.placementContextError("速率限制等待失败", waitErr)
+			stop := false
+			for _, req := range chunk {
+				if state.note(exchangeName, req, nil, waitErr) {
+					stop = true
 				}
 			}
-			if !marginFailure || mustStopBatch {
-				placementErrors = append(placementErrors,
-					fmt.Errorf("订单 %.12g %s 提交失败: %w", orderReq.Price, orderReq.Side, err))
-			}
+			return stop
+		}
+	}
 
-			// 结果未知或门禁已关闭时必须立即停止本批次，避免继续扩大不确定状态。
-			if mustStopBatch {
-				break
+	type leasedRequest struct {
+		req         *OrderRequest
+		exchangeReq *exchange.OrderRequest
+		release     func()
+	}
+	submitted := make([]leasedRequest, 0, len(chunk))
+	releaseSubmitted := func() {
+		for _, item := range submitted {
+			item.release()
+		}
+	}
+
+	for _, req := range chunk {
+		if !oe.newOrdersEnabled.Load() {
+			gateErr := placeCtx.Err()
+			if gateErr == nil {
+				gateErr = ErrNewOrdersStopped
 			}
-			// 单笔限流重试已经耗尽时对整个批次施加背压，避免后续每个订单
-			// 再分别消耗完整的重试预算。PostOnly 等其它明确拒绝仍可逐单继续。
-			var rejected *OrderRejectedError
-			if IsDefiniteOrderRejection(err) && errors.As(err, &rejected) &&
-				rejected.Kind == OrderRejectionRateLimit {
-				logger.Warn("⚠️ [%s] 限流重试已耗尽，停止提交本批剩余订单", oe.exchange.GetName())
-				break
+			releaseSubmitted()
+			return state.note(exchangeName, req, nil, oe.placementContextError("下单前交易门禁已关闭", gateErr))
+		}
+		release, ok := acquireSubmissionLease(req)
+		if !ok {
+			if state.note(exchangeName, req, nil, ErrOrderSubmissionStale) {
+				releaseSubmitted()
+				return true
 			}
 			continue
 		}
-		placedOrders = append(placedOrders, order)
+		if !oe.newOrdersEnabled.Load() || placeCtx.Err() != nil {
+			release()
+			releaseSubmitted()
+			gateErr := placeCtx.Err()
+			if gateErr == nil {
+				gateErr = ErrNewOrdersStopped
+			}
+			return state.note(exchangeName, req, nil, oe.placementContextError("下单前交易门禁已关闭", gateErr))
+		}
+		submitted = append(submitted, leasedRequest{
+			req:         req,
+			exchangeReq: nativeExchangeRequest(req),
+			release:     release,
+		})
+	}
+	if len(submitted) == 0 {
+		return false
 	}
 
-	return placedOrders, hasMarginError, errors.Join(placementErrors...)
+	if guardErr := oe.checkSubmissionHealth(); guardErr != nil {
+		releaseSubmitted()
+		oe.StopNewOrders()
+		healthErr := fmt.Errorf("%w: %v", ErrTradingHealthGuardRejected, guardErr)
+		stop := false
+		for _, item := range submitted {
+			if state.note(exchangeName, item.req, nil, healthErr) {
+				stop = true
+			}
+		}
+		return stop
+	}
+	if !oe.newOrdersEnabled.Load() || placeCtx.Err() != nil {
+		releaseSubmitted()
+		gateErr := placeCtx.Err()
+		if gateErr == nil {
+			gateErr = ErrNewOrdersStopped
+		}
+		stop := false
+		for _, item := range submitted {
+			if state.note(exchangeName, item.req, nil, oe.placementContextError("健康复检后交易门禁已关闭", gateErr)) {
+				stop = true
+			}
+		}
+		return stop
+	}
+
+	exchangeReqs := make([]*exchange.OrderRequest, len(submitted))
+	for i, item := range submitted {
+		exchangeReqs[i] = item.exchangeReq
+	}
+	requestCtx, cancel := oe.requestContext(placeCtx)
+	items, batchErr := func() ([]exchange.PlaceOrderBatchItem, error) {
+		defer releaseSubmitted()
+		return batcher.PlaceOrderBatch(requestCtx, exchangeReqs)
+	}()
+	cancel()
+
+	stop := false
+	if batchErr != nil {
+		for _, item := range submitted {
+			order, err := oe.interpretSubmittedResult(item.req, nil, batchErr)
+			if order != nil && err == nil {
+				logger.Debug("✅ [%s] 下单成功(PostOnly): %s %.*f 数量: %.4f 订单ID: %d",
+					exchangeName, order.Side, item.req.PriceDecimals, order.Price, order.Quantity, order.OrderID)
+			}
+			if state.note(exchangeName, item.req, order, err) {
+				stop = true
+			}
+		}
+		return true
+	}
+	if len(items) != len(submitted) {
+		mismatch := fmt.Errorf("批量下单结果条数=%d，期望 %d", len(items), len(submitted))
+		for _, item := range submitted {
+			order, err := oe.interpretSubmittedResult(item.req, nil, mismatch)
+			if state.note(exchangeName, item.req, order, err) {
+				stop = true
+			}
+		}
+		return true
+	}
+	for i, item := range submitted {
+		order, err := oe.interpretSubmittedResult(item.req, items[i].Order, items[i].Err)
+		if order != nil && err == nil {
+			logger.Debug("✅ [%s] 下单成功(PostOnly): %s %.*f 数量: %.4f 订单ID: %d",
+				exchangeName, order.Side, item.req.PriceDecimals, order.Price, order.Quantity, order.OrderID)
+		}
+		if state.note(exchangeName, item.req, order, err) {
+			stop = true
+		}
+	}
+	return stop
 }
 
 // CancelOrder 取消订单
@@ -550,13 +754,13 @@ func (oe *ExchangeOrderExecutor) CancelOrder(orderID int64) error {
 		// 如果是"Unknown order"错误，说明订单已经不存在（可能已成交或已取消），不算错误
 		errStr := err.Error()
 		if hasErrorCode(err, -2011) || strings.Contains(errStr, "Unknown order") || strings.Contains(errStr, "does not exist") {
-			logger.Info("ℹ️ [%s] 订单 %d 已不存在（可能已成交或已取消），跳过取消", oe.exchange.GetName(), orderID)
+			logger.Debug("ℹ️ [%s] 订单 %d 已不存在（可能已成交或已取消），跳过取消", oe.exchange.GetName(), orderID)
 			return nil
 		}
 		return fmt.Errorf("取消订单失败: %w", err)
 	}
 
-	logger.Info("✅ [%s] 取消订单成功: %d", oe.exchange.GetName(), orderID)
+	logger.Debug("✅ [%s] 取消订单成功: %d", oe.exchange.GetName(), orderID)
 	return nil
 }
 

@@ -21,7 +21,7 @@ type orderCleanerTestPM struct {
 	casApplied int
 }
 
-func (p *orderCleanerTestPM) IterateSlots(fn func(price float64, slot interface{}) bool) {
+func (p *orderCleanerTestPM) IterateSlots(fn func(price float64, slot SlotInfo) bool) {
 	p.mu.Lock()
 	snapshots := make(map[float64]orderCleanerTestSlot, len(p.slots))
 	for price, slot := range p.slots {
@@ -30,7 +30,13 @@ func (p *orderCleanerTestPM) IterateSlots(fn func(price float64, slot interface{
 	p.mu.Unlock()
 
 	for price, slot := range snapshots {
-		if !fn(price, slot) {
+		if !fn(price, SlotInfo{
+			Price:       price,
+			OrderID:     slot.OrderID,
+			ClientOID:   slot.ClientOID,
+			OrderSide:   slot.OrderSide,
+			OrderStatus: slot.OrderStatus,
+		}) {
 			return
 		}
 	}

@@ -2,7 +2,9 @@ package exchange
 
 import (
 	"context"
+
 	"opensqt/exchange/backpack"
+	"opensqt/logger"
 )
 
 type backpackWrapper struct {
@@ -204,8 +206,32 @@ func (w *backpackWrapper) GetBalance(ctx context.Context, asset string) (float64
 	return w.adapter.GetBalance(ctx, asset)
 }
 
-func (w *backpackWrapper) StartOrderStream(ctx context.Context, callback func(interface{})) error {
-	return w.adapter.StartOrderStream(ctx, callback)
+func (w *backpackWrapper) StartOrderStream(ctx context.Context, callback OrderUpdateCallback) error {
+	return w.adapter.StartOrderStream(ctx, func(update interface{}) {
+		ou, ok := backpackStreamUpdate(update)
+		if !ok {
+			logger.Warn("⚠️ [Backpack] 订单更新类型无法识别: %T", update)
+			return
+		}
+		callback(ou)
+	})
+}
+
+func backpackStreamUpdate(update interface{}) (OrderUpdate, bool) {
+	switch u := update.(type) {
+	case backpack.OrderUpdate:
+		return NewOrderUpdate(u.OrderID, u.ClientOrderID, u.Symbol, string(u.Side), string(u.Type), string(u.Status),
+			u.Price, u.Quantity, u.ExecutedQty, u.AvgPrice, u.UpdateTime, u.RealizedPNL, u.RealizedPNLIncremental), true
+	case *backpack.OrderUpdate:
+		if u == nil {
+			return OrderUpdate{}, false
+		}
+		return backpackStreamUpdate(*u)
+	case OrderUpdate:
+		return u, true
+	default:
+		return OrderUpdate{}, false
+	}
 }
 
 func (w *backpackWrapper) StopOrderStream() error {

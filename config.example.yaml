@@ -77,7 +77,9 @@ trading:
   reconcile_interval: 60      # 对账间隔（秒）
 
   # 订单管理配置
-  order_cleanup_threshold: 50      # 订单清理上限（超过此数量时触发清理）
+  # order_cleanup_threshold 必须大于 buy_window_size + sell_window_size，
+  # 否则补单与清理会来回打架。密网格应先加大阈值，而不是把窗口开到 50+。
+  order_cleanup_threshold: 100     # 订单清理上限（默认100，必须大于 buy+sell 窗口）
   cleanup_batch_size: 20           # 清理批次大小（每次清理的买单和卖单数量）
   margin_lock_duration_seconds: 20  # 保证金不足时锁定时间（秒，默认10秒）
   

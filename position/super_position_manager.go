@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"opensqt/config"
+	"opensqt/exchange"
 	"opensqt/logger"
+	"opensqt/safety"
 	"opensqt/utils"
 )
 
@@ -243,7 +245,21 @@ type SuperPositionManager struct {
 	quantityDecimals int
 
 	// 库存槽位：价格 -> 槽位
-	slots sync.Map // map[float64]*InventorySlot
+	slots     sync.Map // map[float64]*InventorySlot
+	slotIndex slotPriceIndex
+
+	// 最近一次完成规划的网格价与现价。同格抖动可 skip；现价越过买单安全垫或 maker 下界时不能 skip。
+	lastAdjustedGridPrice atomic.Value // float64
+	lastAdjustedPrice     atomic.Value // float64
+
+	// 仅测试：扫描窗口外买单之后、提交撤销之前调用。
+	beforeCommitOutOfWindowBuys func()
+	// 仅测试：完成卖单候选与初始占价扫描之后调用。
+	afterSellCandidateScan func()
+
+	// adjustMu 串行化整次 AdjustOrders（含锁外 REST）。spm.mu 只保护规划期
+	// 共享字段，避免面板快照在下单 RTT 期间被全局锁堵住。
+	adjustMu sync.Mutex
 
 	// 保证金管理
 	insufficientMargin bool
@@ -315,6 +331,8 @@ func NewSuperPositionManager(
 	spm.realizedPNL.Store(0.0)
 	spm.lastReconcileTime.Store(time.Now())
 	spm.lastMarketPrice.Store(0.0)
+	spm.lastAdjustedGridPrice.Store(0.0)
+	spm.lastAdjustedPrice.Store(0.0)
 	return spm
 }
 
@@ -618,13 +636,14 @@ func (spm *SuperPositionManager) clearReservationLocked(slot *InventorySlot) {
 	slot.SlotStatus = SlotStatusFree
 }
 
-// placementRetryReadyLocked 返回槽位是否已可再次创建 reservation。
-// 调用方必须持有 slot.mu 写锁，以便在冷却到期时清理状态。
+// placementRetryElapsedLocked 只读判断冷却是否已过，扫描路径可在 RLock 下调用。
+func placementRetryElapsedLocked(slot *InventorySlot, now time.Time) bool {
+	return slot != nil && (slot.placementRetryNotBefore.IsZero() || !now.Before(slot.placementRetryNotBefore))
+}
+
+// placementRetryReadyLocked 在写锁下确认可再次 reservation，并清掉已到期的冷却。
 func placementRetryReadyLocked(slot *InventorySlot, now time.Time) bool {
-	if slot.placementRetryNotBefore.IsZero() {
-		return true
-	}
-	if now.Before(slot.placementRetryNotBefore) {
+	if !placementRetryElapsedLocked(slot, now) {
 		return false
 	}
 	slot.placementRetryNotBefore = time.Time{}
@@ -633,7 +652,8 @@ func placementRetryReadyLocked(slot *InventorySlot, now time.Time) bool {
 
 // sellCandidateEligibleLocked 是卖单候选在收集和最终 reservation 前的
 // 统一门禁。订单流可在两个阶段之间更新槽位，因此最终复检不能
-// 只看 SlotStatus，还必须确认订单身份仍然为空。调用方必须持有 slot 写锁。
+// 只看 SlotStatus，还必须确认订单身份仍然为空。
+// 冷却只读判断，规划扫描可在 RLock 下调用；到期清理只发生在写锁路径。
 func sellCandidateEligibleLocked(slot *InventorySlot, now time.Time) bool {
 	return slot != nil &&
 		slot.PositionStatus == PositionStatusFilled &&
@@ -641,7 +661,7 @@ func sellCandidateEligibleLocked(slot *InventorySlot, now time.Time) bool {
 		slot.SlotStatus == SlotStatusFree &&
 		slot.OrderID == 0 &&
 		slot.ClientOID == "" &&
-		placementRetryReadyLocked(slot, now)
+		placementRetryElapsedLocked(slot, now)
 }
 
 // releaseFailedReservation 只释放明确未提交且身份仍完全匹配的 reservation。
@@ -684,11 +704,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	// 🔥 移除初始化检查：现在完全由 AdjustOrders 控制所有下单
 	// 初始化只负责恢复持仓状态，不再下单
 
+	spm.adjustMu.Lock()
 	var adjustmentDeadlines []time.Time
-	spm.mu.Lock()
 	defer func() {
-		spm.mu.Unlock()
-		// 失败 reservation 和保证金锁到期通知都延迟到全局锁释放之后。
+		spm.adjustMu.Unlock()
+		// 失败 reservation 和保证金锁到期通知都延迟到 adjustMu 释放之后。
 		// 生产回调只会向串行协调器入队；这里也从实现上杜绝未来回调
 		// 意外重入造成死锁。
 		for _, deadline := range adjustmentDeadlines {
@@ -707,6 +727,16 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 
 	// 更新最后市场价格（用于打印状态）
 	spm.lastMarketPrice.Store(currentPrice)
+
+	spm.mu.Lock()
+	planningLocked := true
+	unlockPlanning := func() {
+		if planningLocked {
+			spm.mu.Unlock()
+			planningLocked = false
+		}
+	}
+	defer unlockPlanning()
 
 	// 保证金锁只暂停新增买单。ReduceOnly 卖单仍需继续生成，
 	// 否则资金越紧张时反而无法挂出减仓单。
@@ -740,13 +770,27 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	var sellOrdersToPlace []*OrderRequest
 	var activeBuyOrdersInWindow int
 
-	// 统计当前所有订单数量（分别统计买单和卖单）
+	// 一次遍历同时统计挂单、卖价占用和卖单候选，避免密网格下多次全表扫描。
 	var currentOrderCount int
 	var currentBuyOrderCount int
 	var currentSellOrderCount int
 	occupiedSellPriceTicks := make(map[int64]struct{})
-	spm.slots.Range(func(key, value interface{}) bool {
-		slot := value.(*InventorySlot)
+	sellWindowMaxPrice := currentPrice + float64(sellWindowSize)*priceInterval
+	sellWindowMaxPrice = roundPrice(sellWindowMaxPrice, spm.priceDecimals)
+
+	type sellCandidate struct {
+		SlotPrice       float64 // 槽位价格 (买入价)
+		TargetSellPrice float64 // 原网格目标卖出价
+		DistanceToMid   float64
+	}
+	var sellCandidates []sellCandidate
+	buyWindowPrices := make(map[float64]struct{}, len(slotPrices))
+	for _, price := range slotPrices {
+		buyWindowPrices[price] = struct{}{}
+	}
+	var outOfWindowBuys []outOfWindowBuy
+
+	spm.forEachSlot(func(slotPrice float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
 		if orderMayExistLocked(slot) {
 			currentOrderCount++
@@ -761,9 +805,42 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				occupiedSellPriceTicks[priceTick] = struct{}{}
 			}
 		}
+		eligible := sellCandidateEligibleLocked(slot, adjustmentTime) &&
+			slotPrice <= sellWindowMaxPrice
+		var candidate sellCandidate
+		if eligible {
+			candidate = sellCandidate{
+				SlotPrice:       slotPrice,
+				TargetSellPrice: slotPrice + priceInterval,
+				DistanceToMid:   math.Abs(slotPrice - currentPrice),
+			}
+		}
+		var staleBuy outOfWindowBuy
+		staleBuyFound := false
+		if cancelableLiveBuyLocked(slot) {
+			if _, inWindow := buyWindowPrices[slotPrice]; !inWindow {
+				staleBuy = outOfWindowBuy{
+					price:     slotPrice,
+					orderID:   slot.OrderID,
+					clientOID: slot.ClientOID,
+				}
+				staleBuyFound = true
+			}
+		}
 		slot.mu.RUnlock()
+		if eligible {
+			sellCandidates = append(sellCandidates, candidate)
+		}
+		if staleBuyFound {
+			outOfWindowBuys = append(outOfWindowBuys, staleBuy)
+		}
 		return true
 	})
+	if spm.afterSellCandidateScan != nil {
+		spm.afterSellCandidateScan()
+	}
+
+	cancelIDs, leftoverOutOfWindowBuys, committedCancels := spm.commitOutOfWindowBuyCancels(outOfWindowBuys)
 
 	// 计算允许创建的订单数量上限
 	threshold := spm.config.Trading.OrderCleanupThreshold
@@ -772,50 +849,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	}
 
 	// 🔥 核心改进：不预留空间，允许订单数达到threshold上限
-	// 剩余可用订单数 = 阈值 - 当前订单数
-	remainingOrders := threshold - currentOrderCount
+	// 剩余可用订单数 = 阈值 - 当前订单数。即将撤销的窗口外买单立刻腾出配额。
+	remainingOrders := threshold - currentOrderCount + len(cancelIDs)
 	if remainingOrders < 0 {
 		remainingOrders = 0
 	}
-
-	// 1. 先处理 ReduceOnly 卖单。有效减仓单优先占用全局订单配额，
-	// 避免在订单阈值紧张时被新增买单挤掉。
-	sellWindowMaxPrice := currentPrice + float64(sellWindowSize)*priceInterval
-	sellWindowMaxPrice = roundPrice(sellWindowMaxPrice, spm.priceDecimals)
-
-	type sellCandidate struct {
-		SlotPrice       float64 // 槽位价格 (买入价)
-		TargetSellPrice float64 // 原网格目标卖出价
-		DistanceToMid   float64
-	}
-	var sellCandidates []sellCandidate
-
-	spm.slots.Range(func(key, value interface{}) bool {
-		slotPrice := key.(float64) // 槽位Key = 买入价
-		slot := value.(*InventorySlot)
-		slot.mu.Lock()
-		defer slot.mu.Unlock()
-
-		// 🔥 卖单条件：持仓状态=FILLED + 槽位锁=FREE + 无订单ID + 无ClientOID
-		if sellCandidateEligibleLocked(slot, adjustmentTime) {
-
-			// 窗口检查
-			if slotPrice > sellWindowMaxPrice {
-				return true
-			}
-
-			// 保留未经展示精度四舍五入的盈利目标；最终统一按真实 tickSize
-			// 向上量化，避免先四舍五入向下而削弱原网格利润下限。
-			targetSellPrice := slotPrice + priceInterval
-			distance := math.Abs(slotPrice - currentPrice)
-			sellCandidates = append(sellCandidates, sellCandidate{
-				SlotPrice:       slotPrice,
-				TargetSellPrice: targetSellPrice,
-				DistanceToMid:   distance,
-			})
-		}
-		return true
-	})
 
 	// 按距离排序
 	sort.Slice(sellCandidates, func(i, j int) bool {
@@ -835,7 +873,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	if allowedNewSellOrders > 0 {
 		for i := 0; i < len(sellCandidates) && sellOrdersToCreate < allowedNewSellOrders; i++ {
 			candidate := sellCandidates[i]
-			// 订单流不受 spm.mu 阻塞，候选收集后可能又绑定了新的
+			// 订单流不受 spm.mu 阻塞，候选收集后可能又绑定新的
 			// 远端 SELL。每次分配前合并最新占价，将快照窗口压缩到最小。
 			spm.collectOccupiedSellPriceTicks(occupiedSellPriceTicks)
 			sellPrice, sellPriceTick, ok := spm.allocateMakerSafeSellPrice(
@@ -988,7 +1026,35 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	ordersToPlace = append(ordersToPlace, sellOrdersToPlace...)
 	ordersToPlace = append(ordersToPlace, buyOrdersToPlace...)
 
-	// 执行下单
+	spm.recycleIdleSlots(slotPrices)
+	if leftoverOutOfWindowBuys {
+		spm.clearAdjustFingerprint()
+		adjustmentDeadlines = append(adjustmentDeadlines, time.Time{})
+		logger.Warn("⚠️ [窗口撤买] 仍有离开买单窗口的挂单未能提交撤销，清除同格跳过指纹")
+	} else {
+		spm.storeAdjustFingerprint(currentGridPrice, currentPrice)
+	}
+	unlockPlanning()
+
+	var cancelErr error
+	if len(cancelIDs) > 0 && spm.executor != nil {
+		logger.Debug("🧹 [窗口撤买] 撤销 %d 个离开买单窗口的挂单", len(cancelIDs))
+		if err := spm.executor.BatchCancelOrders(cancelIDs); err != nil {
+			cancelErr = fmt.Errorf("撤销窗口外买单失败，远端可能仍挂着: %w", err)
+			logger.Warn("⚠️ %v", cancelErr)
+			spm.revertOutOfWindowBuyCancels(committedCancels)
+			for _, req := range ordersToPlace {
+				if retryAt := spm.releaseFailedReservation(req); !retryAt.IsZero() {
+					adjustmentDeadlines = append(adjustmentDeadlines, retryAt)
+				}
+			}
+			spm.clearAdjustFingerprint()
+			adjustmentDeadlines = append(adjustmentDeadlines, time.Time{})
+			return cancelErr
+		}
+	}
+
+	// 执行下单。REST 必须在 spm.mu 之外，避免面板快照和下单 RTT 互相阻塞。
 	if len(ordersToPlace) > 0 {
 		logger.Debug("🔄 [实时调整] 需要新增: %d 个订单", len(ordersToPlace))
 		requestsByClientOID := make(map[string]*OrderRequest, len(ordersToPlace))
@@ -1020,12 +1086,14 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		// 保证金锁。这样不会把远端根本不存在的订单留成待确认状态。
 		if marginError {
 			logger.Warn("⚠️ [保证金不足] 检测到保证金不足错误，暂停新增买单 %d 秒，保留已有买单并继续减仓", int(spm.marginLockDuration.Seconds()))
+			spm.mu.Lock()
 			spm.insufficientMargin = true
 			spm.marginLockTime = time.Now()
+			lockUntil := spm.marginLockTime.Add(spm.marginLockDuration)
+			spm.mu.Unlock()
 			// 槽位的短冷却会先到期，但此时 BUY 仍受保证金锁保护。额外安排
 			// 锁到期调整，确保同价且没有其它行情/订单事件时也会恢复挂买单。
-			adjustmentDeadlines = append(adjustmentDeadlines,
-				spm.marginLockTime.Add(spm.marginLockDuration))
+			adjustmentDeadlines = append(adjustmentDeadlines, lockUntil)
 		}
 
 		var acceptedOrderErrs []error
@@ -1204,12 +1272,233 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		placementErr = errors.Join(placementErr, errors.Join(acceptedOrderErrs...))
 
 		if placementErr != nil {
-			return fmt.Errorf("批量下单未完全成功（已确认 %d/%d 个）: %w",
-				len(placedOrders), len(ordersToPlace), placementErr)
+			return errors.Join(fmt.Errorf("批量下单未完全成功（已确认 %d/%d 个）: %w",
+				len(placedOrders), len(ordersToPlace), placementErr), cancelErr)
 		}
 	}
 
-	return nil
+	return cancelErr
+}
+
+// ShouldSkipUnchangedGrid 在最近网格价未变时允许交易门禁跳过价格抖动触发的
+// AdjustOrders。成交、撤单、冷却到期仍通过 RequestAdjustOrders 强制调整。
+// 同格内现价越过买单安全垫、卖单窗口上界或 maker 下界时必须再规划，
+// 否则最近一档会空着。
+func (spm *SuperPositionManager) ShouldSkipUnchangedGrid(currentPrice float64) bool {
+	if spm == nil || currentPrice <= 0 {
+		return false
+	}
+	lastGrid, _ := spm.lastAdjustedGridPrice.Load().(float64)
+	if lastGrid <= 0 {
+		return false
+	}
+	currentPrice = roundPrice(currentPrice, spm.priceDecimals)
+	if spm.findNearestGridPrice(currentPrice) != lastGrid {
+		return false
+	}
+	lastPrice, _ := spm.lastAdjustedPrice.Load().(float64)
+	if lastPrice <= 0 {
+		return false
+	}
+	return spm.sameGridPlacementBoundsUnchanged(lastPrice, currentPrice)
+}
+
+func (spm *SuperPositionManager) storeAdjustFingerprint(gridPrice, currentPrice float64) {
+	spm.lastAdjustedGridPrice.Store(gridPrice)
+	spm.lastAdjustedPrice.Store(currentPrice)
+}
+
+func (spm *SuperPositionManager) clearAdjustFingerprint() {
+	spm.lastAdjustedGridPrice.Store(0.0)
+	spm.lastAdjustedPrice.Store(0.0)
+}
+
+func (spm *SuperPositionManager) sameGridPlacementBoundsUnchanged(lastPrice, currentPrice float64) bool {
+	if spm == nil || spm.config == nil {
+		return false
+	}
+	interval := spm.config.Trading.PriceInterval
+	if interval <= 0 {
+		return false
+	}
+	safety := interval * 0.1
+	grid := spm.findNearestGridPrice(currentPrice)
+	for _, price := range spm.calculateSlotPrices(grid, spm.config.Trading.BuyWindowSize, "down") {
+		if (price >= lastPrice-safety) != (price >= currentPrice-safety) {
+			return false
+		}
+	}
+	lastSellMax := roundPrice(
+		lastPrice+float64(spm.config.Trading.SellWindowSize)*interval,
+		spm.priceDecimals,
+	)
+	currentSellMax := roundPrice(
+		currentPrice+float64(spm.config.Trading.SellWindowSize)*interval,
+		spm.priceDecimals,
+	)
+	if spm.slotIndex.hasPriceInOpenClosedRange(
+		math.Min(lastSellMax, currentSellMax),
+		math.Max(lastSellMax, currentSellMax),
+	) {
+		return false
+	}
+	lastMaker, lastOK := spm.alignedMakerFloorPrice(lastPrice, interval)
+	currMaker, currOK := spm.alignedMakerFloorPrice(currentPrice, interval)
+	return lastOK && currOK && lastMaker == currMaker
+}
+
+func (spm *SuperPositionManager) recycleIdleSlots(buyWindowPrices []float64) {
+	if spm == nil {
+		return
+	}
+	keep := make(map[float64]struct{}, len(buyWindowPrices))
+	for _, price := range buyWindowPrices {
+		keep[price] = struct{}{}
+	}
+	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
+		if _, ok := keep[price]; ok {
+			return true
+		}
+		slot.mu.Lock()
+		spm.deleteSlotIfCurrentAndRecyclable(price, slot)
+		slot.mu.Unlock()
+		return true
+	})
+}
+
+type outOfWindowBuy struct {
+	price     float64
+	orderID   int64
+	clientOID string
+}
+
+type committedBuyCancel struct {
+	price          float64
+	orderID        int64
+	clientOID      string
+	previousStatus string
+}
+
+func cancelableLiveBuyLocked(slot *InventorySlot) bool {
+	return slot != nil && slot.OrderSide == "BUY" && slot.OrderID > 0 &&
+		(slot.OrderStatus == OrderStatusPlaced || slot.OrderStatus == OrderStatusConfirmed)
+}
+
+func (spm *SuperPositionManager) commitOutOfWindowBuyCancels(targets []outOfWindowBuy) ([]int64, bool, []committedBuyCancel) {
+	if spm == nil || len(targets) == 0 {
+		return nil, false, nil
+	}
+	if spm.beforeCommitOutOfWindowBuys != nil {
+		spm.beforeCommitOutOfWindowBuys()
+	}
+	ids := make([]int64, 0, len(targets))
+	committed := make([]committedBuyCancel, 0, len(targets))
+	leftover := false
+	for _, target := range targets {
+		id, stillLive, previousStatus := spm.tryCommitOutOfWindowBuyCancel(target)
+		if id > 0 {
+			ids = append(ids, id)
+			committed = append(committed, committedBuyCancel{
+				price:          target.price,
+				orderID:        id,
+				clientOID:      target.clientOID,
+				previousStatus: previousStatus,
+			})
+			continue
+		}
+		if stillLive {
+			leftover = true
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, leftover, committed
+}
+
+// tryCommitOutOfWindowBuyCancel 提交时按当前 PLACED/CONFIRMED 判断，避免订单流升格后漏撤。
+func (spm *SuperPositionManager) tryCommitOutOfWindowBuyCancel(target outOfWindowBuy) (orderID int64, leftover bool, previousStatus string) {
+	if target.orderID <= 0 {
+		return 0, false, ""
+	}
+	value, ok := spm.slots.Load(target.price)
+	if !ok {
+		return 0, false, ""
+	}
+	slot := value.(*InventorySlot)
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+
+	if slot.OrderID != target.orderID {
+		return 0, cancelableLiveBuyLocked(slot), ""
+	}
+	if target.clientOID != "" &&
+		spm.canonicalClientOrderID(slot.ClientOID) != spm.canonicalClientOrderID(target.clientOID) {
+		return 0, cancelableLiveBuyLocked(slot), ""
+	}
+	if !cancelableLiveBuyLocked(slot) {
+		return 0, false, ""
+	}
+	previousStatus = slot.OrderStatus
+	slot.OrderStatus = OrderStatusCancelRequested
+	return slot.OrderID, false, previousStatus
+}
+
+func (spm *SuperPositionManager) revertOutOfWindowBuyCancels(committed []committedBuyCancel) {
+	for _, item := range committed {
+		if item.orderID <= 0 || item.previousStatus == "" {
+			continue
+		}
+		spm.CompareAndSwapSlotOrderStatus(
+			item.price, item.orderID, item.clientOID,
+			OrderStatusCancelRequested, item.previousStatus,
+		)
+	}
+}
+
+func slotIsRecyclableLocked(slot *InventorySlot) bool {
+	if slot == nil {
+		return false
+	}
+	if slot.PositionStatus != PositionStatusEmpty || slot.PositionQty > fillQtyTolerance {
+		return false
+	}
+	if slot.SlotStatus != SlotStatusFree {
+		return false
+	}
+	if slot.OrderID != 0 || slot.ClientOID != "" {
+		return false
+	}
+	if slot.OrderQuantity > fillQtyTolerance || slot.OrderFilledQty > fillQtyTolerance {
+		return false
+	}
+	switch slot.OrderStatus {
+	case OrderStatusNotPlaced, "":
+		if slot.OrderSide != "" {
+			return false
+		}
+	case OrderStatusCanceled:
+		// CANCELED 终态已记入 terminalOrders；空闲空仓可回收。OrderSide 可能仍留着调试值。
+	default:
+		return false
+	}
+	if !slot.placementRetryNotBefore.IsZero() && time.Now().Before(slot.placementRetryNotBefore) {
+		return false
+	}
+	return true
+}
+
+// deleteSlotIfCurrentAndRecyclable 在槽位锁下按指针 CompareAndDelete，
+// 并与 index 删除共享 slotIndex.mu，避免 Delete 与 insert 之间把新槽从索引里拖掉。
+func (spm *SuperPositionManager) deleteSlotIfCurrentAndRecyclable(price float64, slot *InventorySlot) bool {
+	if spm == nil || slot == nil || !slotIsRecyclableLocked(slot) {
+		return false
+	}
+	spm.slotIndex.mu.Lock()
+	defer spm.slotIndex.mu.Unlock()
+	if !spm.slots.CompareAndDelete(price, slot) {
+		return false
+	}
+	spm.slotIndex.removeLocked(price)
+	return true
 }
 
 // OnOrderUpdate 订单更新回调（异步订单同步流）
@@ -1226,8 +1515,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		return
 	}
 
-	slot := spm.getOrCreateSlot(price)
-	slot.mu.Lock()
+	slot := spm.lockMappedSlot(price)
 	adjustmentNeeded := false
 	var adjustmentNotBefore time.Time
 	defer func() {
@@ -1860,25 +2148,61 @@ func (spm *SuperPositionManager) GetRealizedPNL() float64 {
 	return 0
 }
 
-// getOrCreateSlot 获取或创建槽位
+func newEmptySlot(price float64) *InventorySlot {
+	return &InventorySlot{
+		Price:          price,
+		PositionStatus: PositionStatusEmpty,
+		PositionQty:    0,
+		OrderStatus:    OrderStatusNotPlaced,
+		SlotStatus:     SlotStatusFree,
+	}
+}
+
+// getOrCreateSlot 获取或创建槽位。map 写入与 index.insert 必须在同一把
+// slotIndex.mu 下，避免 recycle 的迟到 remove 把刚插入的价格从索引里吃掉。
 func (spm *SuperPositionManager) getOrCreateSlot(price float64) *InventorySlot {
 	if slot, exists := spm.slots.Load(price); exists {
 		return slot.(*InventorySlot)
 	}
 
-	// 创建新槽位
-	slot := &InventorySlot{
-		Price:          price,
-		PositionStatus: PositionStatusEmpty,
-		PositionQty:    0,
-		OrderStatus:    OrderStatusNotPlaced,
-		SlotStatus:     SlotStatusFree, // 🔥 初始化为FREE状态
-	}
-	actual, loaded := spm.slots.LoadOrStore(price, slot)
-	if loaded {
-		return actual.(*InventorySlot)
+	created := newEmptySlot(price)
+	spm.slotIndex.mu.Lock()
+	defer spm.slotIndex.mu.Unlock()
+	actual, loaded := spm.slots.LoadOrStore(price, created)
+	slot := actual.(*InventorySlot)
+	if !loaded {
+		spm.slotIndex.insertLocked(price)
 	}
 	return slot
+}
+
+// lockMappedSlot 锁住当前仍在 map 里的槽位。recycle 可能在 getOrCreate 与
+// Lock 之间 CompareAndDelete 旧指针；若已脱离 map 则换新槽再锁。
+func (spm *SuperPositionManager) lockMappedSlot(price float64) *InventorySlot {
+	for {
+		slot := spm.getOrCreateSlot(price)
+		slot.mu.Lock()
+		if current, ok := spm.slots.Load(price); ok && current == slot {
+			return slot
+		}
+		slot.mu.Unlock()
+	}
+}
+
+func (spm *SuperPositionManager) forEachSlot(fn func(price float64, slot *InventorySlot) bool) {
+	for _, price := range spm.slotIndex.snapshot() {
+		raw, ok := spm.slots.Load(price)
+		if !ok {
+			continue
+		}
+		slot, ok := raw.(*InventorySlot)
+		if !ok || slot == nil {
+			continue
+		}
+		if !fn(price, slot) {
+			return
+		}
+	}
 }
 
 // findNearestGridPrice 找到最近的网格价格
@@ -1943,18 +2267,11 @@ type SlotData struct {
 	OrderCreatedAt time.Time
 }
 
-// IterateSlots 遍历所有槽位（封装 sync.Map.Range）
-// 注意：为了避免类型冲突，这里使用 interface{} 返回槽位数据
-// 调用者需要将其转换为具体的槽位信息
-func (spm *SuperPositionManager) IterateSlots(fn func(price float64, slot interface{}) bool) {
-	spm.slots.Range(func(key, value interface{}) bool {
-		price := key.(float64)
-		slot := value.(*InventorySlot)
+// IterateSlots 遍历所有槽位，回调收到只读拷贝。
+func (spm *SuperPositionManager) IterateSlots(fn func(price float64, slot safety.SlotInfo) bool) {
+	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
-		defer slot.mu.RUnlock()
-
-		// 构造槽位数据
-		data := SlotData{
+		data := safety.SlotInfo{
 			Price:          price,
 			PositionStatus: slot.PositionStatus,
 			PositionQty:    slot.PositionQty,
@@ -1968,8 +2285,7 @@ func (spm *SuperPositionManager) IterateSlots(fn func(price float64, slot interf
 			SlotStatus:     slot.SlotStatus,
 			OrderCreatedAt: slot.OrderCreatedAt,
 		}
-
-		// 返回槽位数据
+		slot.mu.RUnlock()
 		return fn(price, data)
 	})
 }
@@ -2071,11 +2387,22 @@ func (spm *SuperPositionManager) getExistingPosition() float64 {
 		return 0
 	}
 
-	// 尝试类型断言 - 假设返回的是包含 Size 字段的结构体切片
-	// 我们使用反射来安全地提取持仓数量
 	switch positions := positionsInterface.(type) {
+	case []*exchange.Position:
+		for _, pos := range positions {
+			if pos != nil && pos.Symbol == spm.config.Trading.Symbol {
+				logger.Debug("🔍 [持仓恢复] 找到持仓: %.4f", pos.Size)
+				return pos.Size
+			}
+		}
+	case []exchange.Position:
+		for _, pos := range positions {
+			if pos.Symbol == spm.config.Trading.Symbol {
+				logger.Debug("🔍 [持仓恢复] 找到持仓: %.4f", pos.Size)
+				return pos.Size
+			}
+		}
 	case []*PositionInfo:
-		// PositionInfo 切片（简化版）
 		for _, pos := range positions {
 			if pos != nil && pos.Symbol == spm.config.Trading.Symbol {
 				logger.Debug("🔍 [持仓恢复] 找到持仓 (PositionInfo): %.4f", pos.Size)
@@ -2248,9 +2575,7 @@ func (spm *SuperPositionManager) PrintPositions() {
 	}
 	var positions []positionInfo
 
-	spm.slots.Range(func(key, value interface{}) bool {
-		price := key.(float64)
-		slot := value.(*InventorySlot)
+	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
 		if slot.PositionStatus == PositionStatusFilled && slot.PositionQty > 0.001 {
 			positions = append(positions, positionInfo{
@@ -2330,9 +2655,7 @@ func (spm *SuperPositionManager) PrintPositions() {
 	}
 	var allSlots []slotInfo
 
-	spm.slots.Range(func(key, value interface{}) bool {
-		price := key.(float64)
-		slot := value.(*InventorySlot)
+	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
 		allSlots = append(allSlots, slotInfo{
 			Price:          price,
@@ -2437,8 +2760,10 @@ func orderMayExistLocked(slot *InventorySlot) bool {
 // collectOccupiedSellPriceTicks 把当前所有可能仍在远端的 SELL 价格
 // 合并到 occupied。不删除已有键：本轮刚创建的 reservation 也必须保留。
 func (spm *SuperPositionManager) collectOccupiedSellPriceTicks(occupied map[int64]struct{}) {
-	spm.slots.Range(func(_, value interface{}) bool {
-		slot := value.(*InventorySlot)
+	if spm == nil || occupied == nil {
+		return
+	}
+	spm.forEachSlot(func(_ float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
 		if spm.sellPriceIsReservedLocked(slot) {
 			if priceTick, ok := priceTickIndexUp(slot.OrderPrice, spm.priceTickSize); ok {
@@ -2558,6 +2883,48 @@ func ValidateGridPriceInterval(priceInterval, tickSize float64) error {
 	}
 	return fmt.Errorf("网格价格间隔 %g 必须是交易所价格步长 %g 的正整数倍",
 		priceInterval, tickSize)
+}
+
+func (spm *SuperPositionManager) alignedMakerFloorPrice(currentPrice, priceInterval float64) (float64, bool) {
+	if spm == nil {
+		return 0, false
+	}
+	tickSize := spm.priceTickSize
+	intervalTicks, ok := gridIntervalTickCount(priceInterval, tickSize)
+	if !ok {
+		return 0, false
+	}
+	anchorTick, ok := priceTickIndexNearest(spm.anchorPrice, tickSize)
+	if !ok {
+		return 0, false
+	}
+	currentTick, ok := priceTickIndexUp(currentPrice, tickSize)
+	if !ok {
+		return 0, false
+	}
+	safetyTicks := intervalTicks / 10
+	if intervalTicks%10 != 0 {
+		safetyTicks++
+	}
+	if safetyTicks < 1 {
+		safetyTicks = 1
+	}
+	if currentTick > math.MaxInt64-safetyTicks {
+		return 0, false
+	}
+	priceTick := currentTick + safetyTicks
+	remainder := (priceTick - anchorTick) % intervalTicks
+	if remainder < 0 {
+		remainder += intervalTicks
+	}
+	if remainder != 0 {
+		advance := intervalTicks - remainder
+		if priceTick > math.MaxInt64-advance {
+			return 0, false
+		}
+		priceTick += advance
+	}
+	return roundPrice(float64(priceTick)*tickSize, spm.priceDecimals), true
 }
 
 // allocateMakerSafeSellPrice 保留原网格盈利目标和 Maker 安全价作为下限，

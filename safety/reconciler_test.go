@@ -61,9 +61,21 @@ type reconcileTestPM struct {
 	reconcileCount int64
 }
 
-func (p *reconcileTestPM) IterateSlots(fn func(float64, interface{}) bool) {
+func (p *reconcileTestPM) IterateSlots(fn func(float64, SlotInfo) bool) {
 	for i, slot := range p.slots {
-		if !fn(float64(i+1), slot) {
+		if !fn(float64(i+1), SlotInfo{
+			Price:          float64(i + 1),
+			PositionStatus: slot.PositionStatus,
+			PositionQty:    slot.PositionQty,
+			OrderID:        slot.OrderID,
+			ClientOID:      slot.ClientOID,
+			OrderSide:      slot.OrderSide,
+			OrderStatus:    slot.OrderStatus,
+			OrderPrice:     slot.OrderPrice,
+			OrderQuantity:  slot.OrderQuantity,
+			OrderFilledQty: slot.OrderFilledQty,
+			SlotStatus:     slot.SlotStatus,
+		}) {
 			return
 		}
 	}

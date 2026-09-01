@@ -6,8 +6,10 @@ import (
 )
 
 type recordingExecutor struct {
-	orders   []*OrderRequest
-	batchErr error
+	orders    []*OrderRequest
+	batchErr  error
+	cancelIDs []int64
+	cancelErr error
 }
 
 func (e *recordingExecutor) PlaceOrder(req *OrderRequest) (*Order, error) { return nil, nil }
@@ -42,7 +44,10 @@ func TestAdjustOrdersPropagatesBatchPlacementError(t *testing.T) {
 	}
 }
 
-func (e *recordingExecutor) BatchCancelOrders(orderIDs []int64) error { return nil }
+func (e *recordingExecutor) BatchCancelOrders(orderIDs []int64) error {
+	e.cancelIDs = append(e.cancelIDs, orderIDs...)
+	return e.cancelErr
+}
 
 func TestAdjustOrdersKeepsBuyAndSellPostOnlyAfterRepeatedCancellations(t *testing.T) {
 	executor := &recordingExecutor{}

@@ -187,6 +187,13 @@ func (c *Config) Validate() error {
 	if c.Trading.CleanupBatchSize <= 0 {
 		c.Trading.CleanupBatchSize = 10 // 默认10
 	}
+	if c.Trading.OrderCleanupThreshold <= 0 {
+		c.Trading.OrderCleanupThreshold = 100
+	}
+	if c.Trading.BuyWindowSize+c.Trading.SellWindowSize >= c.Trading.OrderCleanupThreshold {
+		return fmt.Errorf("买单窗口(%d)+卖单窗口(%d) 必须小于 order_cleanup_threshold(%d)，否则会反复补单再清理。密网格请先加大阈值（未配置时默认 100），不要把窗口开到阈值以上；旧配置若仍是 50，请同步加大该值",
+			c.Trading.BuyWindowSize, c.Trading.SellWindowSize, c.Trading.OrderCleanupThreshold)
+	}
 	// 注意：price_decimals 和 quantity_decimals 已从配置中移除，现在从交易所自动获取
 	if c.Trading.MinOrderValue <= 0 {
 		c.Trading.MinOrderValue = 20.0 // 默认6U (币安通常最小5U)

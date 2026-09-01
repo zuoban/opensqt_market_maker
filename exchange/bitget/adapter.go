@@ -298,79 +298,24 @@ func (b *BitgetAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Ord
 
 // placeOrderViaREST 通过 REST API 下单
 func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest) (*Order, error) {
-	// 确定 side 和 tradeSide
-	side := strings.ToLower(string(req.Side))
-	var tradeSide string
-
-	// 🔥 Bitget 双向持仓的特殊逻辑：
-	// 开多：side=buy, tradeSide=open
-	// 平多：side=buy, tradeSide=close （注意！平多也是 buy）
-	// 开空：side=sell, tradeSide=open
-	// 平空：side=sell, tradeSide=close
-	if b.posMode == "hedge_mode" {
-		if req.ReduceOnly {
-			// 平仓：保持 side 方向不变，只改 tradeSide
-			// 如果是 SELL（卖出），实际上是要平多仓，需要改为 buy
-			if req.Side == SideSell {
-				side = "buy" // 平多仓必须用 buy
-			} else {
-				side = "sell" // 平空仓必须用 sell
-			}
-			tradeSide = "close"
-		} else {
-			tradeSide = "open"
-		}
+	entry, _, err := b.placeOrderEntry(req)
+	if err != nil {
+		return nil, err
 	}
-
-	// 🔥 使用合约信息中的精度格式化数量和价格
-	quantityStr := fmt.Sprintf("%.*f", b.volumePlace, req.Quantity)
-	priceStr := fmt.Sprintf("%.*f", b.pricePlace, req.Price)
-
-	// 根据 PostOnly 参数选择 force 类型
-	forceType := "gtc" // 默认使用 GTC (Good Till Cancel)
-	if req.PostOnly {
-		forceType = "post_only" // Post Only - 只做 Maker
-	}
-
-	// Bitget V2 下单参数
 	body := map[string]interface{}{
 		"symbol":      req.Symbol,
 		"productType": b.productType,
 		"marginMode":  "crossed",
 		"marginCoin":  "USDT",
-		"side":        side,
-		"orderType":   "limit",
-		"price":       priceStr,
-		"size":        quantityStr,
-		"force":       forceType,
 	}
-
-	// 设置自定义订单ID
-	if req.ClientOrderID != "" {
-		body["clientOid"] = req.ClientOrderID
-	}
-
-	// 双向持仓模式下添加 tradeSide（必须）
-	// 🔥 关键：双向持仓模式下，不能使用 reduceOnly 参数，只能用 tradeSide=close
-	if tradeSide != "" {
-		body["tradeSide"] = tradeSide
-	}
-
-	// 🔥 单向持仓模式下，如果是只减仓，必须使用 reduceOnly 参数
-	// 注意：单向持仓时 tradeSide 参数必须省略，否则会报错
-	if b.posMode != "hedge_mode" && req.ReduceOnly {
-		body["reduceOnly"] = "YES"
+	for key, value := range entry {
+		body[key] = value
 	}
 
 	// 只请求1次，不重试
 	resp, err := b.client.DoRequest(ctx, "POST", "/api/v2/mix/order/place-order", body)
 	if err != nil {
-		classified := classifyBitgetPlacementError(err)
-		// 检查错误类型
-		if strings.Contains(err.Error(), "insufficient balance") || strings.Contains(err.Error(), "40007") {
-			return nil, fmt.Errorf("保证金不足: %w", classified)
-		}
-		return nil, classified
+		return nil, b.wrapPlacementError(err)
 	}
 
 	// 解析响应
@@ -396,9 +341,66 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 			fmt.Errorf("Bitget 下单响应 clientOid=%q，与请求 %q 不一致", data.ClientOrderID, req.ClientOrderID))
 	}
 
+	order := b.newAcceptedOrder(req, orderID, data.ClientOrderID)
+
+	// 注意：不在这里打印日志，由executor统一打印避免重复
+	return order, nil
+}
+
+func (b *BitgetAdapter) placeOrderEntry(req *OrderRequest) (map[string]interface{}, string, error) {
+	if req == nil {
+		return nil, "", exchangeerr.WrapOrderPlacementRejected(fmt.Errorf("订单请求不能为空"))
+	}
+	side := strings.ToLower(string(req.Side))
+	var tradeSide string
+	if b.posMode == "hedge_mode" {
+		if req.ReduceOnly {
+			if req.Side == SideSell {
+				side = "buy"
+			} else {
+				side = "sell"
+			}
+			tradeSide = "close"
+		} else {
+			tradeSide = "open"
+		}
+	}
+
+	forceType := "gtc"
+	if req.PostOnly {
+		forceType = "post_only"
+	}
+	entry := map[string]interface{}{
+		"side":      side,
+		"orderType": "limit",
+		"price":     fmt.Sprintf("%.*f", b.pricePlace, req.Price),
+		"size":      fmt.Sprintf("%.*f", b.volumePlace, req.Quantity),
+		"force":     forceType,
+	}
+	if req.ClientOrderID != "" {
+		entry["clientOid"] = req.ClientOrderID
+	}
+	if tradeSide != "" {
+		entry["tradeSide"] = tradeSide
+	}
+	if b.posMode != "hedge_mode" && req.ReduceOnly {
+		entry["reduceOnly"] = "YES"
+	}
+	return entry, req.ClientOrderID, nil
+}
+
+func (b *BitgetAdapter) wrapPlacementError(err error) error {
+	classified := classifyBitgetPlacementError(err)
+	if err != nil && (strings.Contains(err.Error(), "insufficient balance") || strings.Contains(err.Error(), "40007")) {
+		return fmt.Errorf("保证金不足: %w", classified)
+	}
+	return classified
+}
+
+func (b *BitgetAdapter) newAcceptedOrder(req *OrderRequest, orderID int64, clientOID string) *Order {
 	order := &Order{
 		OrderID:       orderID,
-		ClientOrderID: data.ClientOrderID,
+		ClientOrderID: clientOID,
 		Symbol:        req.Symbol,
 		Side:          req.Side,
 		Type:          req.Type,
@@ -407,9 +409,11 @@ func (b *BitgetAdapter) placeOrderViaREST(ctx context.Context, req *OrderRequest
 		Status:        OrderStatusNew,
 		CreatedAt:     time.Now(),
 	}
-
-	// 注意：不在这里打印日志，由executor统一打印避免重复
-	return order, nil
+	if b.orderMappingCallback != nil && order.OrderID > 0 {
+		b.orderMappingCallback(order.OrderID, req.Price)
+		logger.Debug("🔍 [Bitget映射] 注册 订单ID=%d -> 价格=%.2f", order.OrderID, req.Price)
+	}
+	return order
 }
 
 func classifyBitgetPlacementError(err error) error {
@@ -476,40 +480,6 @@ func hasBitgetDuplicateClientOrderIDMessage(message string) bool {
 	return duplicate && identifier
 }
 
-// BatchPlaceOrders 批量下单
-func (b *BitgetAdapter) BatchPlaceOrders(ctx context.Context, orders []*OrderRequest) ([]*Order, bool) {
-	placedOrders := make([]*Order, 0, len(orders))
-	hasMarginError := false
-
-	for _, orderReq := range orders {
-		order, err := b.PlaceOrder(ctx, orderReq)
-		if err != nil {
-			logger.Warn("⚠️ [Bitget] 下单失败 %.2f %s: %v",
-				orderReq.Price, orderReq.Side, err)
-
-			if strings.Contains(err.Error(), "保证金不足") {
-				hasMarginError = true
-			}
-			continue
-		}
-
-		// 🔥 关键：确保 order.Price 包含请求的价格
-		// 这样调用者就能正确建立 orderID -> price 的映射
-		order.Price = orderReq.Price
-
-		// 🔥 新增：立即注册订单ID到价格的映射
-		// 这样可以防止 WebSocket 更新先到导致找不到槽位
-		if b.orderMappingCallback != nil && order.OrderID > 0 {
-			b.orderMappingCallback(order.OrderID, orderReq.Price)
-			logger.Debug("🔍 [Bitget映射] 注册 订单ID=%d -> 价格=%.2f", order.OrderID, orderReq.Price)
-		}
-
-		placedOrders = append(placedOrders, order)
-	}
-
-	return placedOrders, hasMarginError
-}
-
 // CancelOrder 取消订单
 func (b *BitgetAdapter) CancelOrder(ctx context.Context, symbol string, orderID int64) error {
 	body := map[string]interface{}{
@@ -539,6 +509,8 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 		return nil
 	}
 
+	var cancelErrs []error
+
 	// 🔥 Bitget 批量撤单限制：最多20个，必须传symbol、productType、marginCoin
 	batchSize := 20
 	for i := 0; i < len(orderIDs); i += batchSize {
@@ -553,6 +525,7 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 		if len(batch) == 1 {
 			if err := b.CancelOrder(ctx, symbol, batch[0]); err != nil {
 				logger.Warn("⚠️ [Bitget] 取消订单失败 %d: %v", batch[0], err)
+				cancelErrs = append(cancelErrs, fmt.Errorf("取消 Bitget 订单 %d 失败: %w", batch[0], err))
 			}
 			continue
 		}
@@ -571,17 +544,38 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 			"orderIdList": orderIDStrs,   // 必需：订单ID列表
 		}
 
-		_, err := b.client.DoRequest(ctx, "POST", "/api/v2/mix/order/batch-cancel-orders", body)
+		resp, err := b.client.DoRequest(ctx, "POST", "/api/v2/mix/order/batch-cancel-orders", body)
 		if err != nil {
 			logger.Warn("⚠️ [Bitget] 批量撤单失败 (共%d个): %v", len(batch), err)
+			batchErr := fmt.Errorf("Bitget 批量撤单失败（%d 个）: %w", len(batch), err)
+			if ctx.Err() != nil {
+				cancelErrs = append(cancelErrs, batchErr)
+				return errors.Join(cancelErrs...)
+			}
+
 			// 失败时尝试单个撤单
 			logger.Info("🔄 [Bitget] 改为逐个撤单...")
-			for _, orderID := range batch {
-				_ = b.CancelOrder(ctx, symbol, orderID)
-				time.Sleep(100 * time.Millisecond) // 避免限频
+			var fallbackErrs []error
+			for index, orderID := range batch {
+				if fallbackErr := b.CancelOrder(ctx, symbol, orderID); fallbackErr != nil {
+					fallbackErrs = append(fallbackErrs, fmt.Errorf("Bitget 批量撤单回退取消订单 %d 失败: %w", orderID, fallbackErr))
+				}
+				if index < len(batch)-1 {
+					time.Sleep(100 * time.Millisecond) // 避免限频
+				}
+			}
+			if len(fallbackErrs) > 0 {
+				cancelErrs = append(cancelErrs, batchErr)
+				cancelErrs = append(cancelErrs, fallbackErrs...)
 			}
 		} else {
-			logger.Info("✅ [Bitget] 批量撤单成功: %d 个订单", len(batch))
+			successCount, notFoundCount, resultErr := validateBitgetBatchCancelResult(resp.Data, orderIDStrs)
+			if resultErr != nil {
+				logger.Warn("⚠️ [Bitget] 批量撤单结果不完整: %v", resultErr)
+				cancelErrs = append(cancelErrs, resultErr)
+			} else {
+				logger.Info("✅ [Bitget] 批量撤单成功: %d 个订单（已不存在 %d 个）", successCount, notFoundCount)
+			}
 		}
 
 		// 避免限频
@@ -590,7 +584,86 @@ func (b *BitgetAdapter) BatchCancelOrders(ctx context.Context, symbol string, or
 		}
 	}
 
-	return nil
+	return errors.Join(cancelErrs...)
+}
+
+func validateBitgetBatchCancelResult(data json.RawMessage, requestedOrderIDs []string) (int, int, error) {
+	var result struct {
+		SuccessList []struct {
+			OrderID string `json:"orderId"`
+		} `json:"successList"`
+		FailureList []struct {
+			OrderID   string `json:"orderId"`
+			ErrorCode string `json:"errorCode"`
+			ErrorMsg  string `json:"errorMsg"`
+		} `json:"failureList"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return 0, 0, fmt.Errorf("解析 Bitget 批量撤单响应失败: %w", err)
+	}
+
+	requested := make(map[string]struct{}, len(requestedOrderIDs))
+	for _, orderID := range requestedOrderIDs {
+		requested[orderID] = struct{}{}
+	}
+	covered := make(map[string]struct{}, len(requestedOrderIDs))
+	var resultErrs []error
+	successCount := 0
+	notFoundCount := 0
+
+	markCovered := func(orderID, listName string) bool {
+		orderID = strings.TrimSpace(orderID)
+		if orderID == "" {
+			resultErrs = append(resultErrs, fmt.Errorf("Bitget 批量撤单 %s 缺少订单 ID", listName))
+			return false
+		}
+		if _, ok := requested[orderID]; !ok {
+			resultErrs = append(resultErrs, fmt.Errorf("Bitget 批量撤单 %s 返回未请求的订单 %s", listName, orderID))
+			return false
+		}
+		if _, duplicate := covered[orderID]; duplicate {
+			resultErrs = append(resultErrs, fmt.Errorf("Bitget 批量撤单重复返回订单 %s", orderID))
+			return false
+		}
+		covered[orderID] = struct{}{}
+		return true
+	}
+
+	for _, succeeded := range result.SuccessList {
+		if markCovered(succeeded.OrderID, "successList") {
+			successCount++
+		}
+	}
+	for _, failed := range result.FailureList {
+		if !markCovered(failed.OrderID, "failureList") {
+			continue
+		}
+		if bitgetCancelResultIsNotFound(failed.ErrorCode, failed.ErrorMsg) {
+			notFoundCount++
+			continue
+		}
+		reason := strings.TrimSpace(strings.TrimSpace(failed.ErrorCode) + " " + strings.TrimSpace(failed.ErrorMsg))
+		if reason == "" {
+			reason = "响应未提供失败原因"
+		}
+		resultErrs = append(resultErrs, fmt.Errorf("Bitget 取消订单 %s 失败: %s", failed.OrderID, reason))
+	}
+	for _, orderID := range requestedOrderIDs {
+		if _, ok := covered[orderID]; ok {
+			continue
+		}
+		resultErrs = append(resultErrs, fmt.Errorf("Bitget 批量撤单响应缺少订单 %s 的结果", orderID))
+	}
+
+	return successCount, notFoundCount, errors.Join(resultErrs...)
+}
+
+func bitgetCancelResultIsNotFound(code, message string) bool {
+	if strings.TrimSpace(code) == "40029" {
+		return true
+	}
+	message = strings.ToLower(message)
+	return strings.Contains(message, "order does not exist") || strings.Contains(message, "not found")
 }
 
 // CancelAllOrders 一键全撤所有订单（Bitget特有功能）
@@ -963,41 +1036,18 @@ func (b *BitgetAdapter) StartOrderStream(ctx context.Context, callback func(inte
 
 	// 转换回调函数
 	wrappedCallback := func(update interface{}) {
-		// 如果是 *OrderUpdate 指针类型，转换为通用结构体
-		if localUpdate, ok := update.(*OrderUpdate); ok {
+		switch localUpdate := update.(type) {
+		case *OrderUpdate:
+			if localUpdate == nil {
+				logger.Warn("⚠️ [Bitget Adapter] 订单更新为空指针")
+				return
+			}
 			logger.Debug("🔍 [Bitget Adapter] 订单更新回调触发: ID=%d, ClientOID=%s, Status=%s",
 				localUpdate.OrderID, localUpdate.ClientOrderID, string(localUpdate.Status))
-			genericUpdate := struct {
-				OrderID                int64
-				ClientOrderID          string
-				Symbol                 string
-				Side                   string
-				Type                   string
-				Status                 string
-				Price                  float64
-				Quantity               float64
-				ExecutedQty            float64
-				AvgPrice               float64
-				UpdateTime             int64
-				RealizedPNL            float64
-				RealizedPNLIncremental bool
-			}{
-				OrderID:                localUpdate.OrderID,
-				ClientOrderID:          localUpdate.ClientOrderID, // 🔥 关键：传递 ClientOrderID
-				Symbol:                 localUpdate.Symbol,
-				Side:                   string(localUpdate.Side),
-				Type:                   string(localUpdate.Type),
-				Status:                 string(localUpdate.Status),
-				Price:                  localUpdate.Price,
-				Quantity:               localUpdate.Quantity,
-				ExecutedQty:            localUpdate.ExecutedQty,
-				AvgPrice:               localUpdate.AvgPrice,
-				UpdateTime:             localUpdate.UpdateTime,
-				RealizedPNL:            localUpdate.RealizedPNL,
-				RealizedPNLIncremental: localUpdate.RealizedPNLIncremental,
-			}
-			callback(genericUpdate)
-		} else {
+			callback(*localUpdate)
+		case OrderUpdate:
+			callback(localUpdate)
+		default:
 			logger.Warn("⚠️ [Bitget Adapter] 订单更新类型断言失败: %T", update)
 		}
 	}
