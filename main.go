@@ -563,6 +563,16 @@ func (a *positionExchangeAdapter) GetOrder(ctx context.Context, symbol string, o
 	return a.exchange.GetOrder(ctx, symbol, orderID)
 }
 
+func (a *positionExchangeAdapter) GetOrderByClientID(ctx context.Context, symbol, clientOrderID string) (interface{}, error) {
+	lookup, ok := a.exchange.(interface {
+		GetOrderByClientID(context.Context, string, string) (*exchange.Order, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("交易所不支持按 ClientOrderID 查询")
+	}
+	return lookup.GetOrderByClientID(ctx, symbol, clientOrderID)
+}
+
 func (a *positionExchangeAdapter) GetBaseAsset() string {
 	return a.exchange.GetBaseAsset()
 }

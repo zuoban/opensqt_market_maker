@@ -2,6 +2,7 @@ package safety
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +60,18 @@ type reconcileTestSlot struct {
 type reconcileTestPM struct {
 	slots          []reconcileTestSlot
 	reconcileCount int64
+}
+
+type resolvingReconcileTestPM struct {
+	*reconcileTestPM
+	remaining int
+	err       error
+	calls     int
+}
+
+func (p *resolvingReconcileTestPM) ResolvePendingOrders(context.Context) (int, error) {
+	p.calls++
+	return p.remaining, p.err
 }
 
 func (p *reconcileTestPM) IterateSlots(fn func(float64, SlotInfo) bool) {
@@ -390,5 +403,25 @@ func TestReconcilerDoesNotTreatPendingSlotAsHealthy(t *testing.T) {
 	}
 	if r.IsHealthy() {
 		t.Fatal("pending slot was marked healthy")
+	}
+}
+
+func TestReconcilerRunsPendingRecoveryBeforeRemoteSnapshot(t *testing.T) {
+	pm := &resolvingReconcileTestPM{
+		reconcileTestPM: &reconcileTestPM{},
+		remaining:       1,
+	}
+	ex := &reconcileTestExchange{
+		posErr: errors.New("remote snapshot should not run"),
+	}
+	cfg := &config.Config{}
+	cfg.Trading.Symbol = "ETHUSDT"
+	r := NewReconciler(cfg, ex, pm)
+	err := r.Reconcile()
+	if err == nil || !strings.Contains(err.Error(), "正在提交订单") {
+		t.Fatalf("Reconcile() error = %v, want pending recovery result", err)
+	}
+	if pm.calls != 1 {
+		t.Fatalf("ResolvePendingOrders calls = %d, want 1", pm.calls)
 	}
 }

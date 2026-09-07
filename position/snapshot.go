@@ -27,7 +27,20 @@ type SlotSnapshot struct {
 	CatchUp                    bool      `json:"catchUp"`
 	InBuyWindow                bool      `json:"inBuyWindow"`
 	InSellWindow               bool      `json:"inSellWindow"`
+	WaitState                  string    `json:"waitState"`
+	RetryNotBefore             time.Time `json:"retryNotBefore"`
+	RetryRemainingS            float64   `json:"retryRemainingSec"`
 }
+
+const (
+	SlotWaitStateActive              = "ACTIVE"
+	SlotWaitStatePendingConfirmation = "PENDING_CONFIRMATION"
+	SlotWaitStateCancelConfirmation  = "CANCEL_CONFIRMATION"
+	SlotWaitStateRetryCooldown       = "RETRY_COOLDOWN"
+	SlotWaitStateLockedInconsistent  = "LOCKED_INCONSISTENT"
+	SlotWaitStatePosition            = "POSITION"
+	SlotWaitStateEmpty               = "EMPTY"
+)
 
 type MakerExecutionSnapshot struct {
 	Attempts         uint64 `json:"attempts"`
@@ -41,42 +54,74 @@ type MakerExecutionSnapshot struct {
 
 // PositionSnapshot 仓位管理器只读快照
 type PositionSnapshot struct {
-	Initialized          bool                   `json:"initialized"`
-	Symbol               string                 `json:"symbol"`
-	BaseAsset            string                 `json:"baseAsset"`
-	AnchorPrice          float64                `json:"anchorPrice"`
-	LastPrice            float64                `json:"lastPrice"`
-	GridPrice            float64                `json:"gridPrice"`
-	PriceDecimals        int                    `json:"priceDecimals"`
-	QuantityDecimals     int                    `json:"quantityDecimals"`
-	PriceInterval        float64                `json:"priceInterval"`
-	OrderQuantity        float64                `json:"orderQuantity"`
-	BuyWindowSize        int                    `json:"buyWindowSize"`
-	SellWindowSize       int                    `json:"sellWindowSize"`
-	BuyWindowPrices      []float64              `json:"buyWindowPrices"`
-	SellWindowPrices     []float64              `json:"sellWindowPrices"`
-	Slots                []SlotSnapshot         `json:"slots"`
-	FilledOrders         []FilledOrderRecord    `json:"filledOrders"`
-	FilledHourly         []HourlyFillBucket     `json:"filledHourly"`
-	FilledOrderCount     int64                  `json:"filledOrderCount"`
-	FilledSlotCount      int                    `json:"filledSlotCount"`
-	PositionQty          float64                `json:"positionQty"`
-	PositionValue        float64                `json:"positionValue"`
-	ActiveBuyOrders      int                    `json:"activeBuyOrders"`
-	ActiveSellOrders     int                    `json:"activeSellOrders"`
-	TotalBuyQty          float64                `json:"totalBuyQty"`
-	TotalSellQty         float64                `json:"totalSellQty"`
-	EstimatedProfit      float64                `json:"estimatedProfit"`
-	RealizedPNL          float64                `json:"realizedPnl"`
-	ReconcileCount       int64                  `json:"reconcileCount"`
-	LastReconcileTime    time.Time              `json:"lastReconcileTime"`
-	MarginLocked         bool                   `json:"marginLocked"`
-	MarginLockRemainingS float64                `json:"marginLockRemainingSec"`
-	MakerExecution       MakerExecutionSnapshot `json:"makerExecution"`
+	Initialized            bool                   `json:"initialized"`
+	Symbol                 string                 `json:"symbol"`
+	BaseAsset              string                 `json:"baseAsset"`
+	AnchorPrice            float64                `json:"anchorPrice"`
+	LastPrice              float64                `json:"lastPrice"`
+	GridPrice              float64                `json:"gridPrice"`
+	PriceDecimals          int                    `json:"priceDecimals"`
+	QuantityDecimals       int                    `json:"quantityDecimals"`
+	PriceInterval          float64                `json:"priceInterval"`
+	OrderQuantity          float64                `json:"orderQuantity"`
+	BuyWindowSize          int                    `json:"buyWindowSize"`
+	SellWindowSize         int                    `json:"sellWindowSize"`
+	BuyWindowPrices        []float64              `json:"buyWindowPrices"`
+	SellWindowPrices       []float64              `json:"sellWindowPrices"`
+	Slots                  []SlotSnapshot         `json:"slots"`
+	FilledOrders           []FilledOrderRecord    `json:"filledOrders"`
+	FilledHourly           []HourlyFillBucket     `json:"filledHourly"`
+	FilledOrderCount       int64                  `json:"filledOrderCount"`
+	FilledSlotCount        int                    `json:"filledSlotCount"`
+	PositionQty            float64                `json:"positionQty"`
+	PositionValue          float64                `json:"positionValue"`
+	ActiveBuyOrders        int                    `json:"activeBuyOrders"`
+	ActiveSellOrders       int                    `json:"activeSellOrders"`
+	TotalBuyQty            float64                `json:"totalBuyQty"`
+	TotalSellQty           float64                `json:"totalSellQty"`
+	EstimatedProfit        float64                `json:"estimatedProfit"`
+	RealizedPNL            float64                `json:"realizedPnl"`
+	ReconcileCount         int64                  `json:"reconcileCount"`
+	LastReconcileTime      time.Time              `json:"lastReconcileTime"`
+	MarginLocked           bool                   `json:"marginLocked"`
+	MarginLockRemainingS   float64                `json:"marginLockRemainingSec"`
+	MakerExecution         MakerExecutionSnapshot `json:"makerExecution"`
+	PendingOrderCount      int                    `json:"pendingOrderCount"`
+	CancelingOrderCount    int                    `json:"cancelingOrderCount"`
+	CoolingSlotCount       int                    `json:"coolingSlotCount"`
+	InconsistentSlotCount  int                    `json:"inconsistentSlotCount"`
+	OrderCapacityUsed      int                    `json:"orderCapacityUsed"`
+	OrderCapacityLimit     int                    `json:"orderCapacityLimit"`
+	OrderCapacityRemaining int                    `json:"orderCapacityRemaining"`
 }
 
 func isActiveOrderStatus(status string) bool {
 	return status == OrderStatusPlaced || status == OrderStatusConfirmed || status == OrderStatusPartiallyFilled
+}
+
+func slotWaitStateLocked(slot *InventorySlot, now time.Time) string {
+	if slot == nil {
+		return SlotWaitStateEmpty
+	}
+	if slot.OrderStatus == OrderStatusCancelRequested {
+		return SlotWaitStateCancelConfirmation
+	}
+	if slot.SlotStatus == SlotStatusPending {
+		return SlotWaitStatePendingConfirmation
+	}
+	if !slot.placementRetryNotBefore.IsZero() && now.Before(slot.placementRetryNotBefore) {
+		return SlotWaitStateRetryCooldown
+	}
+	if isActiveOrderStatus(slot.OrderStatus) {
+		return SlotWaitStateActive
+	}
+	if slot.SlotStatus == SlotStatusLocked || slot.OrderID != 0 || slot.ClientOID != "" {
+		return SlotWaitStateLockedInconsistent
+	}
+	if slot.PositionStatus == PositionStatusFilled && slot.PositionQty > 0 {
+		return SlotWaitStatePosition
+	}
+	return SlotWaitStateEmpty
 }
 
 func snapshotSlotVisible(item SlotSnapshot, gridPrice float64, priceDecimals int) bool {
@@ -124,6 +169,7 @@ func (spm *SuperPositionManager) MarginLockRemaining() time.Duration {
 
 // Snapshot 拷贝当前槽位与汇总，持锁期间只读字段，不做序列化。
 func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
+	now := time.Now()
 	spm.mu.RLock()
 	snap := PositionSnapshot{
 		Initialized:      spm.isInitialized.Load(),
@@ -146,6 +192,10 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		snap.OrderQuantity = spm.config.Trading.OrderQuantity
 		snap.BuyWindowSize = spm.config.Trading.BuyWindowSize
 		snap.SellWindowSize = spm.config.Trading.SellWindowSize
+		snap.OrderCapacityLimit = spm.config.Trading.OrderCleanupThreshold
+		if snap.OrderCapacityLimit <= 0 {
+			snap.OrderCapacityLimit = 100
+		}
 	}
 	if spm.exchange != nil {
 		snap.BaseAsset = spm.exchange.GetBaseAsset()
@@ -156,7 +206,7 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	for i := range spm.filledOrders {
 		snap.FilledOrders[len(spm.filledOrders)-1-i] = spm.filledOrders[i]
 	}
-	snap.FilledHourly = spm.hourlyFillSnapshotLocked(time.Now())
+	snap.FilledHourly = spm.hourlyFillSnapshotLocked(now)
 	snap.FilledOrderCount = spm.filledOrderCount
 	spm.filledOrdersMu.RUnlock()
 
@@ -195,6 +245,7 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	slots := make([]SlotSnapshot, 0, 32)
 	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
+		waitState := slotWaitStateLocked(slot, now)
 		item := SlotSnapshot{
 			Price:                      price,
 			PriceText:                  formatPrice(price, snap.PriceDecimals),
@@ -213,8 +264,16 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 			MakerGuardSkipCount:        slot.MakerGuardSkipCount,
 			TotalPostOnlyRejects:       slot.TotalPostOnlyRejects,
 			ConsecutivePostOnlyRejects: slot.ConsecutivePostOnlyRejects,
+			WaitState:                  waitState,
+			RetryNotBefore:             slot.placementRetryNotBefore,
 			CatchUp: slot.OrderSide == "BUY" && slot.OrderPrice > 0 &&
 				slot.OrderPrice < price-fillQtyTolerance,
+		}
+		if !slot.placementRetryNotBefore.IsZero() && now.Before(slot.placementRetryNotBefore) {
+			item.RetryRemainingS = slot.placementRetryNotBefore.Sub(now).Seconds()
+		}
+		if orderMayExistLocked(slot) {
+			snap.OrderCapacityUsed++
 		}
 		slot.mu.RUnlock()
 
@@ -235,6 +294,16 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 				snap.ActiveSellOrders++
 			}
 		}
+		switch item.WaitState {
+		case SlotWaitStatePendingConfirmation:
+			snap.PendingOrderCount++
+		case SlotWaitStateCancelConfirmation:
+			snap.CancelingOrderCount++
+		case SlotWaitStateRetryCooldown:
+			snap.CoolingSlotCount++
+		case SlotWaitStateLockedInconsistent:
+			snap.InconsistentSlotCount++
+		}
 		if snapshotSlotVisible(item, snap.GridPrice, snap.PriceDecimals) {
 			slots = append(slots, item)
 		}
@@ -245,6 +314,10 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		return slots[i].Price > slots[j].Price
 	})
 	snap.Slots = slots
+	snap.OrderCapacityRemaining = snap.OrderCapacityLimit - snap.OrderCapacityUsed
+	if snap.OrderCapacityRemaining < 0 {
+		snap.OrderCapacityRemaining = 0
+	}
 	if lastPrice > 0 && snap.PositionQty > 0 {
 		snap.PositionValue = snap.PositionQty * lastPrice
 	}

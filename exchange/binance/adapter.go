@@ -704,6 +704,24 @@ func (b *BinanceAdapter) GetOrder(ctx context.Context, symbol string, orderID in
 	return orderFromBinance(order)
 }
 
+// GetOrderByClientID 按策略原始 ClientOrderID 查询订单。Binance 实际保存的是
+// 带返佣前缀的 ID，因此查询前先去前缀再规范化添加一次，避免重复前缀。
+func (b *BinanceAdapter) GetOrderByClientID(ctx context.Context, symbol, clientOrderID string) (*Order, error) {
+	clientOrderID = strings.TrimSpace(clientOrderID)
+	if clientOrderID == "" {
+		return nil, fmt.Errorf("Binance ClientOrderID 不能为空")
+	}
+	brokerClientOrderID := utils.AddBinanceBrokerPrefix(utils.RemoveBinanceBrokerPrefix(clientOrderID))
+	order, err := b.confirmOrderByClientIDWithContext(ctx, symbol, brokerClientOrderID)
+	if err != nil {
+		if isBinanceAPIErrorCode(err, -2013) {
+			return nil, fmt.Errorf("%w: ClientOrderID=%s", exchangeerr.ErrOrderNotFound, clientOrderID)
+		}
+		return nil, err
+	}
+	return order, nil
+}
+
 // GetOpenOrders 查询未完成订单
 func (b *BinanceAdapter) GetOpenOrders(ctx context.Context, symbol string) ([]*Order, error) {
 	orders, err := b.client.NewListOpenOrdersService().

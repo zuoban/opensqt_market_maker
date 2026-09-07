@@ -373,6 +373,19 @@
         return status === "PLACED" || status === "CONFIRMED" || status === "PARTIALLY_FILLED";
     }
 
+    function slotWaitState(slot) {
+        if (slot.waitState) return slot.waitState;
+        if (slot.orderStatus === "CANCEL_REQUESTED") return "CANCEL_CONFIRMATION";
+        if (slot.slotStatus === "PENDING") return "PENDING_CONFIRMATION";
+        if (Number(slot.retryRemainingSec || 0) > 0) return "RETRY_COOLDOWN";
+        if (isActive(slot.orderStatus)) return "ACTIVE";
+        if (slot.slotStatus === "LOCKED" || Number(slot.orderId || 0) !== 0 || slot.clientOid) {
+            return "LOCKED_INCONSISTENT";
+        }
+        if (slot.positionStatus === "FILLED" && Number(slot.positionQty || 0) > 0) return "POSITION";
+        return "EMPTY";
+    }
+
     function setConnectionState(state, label) {
         const pill = $("wsPill");
         connectionClasses.forEach((name) => pill.classList.remove(name));
@@ -676,7 +689,21 @@
             ),
             metric("网格 / 间距", fmt(pos.gridPrice, dec) + " / " + fmt(pos.priceInterval, dec)),
             metric("每单金额", fmt(pos.orderQuantity || app.orderQuantity) + " " + quote),
-            metric("窗口 买 / 卖", (pos.buyWindowSize || 0) + " / " + (pos.sellWindowSize || 0))
+            metric("窗口 买 / 卖", (pos.buyWindowSize || 0) + " / " + (pos.sellWindowSize || 0)),
+            metric(
+                "槽位等待",
+                "确认 " + safeCount(pos.pendingOrderCount) + " / 撤单 " + safeCount(pos.cancelingOrderCount) +
+                    " / 冷却 " + safeCount(pos.coolingSlotCount),
+                safeCount(pos.inconsistentSlotCount) > 0 ? "warn" : "",
+                safeCount(pos.inconsistentSlotCount) > 0 ? "另有 " + safeCount(pos.inconsistentSlotCount) + " 个状态异常" : "非空闲槽位不会再显示为空网格"
+            ),
+            metric(
+                "订单容量",
+                safeCount(pos.orderCapacityUsed) + " / " + safeCount(pos.orderCapacityLimit) +
+                    " · 剩余 " + safeCount(pos.orderCapacityRemaining),
+                safeCount(pos.orderCapacityRemaining) === 0 && safeCount(pos.orderCapacityLimit) > 0 ? "warn" : "",
+                "包含活跃、待确认与撤单中的订单"
+            )
         ];
 
         updateSection("primary-kpis", primaryItems, () => renderMetrics($("kpis"), primaryItems));
@@ -715,6 +742,11 @@
         if (value === undefined || value === null || value === "") return null;
         const number = Number(value);
         return Number.isFinite(number) ? number : null;
+    }
+
+    function safeCount(value) {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
     }
 
     function clamp(value, min, max) {
@@ -909,14 +941,27 @@
             const hasPosition = slot.positionStatus === "FILLED" && Number(slot.positionQty || 0) > 0;
             const hasBuy = slot.orderSide === "BUY" && isActive(slot.orderStatus);
             const hasSell = slot.orderSide === "SELL" && isActive(slot.orderStatus);
+            const waitState = slotWaitState(slot);
+            const hasPending = waitState === "PENDING_CONFIRMATION";
+            const hasCanceling = waitState === "CANCEL_CONFIRMATION";
+            const hasCooling = waitState === "RETRY_COOLDOWN";
+            const hasInconsistent = waitState === "LOCKED_INCONSISTENT";
             const markers = [];
             if (isGrid) markers.push("G");
             if (hasBuy) markers.push("B");
             if (hasSell) markers.push("S");
             if (hasPosition) markers.push("P");
+            if (hasPending) markers.push("Q");
+            if (hasCanceling) markers.push("C");
+            if (hasCooling) markers.push("R");
+            if (hasInconsistent) markers.push("!");
 
             let kind = "outside";
-            if (isGrid) kind = "grid";
+            if (hasInconsistent) kind = "inconsistent";
+            else if (hasCanceling) kind = "canceling";
+            else if (hasPending) kind = "pending";
+            else if (hasCooling) kind = "cooling";
+            else if (isGrid) kind = "grid";
             else if (hasSell) kind = "sell";
             else if (hasPosition) kind = "position";
             else if (hasBuy) kind = "buy";
@@ -931,9 +976,15 @@
                 hasBuy,
                 hasSell,
                 hasPosition,
+                hasPending,
+                hasCanceling,
+                hasCooling,
+                hasInconsistent,
+                waitState,
                 inWindow,
                 orderQuantity: (hasBuy || hasSell) && orderValue > 0 ? orderValue / price : 0,
                 positionQuantity: Number(slot.positionQty || 0),
+                retryRemainingSec: Number(slot.retryRemainingSec || 0),
                 slot
             });
         });
@@ -951,12 +1002,27 @@
         const lastPrice = latest ? latest.close : 0;
         const keyLevels = selectKeyLevels(split.visible, lastPrice);
         const folded = foldEdgeLevels(split.visible, keyLevels, focused.priceMin, focused.priceMax);
-        const execution = levels.reduce((result, level) => {
+        const levelExecution = levels.reduce((result, level) => {
             if (level.hasBuy) result.buy += 1;
             if (level.hasSell) result.sell += 1;
             if (level.hasPosition) result.position += 1;
+            if (level.hasPending) result.pending += 1;
+            if (level.hasCanceling) result.canceling += 1;
+            if (level.hasCooling) result.cooling += 1;
+            if (level.hasInconsistent) result.inconsistent += 1;
             return result;
-        }, { buy: 0, sell: 0, position: 0 });
+        }, { buy: 0, sell: 0, position: 0, pending: 0, canceling: 0, cooling: 0, inconsistent: 0 });
+        const aggregateCount = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+        const execution = {
+            ...levelExecution,
+            pending: aggregateCount(pos.pendingOrderCount, levelExecution.pending),
+            canceling: aggregateCount(pos.cancelingOrderCount, levelExecution.canceling),
+            cooling: aggregateCount(pos.coolingSlotCount, levelExecution.cooling),
+            inconsistent: aggregateCount(pos.inconsistentSlotCount, levelExecution.inconsistent),
+            capacityUsed: aggregateCount(pos.orderCapacityUsed, 0),
+            capacityLimit: aggregateCount(pos.orderCapacityLimit, 0),
+            capacityRemaining: aggregateCount(pos.orderCapacityRemaining, 0)
+        };
         return {
             interval: kline.interval || "5m",
             historyReady: Boolean(kline.historyReady),
@@ -1010,6 +1076,10 @@
         add((levels || []).find((level) => level.isGrid));
         let nearestBuy = null;
         let nearestSell = null;
+        let nearestPending = null;
+        let nearestCanceling = null;
+        let nearestCooling = null;
+        let nearestInconsistent = null;
         (levels || []).forEach((level) => {
             if (level.hasBuy && (!nearestBuy || Math.abs(level.price - lastPrice) < Math.abs(nearestBuy.price - lastPrice))) {
                 nearestBuy = level;
@@ -1017,9 +1087,17 @@
             if (level.hasSell && (!nearestSell || Math.abs(level.price - lastPrice) < Math.abs(nearestSell.price - lastPrice))) {
                 nearestSell = level;
             }
+            if (level.hasPending && (!nearestPending || Math.abs(level.price - lastPrice) < Math.abs(nearestPending.price - lastPrice))) nearestPending = level;
+            if (level.hasCanceling && (!nearestCanceling || Math.abs(level.price - lastPrice) < Math.abs(nearestCanceling.price - lastPrice))) nearestCanceling = level;
+            if (level.hasCooling && (!nearestCooling || Math.abs(level.price - lastPrice) < Math.abs(nearestCooling.price - lastPrice))) nearestCooling = level;
+            if (level.hasInconsistent && (!nearestInconsistent || Math.abs(level.price - lastPrice) < Math.abs(nearestInconsistent.price - lastPrice))) nearestInconsistent = level;
         });
         add(nearestBuy);
         add(nearestSell);
+        add(nearestPending);
+        add(nearestCanceling);
+        add(nearestCooling);
+        add(nearestInconsistent);
         return keys;
     }
 
@@ -1064,9 +1142,17 @@
             current.hasBuy = current.hasBuy || level.hasBuy;
             current.hasSell = current.hasSell || level.hasSell;
             current.hasPosition = current.hasPosition || level.hasPosition;
+            current.hasPending = current.hasPending || level.hasPending;
+            current.hasCanceling = current.hasCanceling || level.hasCanceling;
+            current.hasCooling = current.hasCooling || level.hasCooling;
+            current.hasInconsistent = current.hasInconsistent || level.hasInconsistent;
             current.isGrid = current.isGrid || level.isGrid;
             current.inWindow = current.inWindow || level.inWindow;
-            if (current.isGrid) current.kind = "grid";
+            if (current.hasInconsistent) current.kind = "inconsistent";
+            else if (current.hasCanceling) current.kind = "canceling";
+            else if (current.hasPending) current.kind = "pending";
+            else if (current.hasCooling) current.kind = "cooling";
+            else if (current.isGrid) current.kind = "grid";
             else if (current.hasSell) current.kind = "sell";
             else if (current.hasPosition) current.kind = "position";
             else if (current.hasBuy) current.kind = "buy";
@@ -1122,7 +1208,10 @@
             " · 最新 " + fmt(latest.close, decimals) +
             " · 显示区间 " + fmt(chartModel.priceMin, decimals) + "–" + fmt(chartModel.priceMax, decimals) +
             " · " + direction + " " + fmtSigned(chartModel.changePct, 2) + "%" +
-            " · 网格层 " + chartModel.levels.length + degradedText;
+            " · 网格层 " + chartModel.levels.length +
+            " · 待确认 " + chartModel.execution.pending +
+            " · 撤单中 " + chartModel.execution.canceling +
+            " · 冷却 " + chartModel.execution.cooling + degradedText;
         setText($("klineSummary"), summary);
         $("klineCanvas").setAttribute("aria-label", summary + "。可使用左右方向键或两侧按钮逐根查看。");
         renderKlineStats(chartModel, decimals);
@@ -1148,7 +1237,8 @@
         setText($("klineRange"), fmt(model.candleLow, decimals) + " – " + fmt(model.candleHigh, decimals));
         setText(
             $("klineExecution"),
-            "B " + model.execution.buy + " · S " + model.execution.sell + " · P " + model.execution.position
+            "B" + model.execution.buy + " S" + model.execution.sell +
+                " · 待" + model.execution.pending + " 撤" + model.execution.canceling + " 冷" + model.execution.cooling
         );
     }
 
@@ -1333,6 +1423,10 @@
             sell: color("--sell", "#3ee0a4"),
             position: color("--cyan", "#5ec6ff"),
             grid: color("--warn", "#f0c15a"),
+            pending: color("--warn", "#f0c15a"),
+            canceling: color("--negative", "#ff7a73"),
+            cooling: color("--cyan", "#5ec6ff"),
+            inconsistent: color("--ink", "#eef4f1"),
             surface: color("--surface", "#0d1214"),
             rail: color("--plot-rail", "rgba(8,12,14,.55)"),
             labelBg: color("--plot-label", "rgba(8,12,14,.9)")
@@ -1526,6 +1620,10 @@
                 sell: [colors.sell, [], 1, 0.68],
                 position: [colors.position, [2, 4], 1, 0.72],
                 buy: [colors.buy, [7, 5], 1, 0.68],
+                pending: [colors.pending, [5, 4], 1.35, 0.86],
+                canceling: [colors.canceling, [10, 4, 2, 4], 1.35, 0.88],
+                cooling: [colors.cooling, [2, 4], 1.15, 0.72],
+                inconsistent: [colors.inconsistent, [1, 3], 1.6, 0.92],
                 empty: [colors.mutedSoft, [2, 6], 1, 0.32],
                 outside: [colors.mutedSoft, [1, 7], 1, 0.18]
             }[level.kind];
@@ -1568,7 +1666,10 @@
             }
         }
         labelItems.forEach((item) => {
-            const label = item.level.markers.join("·") + " " + compactPrice(item.level.price);
+            const retryText = item.level.hasCooling && item.level.retryRemainingSec > 0
+                ? " · " + Math.ceil(item.level.retryRemainingSec * 10) / 10 + "s"
+                : "";
+            const label = item.level.markers.join("·") + " " + compactPrice(item.level.price) + retryText;
             const labelWidth = Math.max(42, geometry.railRight - geometry.railLeft - 2);
             const x = geometry.railLeft;
             ctx.save();
@@ -1594,7 +1695,7 @@
     }
 
     function overflowChipText(levels, atTop, compact) {
-        const counts = { B: 0, S: 0, P: 0, G: 0 };
+        const counts = { B: 0, S: 0, P: 0, G: 0, Q: 0, C: 0, R: 0, "!": 0 };
         levels.forEach((level) => {
             (level.markers || []).forEach((marker) => {
                 if (counts[marker] != null) counts[marker] += 1;
@@ -1612,11 +1713,19 @@
             if (counts.P && counts.P !== counts.S) parts.push("P" + counts.P);
             if (counts.B) parts.push("B" + counts.B);
         }
+        if (counts.Q) parts.push("Q" + counts.Q);
+        if (counts.C) parts.push("C" + counts.C);
+        if (counts.R) parts.push("R" + counts.R);
+        if (counts["!"]) parts.push("!" + counts["!"]);
         if (counts.G) parts.push("G");
         return (atTop ? "上 " : "下 ") + (parts.join("·") || String(levels.length));
     }
 
     function overflowChipColor(levels, colors) {
+        if (levels.some((level) => level.hasInconsistent)) return colors.inconsistent;
+        if (levels.some((level) => level.hasCanceling)) return colors.canceling;
+        if (levels.some((level) => level.hasPending)) return colors.pending;
+        if (levels.some((level) => level.hasCooling)) return colors.cooling;
         if (levels.some((level) => level.hasSell)) return colors.sell;
         if (levels.some((level) => level.hasBuy)) return colors.buy;
         if (levels.some((level) => level.hasPosition)) return colors.position;

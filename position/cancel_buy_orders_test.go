@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"opensqt/exchange/exchangeerr"
 	"opensqt/utils"
 )
 
@@ -49,6 +50,17 @@ type cancelBuyTestExchange struct {
 
 type binanceCancelBuyTestExchange struct {
 	*cancelBuyTestExchange
+}
+
+type lookupCancelBuyTestExchange struct {
+	*cancelBuyTestExchange
+	lookupErr   error
+	lookupCalls int
+}
+
+func (e *lookupCancelBuyTestExchange) GetOrderByClientID(context.Context, string, string) (interface{}, error) {
+	e.lookupCalls++
+	return nil, e.lookupErr
 }
 
 func (e *binanceCancelBuyTestExchange) GetName() string { return "Binance" }
@@ -222,6 +234,37 @@ func TestCancelAllBuyOrdersKeepsUnknownReservationWithoutTerminalEvidence(t *tes
 		slot.OrderStatus != OrderStatusCancelRequested {
 		t.Fatalf("UNKNOWN reservation was unsafely released: id=%d client=%q slot=%s status=%s",
 			slot.OrderID, slot.ClientOID, slot.SlotStatus, slot.OrderStatus)
+	}
+}
+
+func TestCancelAllBuyOrdersReleasesUnknownAfterRepeatedExplicitAbsence(t *testing.T) {
+	executor := &cancelBuyTestExecutor{}
+	baseExchange := &cancelBuyTestExchange{openOrders: []*cancelBuyTestOrder{}}
+	exchange := &lookupCancelBuyTestExchange{
+		cancelBuyTestExchange: baseExchange,
+		lookupErr:             exchangeerr.ErrOrderNotFound,
+	}
+	spm, slot, _ := newCancelBuyTestManager(executor, exchange)
+	slot.OrderID = 0
+	slot.OrderStatus = OrderStatusNotPlaced
+	slot.OrderCreatedAt = time.Now().Add(-pendingLookupMinAge - time.Second)
+	slot.SlotStatus = SlotStatusPending
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := spm.cancelAllBuyOrders(ctx); err != nil {
+		t.Fatalf("cancelAllBuyOrders() error = %v", err)
+	}
+	if exchange.lookupCalls != pendingLookupMissLimit {
+		t.Fatalf("ClientOID lookup calls = %d, want %d", exchange.lookupCalls, pendingLookupMissLimit)
+	}
+	if len(executor.calls) != 0 {
+		t.Fatalf("unknown absent order was sent to cancel: %v", executor.calls)
+	}
+	slot.mu.RLock()
+	defer slot.mu.RUnlock()
+	if slot.SlotStatus != SlotStatusFree || slot.ClientOID != "" || slot.OrderID != 0 {
+		t.Fatalf("confirmed absent reservation did not converge: %+v", slot)
 	}
 }
 

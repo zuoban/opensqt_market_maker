@@ -66,6 +66,15 @@ func (spm *SuperPositionManager) cancelAllBuyOrders(ctx context.Context) error {
 			return buyCancelConfirmationError(err, pending, lastCancelErr, lastQueryErr, lastDetailErr)
 		}
 
+		// 对无 OrderID 的 UNKNOWN reservation 先按原始 ClientOID 做保守恢复。
+		// 找到活跃单后会补齐 OrderID；反复明确不存在时会安全释放槽位。
+		if _, supported := spm.exchange.(clientOrderLookup); supported {
+			if _, err := spm.ResolvePendingOrders(ctx); err != nil {
+				lastDetailErr = fmt.Errorf("恢复待确认订单失败: %w", err)
+			}
+			spm.refreshPendingBuyTargets(pending)
+		}
+
 		orderIDs := knownPendingBuyOrderIDs(pending)
 		if len(orderIDs) == 0 {
 			lastCancelErr = nil
@@ -102,6 +111,33 @@ func (spm *SuperPositionManager) cancelAllBuyOrders(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (spm *SuperPositionManager) refreshPendingBuyTargets(pending map[string]buyCancelTarget) {
+	for key, target := range pending {
+		value, ok := spm.slots.Load(target.price)
+		if !ok {
+			continue
+		}
+		slot, _ := value.(*InventorySlot)
+		if slot == nil {
+			continue
+		}
+		slot.mu.RLock()
+		matches := slot.ClientOID != "" && target.clientOrderID != "" &&
+			spm.canonicalClientOrderID(slot.ClientOID) == spm.canonicalClientOrderID(target.clientOrderID) &&
+			slot.OrderSide == "BUY"
+		if matches {
+			target.orderID = slot.OrderID
+			target.orderPrice = slot.OrderPrice
+			target.orderQuantity = slot.OrderQuantity
+			target.executedQty = slot.OrderFilledQty
+		}
+		slot.mu.RUnlock()
+		if matches {
+			pending[key] = target
+		}
+	}
 }
 
 func (spm *SuperPositionManager) markBuyOrdersCancelRequested() []buyCancelTarget {
@@ -262,6 +298,9 @@ func (spm *SuperPositionManager) buyCancelTargetConverged(target buyCancelTarget
 				return false
 			}
 		}
+	}
+	if converged, recorded := spm.resolvedAbsentOrderConverged(target.clientOrderID, time.Now()); recorded {
+		return converged
 	}
 	identity := OrderUpdate{
 		OrderID:       target.orderID,

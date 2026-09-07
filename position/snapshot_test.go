@@ -137,6 +137,64 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	}
 }
 
+func TestSnapshotExposesSlotWaitStatesAndOrderCapacity(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.OrderCleanupThreshold = 5
+	spm := NewSuperPositionManager(cfg, stubExecutor{}, stubEx{}, 2, 3)
+	spm.anchorPrice = 100
+	spm.lastMarketPrice.Store(100.0)
+
+	pending := spm.getOrCreateSlot(99)
+	pending.ClientOID = "9900_B_1700000000001"
+	pending.OrderSide = "BUY"
+	pending.OrderStatus = OrderStatusNotPlaced
+	pending.OrderQuantity = 0.3
+	pending.OrderCreatedAt = time.Now()
+	pending.SlotStatus = SlotStatusPending
+
+	canceling := spm.getOrCreateSlot(98)
+	canceling.OrderID = 12
+	canceling.ClientOID = "9800_B_1700000000002"
+	canceling.OrderSide = "BUY"
+	canceling.OrderStatus = OrderStatusCancelRequested
+	canceling.SlotStatus = SlotStatusLocked
+
+	cooling := spm.getOrCreateSlot(101)
+	cooling.placementRetryNotBefore = time.Now().Add(time.Second)
+
+	inconsistent := spm.getOrCreateSlot(102)
+	inconsistent.OrderID = 13
+	inconsistent.ClientOID = "10200_S_1700000000003"
+	inconsistent.OrderSide = "SELL"
+	inconsistent.OrderStatus = OrderStatusCanceled
+	inconsistent.SlotStatus = SlotStatusLocked
+
+	snap := spm.Snapshot()
+	if snap.PendingOrderCount != 1 || snap.CancelingOrderCount != 1 ||
+		snap.CoolingSlotCount != 1 || snap.InconsistentSlotCount != 1 {
+		t.Fatalf("wait counts = pending:%d cancel:%d cooling:%d inconsistent:%d",
+			snap.PendingOrderCount, snap.CancelingOrderCount, snap.CoolingSlotCount, snap.InconsistentSlotCount)
+	}
+	if snap.OrderCapacityUsed != 3 || snap.OrderCapacityLimit != 5 || snap.OrderCapacityRemaining != 2 {
+		t.Fatalf("capacity = %d/%d remaining %d", snap.OrderCapacityUsed, snap.OrderCapacityLimit, snap.OrderCapacityRemaining)
+	}
+	states := make(map[float64]string)
+	retryRemaining := 0.0
+	for _, slot := range snap.Slots {
+		states[slot.Price] = slot.WaitState
+		if slot.Price == 101 {
+			retryRemaining = slot.RetryRemainingS
+		}
+	}
+	if states[99] != SlotWaitStatePendingConfirmation || states[98] != SlotWaitStateCancelConfirmation ||
+		states[101] != SlotWaitStateRetryCooldown || states[102] != SlotWaitStateLockedInconsistent {
+		t.Fatalf("slot wait states = %#v", states)
+	}
+	if retryRemaining <= 0 || retryRemaining > 1 {
+		t.Fatalf("retry remaining = %v", retryRemaining)
+	}
+}
+
 func TestSnapshotKeepsOccupiedSlotsOutsideWindow(t *testing.T) {
 	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
 	spm.anchorPrice = 100

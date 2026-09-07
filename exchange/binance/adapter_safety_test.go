@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"opensqt/exchange/exchangeerr"
+	"opensqt/utils"
 
 	"github.com/adshao/go-binance/v2/futures"
 )
@@ -65,6 +66,42 @@ func orderFixture(orderID int64, clientOrderID string) map[string]any {
 		"status":        "NEW",
 		"time":          int64(1234),
 		"updateTime":    int64(1235),
+	}
+}
+
+func TestGetOrderByClientIDNormalizesBrokerPrefix(t *testing.T) {
+	plainClientID := "10000_B_1700000000001"
+	brokerClientID := utils.AddBinanceBrokerPrefix(plainClientID)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("origClientOrderId"); got != brokerClientID {
+			t.Errorf("origClientOrderId = %q, want %q", got, brokerClientID)
+		}
+		writeJSON(t, w, http.StatusOK, orderFixture(81, brokerClientID))
+	}))
+	defer server.Close()
+
+	adapter := testAdapter(t, server.URL, "USDT")
+	for _, clientID := range []string{plainClientID, brokerClientID} {
+		order, err := adapter.GetOrderByClientID(context.Background(), "TESTUSDT", clientID)
+		if err != nil {
+			t.Fatalf("GetOrderByClientID(%q) error = %v", clientID, err)
+		}
+		if order.OrderID != 81 || order.ClientOrderID != brokerClientID {
+			t.Fatalf("GetOrderByClientID(%q) = %+v", clientID, order)
+		}
+	}
+}
+
+func TestGetOrderByClientIDMarksOnlyBinanceNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusBadRequest, map[string]any{"code": -2013, "msg": "Order does not exist."})
+	}))
+	defer server.Close()
+
+	adapter := testAdapter(t, server.URL, "USDT")
+	_, err := adapter.GetOrderByClientID(context.Background(), "TESTUSDT", "10000_B_1700000000001")
+	if !errors.Is(err, exchangeerr.ErrOrderNotFound) {
+		t.Fatalf("GetOrderByClientID() error = %v, want ErrOrderNotFound", err)
 	}
 }
 

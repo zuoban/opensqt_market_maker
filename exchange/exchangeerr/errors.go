@@ -14,6 +14,10 @@ var ErrOrderPlacementUnknown = errors.New("订单下单结果未知")
 // 只有请求尚未发送，或交易所返回了可证明未创建订单的明确拒绝时才能使用。
 var ErrOrderPlacementRejected = errors.New("订单明确未受理")
 
+// ErrOrderNotFound 表示交易所按明确订单身份查询后，权威返回订单不存在。
+// 它只用于只读查询结果；网络错误、超时和无法解析的响应不得包装成此错误。
+var ErrOrderNotFound = errors.New("订单不存在")
+
 // WrapOrderPlacementUnknown 保留底层错误链，同时标记“交易所可能已经接受订单”。
 // 具体适配器应在请求已进入远端边界、但响应无法可靠确认时使用它。
 func WrapOrderPlacementUnknown(err error) error {

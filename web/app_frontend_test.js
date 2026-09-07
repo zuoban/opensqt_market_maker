@@ -668,7 +668,102 @@ test("grid orders and positions become distinct K-line overlays", () => {
     assert.equal(buy.kind, "buy");
     assert.deepEqual(buy.markers, ["B"]);
     assert.ok(Math.abs(buy.orderQuantity - 30 / 99) < 1e-12);
-    assert.deepEqual(model.execution, { buy: 1, sell: 1, position: 1 });
+    assert.deepEqual(model.execution, {
+        buy: 1,
+        sell: 1,
+        position: 1,
+        pending: 0,
+        canceling: 0,
+        cooling: 0,
+        inconsistent: 0,
+        capacityUsed: 0,
+        capacityLimit: 0,
+        capacityRemaining: 0
+    });
+});
+
+test("pending, canceling and cooling grid slots are not rendered as empty", () => {
+    const data = fixture();
+    data.position.pendingOrderCount = 1;
+    data.position.cancelingOrderCount = 1;
+    data.position.coolingSlotCount = 1;
+    data.position.inconsistentSlotCount = 1;
+    data.position.orderCapacityUsed = 4;
+    data.position.orderCapacityLimit = 50;
+    data.position.orderCapacityRemaining = 46;
+    data.position.slots.push(
+        {
+            price: 98,
+            priceText: "98.00",
+            orderSide: "BUY",
+            slotStatus: "PENDING",
+            orderStatus: "NOT_PLACED",
+            waitState: "PENDING_CONFIRMATION",
+            inBuyWindow: true
+        },
+        {
+            price: 97.5,
+            priceText: "97.50",
+            orderSide: "BUY",
+            slotStatus: "LOCKED",
+            orderStatus: "CANCEL_REQUESTED",
+            waitState: "CANCEL_CONFIRMATION",
+            inBuyWindow: true
+        },
+        {
+            price: 97,
+            priceText: "97.00",
+            retryRemainingSec: 0.8,
+            waitState: "RETRY_COOLDOWN",
+            inBuyWindow: true
+        },
+        {
+            price: 96.5,
+            priceText: "96.50",
+            slotStatus: "LOCKED",
+            waitState: "LOCKED_INCONSISTENT",
+            inBuyWindow: true
+        }
+    );
+
+    const model = buildKlineGridModel(data.kline, data.position, false);
+    const pending = model.levels.find((item) => item.price === 98);
+    const canceling = model.levels.find((item) => item.price === 97.5);
+    const cooling = model.levels.find((item) => item.price === 97);
+    const inconsistent = model.levels.find((item) => item.price === 96.5);
+    assert.equal(pending.kind, "pending");
+    assert.deepEqual(pending.markers, ["Q"]);
+    assert.equal(canceling.kind, "canceling");
+    assert.deepEqual(canceling.markers, ["C"]);
+    assert.equal(cooling.kind, "cooling");
+    assert.deepEqual(cooling.markers, ["R"]);
+    assert.equal(inconsistent.kind, "inconsistent");
+    assert.deepEqual(inconsistent.markers, ["!"]);
+    assert.ok(model.railLabels.some((item) => item.hasPending));
+    assert.ok(model.railLabels.some((item) => item.hasCanceling));
+    assert.ok(model.railLabels.some((item) => item.hasCooling));
+    assert.ok(model.railLabels.concat(model.overflowAbove, model.overflowBelow)
+        .some((item) => item.hasInconsistent));
+    assert.deepEqual(model.execution, {
+        buy: 1,
+        sell: 1,
+        position: 1,
+        pending: 1,
+        canceling: 1,
+        cooling: 1,
+        inconsistent: 1,
+        capacityUsed: 4,
+        capacityLimit: 50,
+        capacityRemaining: 46
+    });
+
+    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
+    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
+    assert.match(html, /Q 待确认/);
+    assert.match(html, /C 撤单中/);
+    assert.match(html, /R 重试冷却/);
+    assert.match(cssBlock(css, ".lg.pending::before"), /var\(--warn\)/);
+    assert.match(cssBlock(css, ".lg.canceling::before"), /var\(--negative\)/);
 });
 
 test("outside grid levels are opt-in", () => {

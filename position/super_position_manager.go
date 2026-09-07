@@ -38,11 +38,16 @@ type OrderUpdate struct {
 }
 
 const (
-	maxRecentFilledOrders  = 20
-	hourlyFillHours        = 24
-	fillQtyTolerance       = 1e-12
-	maxTerminalOrders      = 4096
-	placementRetryCooldown = time.Second
+	maxRecentFilledOrders   = 20
+	hourlyFillHours         = 24
+	fillQtyTolerance        = 1e-12
+	maxTerminalOrders       = 4096
+	placementRetryCooldown  = time.Second
+	pendingLookupMinAge     = 5 * time.Second
+	pendingLookupInterval   = 500 * time.Millisecond
+	pendingLookupPassBudget = 2 * time.Second
+	pendingLookupMissLimit  = 3
+	pendingLateUpdateGrace  = time.Second
 )
 
 var ErrAcceptedOrderPreconditionInvalid = errors.New("交易所已接受订单但槽位下单前提已失效")
@@ -225,6 +230,10 @@ type InventorySlot struct {
 	// 明确未提交成功的 reservation 短暂退避。结果不确定的
 	// reservation 仍保持 PENDING，不使用此冷却代替对账。
 	placementRetryNotBefore time.Time
+	// 结果不确定的 reservation 只有在达到最小年龄后，连续多次收到交易所
+	// 明确“不存在”才会释放。任何歧义响应都会保留 PENDING。
+	pendingLookupMisses int
+	pendingLastLookup   time.Time
 
 	// 当前订单已计入的累计已实现盈亏（非增量推送用）
 	orderReportedPNL float64
@@ -329,6 +338,10 @@ type SuperPositionManager struct {
 	terminalOrdersMu  sync.RWMutex
 	terminalOrders    map[string]terminalOrderProgress
 	terminalOrderKeys []string
+	// resolvedAbsentOrders 为连续权威“不存在”的 ClientOID 保留短暂缓冲。
+	// 撤买流程会等缓冲结束再宣布成功；迟到订单流事件会先移除此记录并接管槽位。
+	resolvedAbsentOrdersMu sync.Mutex
+	resolvedAbsentOrders   map[string]time.Time
 
 	// 初始化标志
 	isInitialized atomic.Bool
@@ -356,17 +369,18 @@ func NewSuperPositionManager(
 	}
 
 	spm := &SuperPositionManager{
-		config:             cfg,
-		executor:           executor,
-		exchange:           exchange,
-		insufficientMargin: false,
-		marginLockDuration: time.Duration(marginLockSec) * time.Second,
-		priceDecimals:      priceDecimals,
-		priceTickSize:      priceTickSize,
-		quantityDecimals:   quantityDecimals,
-		filledOrderKeys:    make(map[string]struct{}),
-		filledHourly:       make(map[int64]*hourlyFillAcc),
-		terminalOrders:     make(map[string]terminalOrderProgress),
+		config:               cfg,
+		executor:             executor,
+		exchange:             exchange,
+		insufficientMargin:   false,
+		marginLockDuration:   time.Duration(marginLockSec) * time.Second,
+		priceDecimals:        priceDecimals,
+		priceTickSize:        priceTickSize,
+		quantityDecimals:     quantityDecimals,
+		filledOrderKeys:      make(map[string]struct{}),
+		filledHourly:         make(map[int64]*hourlyFillAcc),
+		terminalOrders:       make(map[string]terminalOrderProgress),
+		resolvedAbsentOrders: make(map[string]time.Time),
 	}
 	spm.totalBuyQty.Store(0.0)
 	spm.totalSellQty.Store(0.0)
@@ -564,6 +578,8 @@ func sameOrderQuantity(a, b float64) bool {
 func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *OrderRequest) {
 	// 冷却到期后创建新 reservation，旧失败状态不应跟随到新请求。
 	slot.placementRetryNotBefore = time.Time{}
+	slot.pendingLookupMisses = 0
+	slot.pendingLastLookup = time.Time{}
 	slot.OrderID = 0
 	slot.ClientOID = req.ClientOrderID
 	slot.OrderSide = req.Side
@@ -741,6 +757,8 @@ func (spm *SuperPositionManager) clearReservationLocked(slot *InventorySlot) {
 	slot.orderReportedPNL = 0
 	slot.orderAccumulatedPNL = 0
 	slot.placementRetryNotBefore = time.Time{}
+	slot.pendingLookupMisses = 0
+	slot.pendingLastLookup = time.Time{}
 	slot.SlotStatus = SlotStatusFree
 }
 
@@ -1777,6 +1795,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 	// 进度或槽位身份判断前统一成程序自己的 ClientOrderID，避免同一订单被当成
 	// 两个身份，也让 UNKNOWN reservation 能被订单流权威收敛。
 	update.ClientOrderID = spm.canonicalClientOrderID(update.ClientOrderID)
+	spm.forgetResolvedAbsentOrder(update.ClientOrderID)
 	price, side, valid := spm.parseClientOrderID(update.ClientOrderID)
 
 	if !valid {
@@ -1838,6 +1857,9 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 			price, slot.ClientOID, update.ClientOrderID, update.OrderID)
 		return
 	}
+	// 匹配的订单流事件本身就是权威存在证据；清除此前的“不存在”读数。
+	slot.pendingLookupMisses = 0
+	slot.pendingLastLookup = time.Time{}
 
 	// 更新订单ID (如果是首个推送)
 	if slot.OrderID == 0 {

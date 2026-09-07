@@ -1193,6 +1193,10 @@ main { display: block; }
 .lg.buy::before { height: 0; border-top: 1px dashed var(--buy); }
 .lg.sell::before { height: 0; border-top: 1px solid var(--sell); }
 .lg.pos::before { height: 0; border-top: 2px dotted var(--cyan); }
+.lg.pending::before { height: 0; border-top: 2px dashed var(--warn); }
+.lg.canceling::before { height: 0; border-top: 2px dashed var(--negative); }
+.lg.cooling::before { height: 0; border-top: 2px dotted var(--cyan); }
+.lg.inconsistent::before { height: 0; border-top: 2px dotted var(--ink); }
 .lg.empty-slot::before { height: 0; border-top: 1px dotted var(--muted-soft); }
 .lg.mark::before { height: 0; border-top: 2px solid var(--warn); box-shadow: 0 0 7px rgba(240, 193, 90, 0.35); }
 

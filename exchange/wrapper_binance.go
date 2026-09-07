@@ -175,6 +175,29 @@ func (w *binanceWrapper) GetOrder(ctx context.Context, symbol string, orderID in
 	}, nil
 }
 
+// GetOrderByClientID 为结果不确定的下单提供只读恢复查询。它是可选能力，
+// 不扩大全局 IExchange 接口，避免其它调用方被迫依赖该恢复路径。
+func (w *binanceWrapper) GetOrderByClientID(ctx context.Context, symbol, clientOrderID string) (*Order, error) {
+	binanceOrder, err := w.adapter.GetOrderByClientID(ctx, symbol, clientOrderID)
+	if err != nil {
+		return nil, err
+	}
+	return &Order{
+		OrderID:       binanceOrder.OrderID,
+		ClientOrderID: binanceOrder.ClientOrderID,
+		Symbol:        binanceOrder.Symbol,
+		Side:          Side(binanceOrder.Side),
+		Type:          OrderType(binanceOrder.Type),
+		Price:         binanceOrder.Price,
+		Quantity:      binanceOrder.Quantity,
+		ExecutedQty:   binanceOrder.ExecutedQty,
+		AvgPrice:      binanceOrder.AvgPrice,
+		Status:        OrderStatus(binanceOrder.Status),
+		CreatedAt:     binanceOrder.CreatedAt,
+		UpdateTime:    binanceOrder.UpdateTime,
+	}, nil
+}
+
 func (w *binanceWrapper) GetOpenOrders(ctx context.Context, symbol string) ([]*Order, error) {
 	binanceOrders, err := w.adapter.GetOpenOrders(ctx, symbol)
 	if err != nil {

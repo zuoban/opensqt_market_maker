@@ -77,6 +77,11 @@ type Reconciler struct {
 	healthy      atomic.Bool
 	healthMu     sync.RWMutex
 	healthChange func(healthy bool, err error)
+	reconcileMu  sync.Mutex
+}
+
+type pendingOrderResolver interface {
+	ResolvePendingOrders(ctx context.Context) (remaining int, err error)
 }
 
 // NewReconciler 创建对账器
@@ -154,6 +159,8 @@ func (r *Reconciler) Start(ctx context.Context) {
 
 // Reconcile 执行对账（通用实现，支持所有交易所）
 func (r *Reconciler) Reconcile() (retErr error) {
+	r.reconcileMu.Lock()
+	defer r.reconcileMu.Unlock()
 	defer func() {
 		if retErr != nil {
 			r.setHealthy(false, retErr)
@@ -168,11 +175,22 @@ func (r *Reconciler) Reconcile() (retErr error) {
 	}
 
 	symbol := r.pm.GetSymbol()
-
-	// 1. 查询交易所持仓信息（使用通用接口）
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// 先用 ClientOrderID 收敛下单结果不确定的 reservation。只有交易所反复
+	// 明确返回“不存在”时 position 层才会释放；未解决时仍保持 fail-closed。
+	if resolver, ok := r.pm.(pendingOrderResolver); ok {
+		remaining, err := resolver.ResolvePendingOrders(ctx)
+		if err != nil {
+			return fmt.Errorf("恢复待确认订单失败: %w", err)
+		}
+		if remaining > 0 {
+			return fmt.Errorf("本地有 %d 个槽位正在提交订单，无法完成权威对账", remaining)
+		}
+	}
+
+	// 1. 查询交易所持仓信息（使用通用接口）
 	positionsRaw, err := r.exchange.GetPositions(ctx, symbol)
 	if err != nil {
 		return fmt.Errorf("查询持仓失败: %w", err)

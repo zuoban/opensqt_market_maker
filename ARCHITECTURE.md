@@ -311,9 +311,11 @@ type IExchange interface {
 - 价格按 `tickSize` 量化（买价向下、卖价向上），数量按 `stepSize` 向下量化，同时校验 `minQty`、`maxQty` 与 `minNotional`。
 - 仅允许单向持仓；卖单必须 `reduceOnly`，所有策略订单必须为 `LIMIT + GTX`。
 - 503、超时、断连、异常 2xx、重复 ClientOrderID 和创建订单响应超限，都按原 ClientOrderID 查询确认；结果未知时禁止盲重试。
+- 无 OrderID 的 `PENDING` reservation 至少保留 5 秒；之后按原 ClientOrderID 做 3 次、间隔至少 500ms 的权威查询。仅连续明确返回 `-2013`（订单不存在）才释放并进入 1 秒迟到事件缓冲，查询超时、传输异常或字段不一致都继续 fail-closed。
 - 用户订单流握手后才进入 READY；listenKey 过期、保活失败、JSON/字段异常会立即 DEGRADED、重连并触发恢复对账。
 - REST 响应在进入 SDK 前有大小上限（普通接口 1 MiB，`exchangeInfo` 8 MiB）。
 - 全撤使用 Binance 原生接口，并查询确认远端挂单为空。
+- 定期对账与撤买恢复共用上述 ClientOrderID 收敛路径；对账本身串行执行，仍有 `PENDING` 或 `CANCEL_REQUESTED` 时不得恢复交易。
 
 #### 实现层级
 ```
