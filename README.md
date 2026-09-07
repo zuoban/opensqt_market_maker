@@ -34,6 +34,7 @@ OpenSQT is a high-performance, low-latency Binance perpetual futures market make
 - **智能网格策略**: 
   - **固定金额模式**: 资金利用率更可控。
   - **超级槽位系统 (Super Slot)**: 智能管理挂单与持仓状态，防止并发冲突。
+  - **严格 Maker 执行**: 最优盘口提交前复检、被动补格和版本化退避，全路径保持 PostOnly。
 - **强大的风控系统**:
   - **主动风控**: 实时监控 K 线成交量异常，自动暂停交易。
   - **资金安全**: 启动前自动检查余额、杠杆倍数与最大持仓风险。
@@ -140,6 +141,30 @@ opensqt_platform/
 
 也可以只使用 `.env`（例如 `OPENSQT_EXCHANGES_BINANCE_API_KEY`），不必提供 `config.yaml`。若两者都有，非空环境变量优先。保证金限制对应环境变量为 `OPENSQT_TRADING_MAX_MARGIN_USAGE_PERCENT`；完整变量列表见 [.env.example](.env.example)。
 
+#### 严格 Maker 执行
+
+Binance 的 PostOnly 订单在到达撮合系统时如果会立即成交，会被明确拒绝。程序不会降级成 Taker，而是使用同一条市场数据 WebSocket 同时接收逐笔成交和 `bookTicker`，并在真正提交前按最新买一/卖一再次复检。逻辑网格价格保持不变；当 BUY 网格已经穿过 Maker 安全边界时，可把实际委托价向下移动到安全价，成交后仍按原逻辑槽位计算目标卖价。
+
+```yaml
+execution:
+  maker_guard_ticks: 2
+  quote_stale_ms: 1500
+  post_only_retry_min_ms: 50
+  post_only_retry_max_ms: 500
+  post_only_retry_burst: 5
+  catch_up_mode: "passive"          # passive: 被动补格；exact_wait: 原价等待
+  max_active_catch_up_slots: 1
+  max_catch_up_slots_per_adjust: 1
+  max_catch_up_distance_ratio: 0.5
+  near_touch_single_order_ratio: 0.15
+```
+
+- 同一盘口版本只尝试一次；明确 `-5022` 后默认按 50/100/200/400/500ms 退避，超过 5 次后每次至少等待 1 秒。
+- 盘口超过 1500ms 未更新、连接重建或快照不完整时暂停新提交；不会使用旧盘口盲挂。
+- 距盘口过近的订单拆成单笔请求，降低原生批量请求中共享陈旧盘口的概率。
+- 下单结果为 UNKNOWN 时保持原槽位 `PENDING` 和原 ClientOrderID，等待订单流或对账确认，避免重复下单。
+- `order_quantity` 始终表示每格报价货币金额；被动补格改变实际买价时会重新计算数量。
+
 ### 运行 (Usage)
 
 ```bash
@@ -170,7 +195,7 @@ dashboard:
   account_refresh_sec: 10
 ```
 
-面板展示价格、K 线网格执行图、程序启动后的成交订单、持仓、主动风控和最近日志。默认只绑定本机；若改成 `0.0.0.0` 会对外暴露账户与仓位，请同时设置 `token`。
+面板展示价格、K 线网格执行图、Maker 接受率与拒单/补格指标、程序启动后的成交订单、持仓、主动风控和最近日志。默认只绑定本机；若改成 `0.0.0.0` 会对外暴露账户与仓位，请同时设置 `token`。
 
 ## 🐳 Docker (GitHub Packages)
 

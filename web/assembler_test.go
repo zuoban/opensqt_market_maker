@@ -40,10 +40,14 @@ func TestSafeAppViewOmitsSecrets(t *testing.T) {
 	cfg.RiskControl.Enabled = true
 	cfg.RiskControl.MonitorSymbols = []string{"BTCUSDT"}
 	cfg.Dashboard.PushIntervalMS = 400
+	cfg.Execution.MakerGuardTicks = 2
+	cfg.Execution.QuoteStaleMS = 1500
+	cfg.Execution.CatchUpMode = "passive"
 
 	view := safeAppView(cfg)
 	if view.FeeRate != 0.0002 || view.Exchange != "binance" || view.MaxMarginUsage != 62.5 ||
-		view.DashboardPushIntervalMS != 400 {
+		view.DashboardPushIntervalMS != 400 || view.MakerGuardTicks != 2 ||
+		view.QuoteStaleMS != 1500 || view.CatchUpMode != "passive" {
 		t.Fatalf("view = %+v", view)
 	}
 	raw, err := json.Marshal(view)
@@ -68,6 +72,30 @@ func TestSafeAppViewOmitsSecrets(t *testing.T) {
 	body := string(full)
 	if strings.Contains(body, "SECRETKEY_ABC") || strings.Contains(body, "SUPERSECRET_XYZ") {
 		t.Fatalf("full snapshot leaked secrets: %s", body)
+	}
+}
+
+func TestSnapshotJSONIncludesMakerExecutionAndQuote(t *testing.T) {
+	snapshot := Snapshot{
+		Price: PriceView{BestBid: 100, BestAsk: 100.1, QuoteAgeMs: 250},
+		Position: position.PositionSnapshot{MakerExecution: position.MakerExecutionSnapshot{
+			Attempts: 10, Accepted: 9, GuardSkips: 1, PostOnlyRejects: 2,
+			CatchUpOrders: 3, CatchUpAbandoned: 1, ActiveCatchUp: 1,
+		}},
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	for _, field := range []string{
+		`"bestBid":100`, `"bestAsk":100.1`, `"quoteAgeMs":250`,
+		`"makerExecution"`, `"attempts":10`, `"accepted":9`,
+		`"guardSkips":1`, `"postOnlyRejects":2`, `"activeCatchUp":1`,
+	} {
+		if !strings.Contains(body, field) {
+			t.Fatalf("snapshot JSON missing %s: %s", field, body)
+		}
 	}
 }
 

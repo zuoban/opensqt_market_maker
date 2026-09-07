@@ -12,6 +12,72 @@ import (
 	"github.com/adshao/go-binance/v2/futures"
 )
 
+func TestParseCombinedMarketUpdate(t *testing.T) {
+	receivedAt := time.Unix(1_700_000_100, 0)
+
+	trade, recognized, err := parseCombinedMarketUpdate([]byte(`{
+		"stream":"ethusdt@trade",
+		"data":{"e":"trade","E":1700000000123,"s":"ETHUSDT","p":"2010.25"}
+	}`), "ETHUSDT", 7, 3, receivedAt)
+	if err != nil || !recognized {
+		t.Fatalf("trade parse = recognized:%v err:%v", recognized, err)
+	}
+	if trade.Symbol != "ETHUSDT" || trade.LastPrice != 2010.25 || trade.StreamEpoch != 3 ||
+		trade.QuoteVersion != 0 || !trade.ReceivedAt.Equal(receivedAt) ||
+		!trade.EventTime.Equal(time.UnixMilli(1_700_000_000_123)) {
+		t.Fatalf("trade update = %+v", trade)
+	}
+
+	book, recognized, err := parseCombinedMarketUpdate([]byte(`{
+		"stream":"ethusdt@bookTicker",
+		"data":{"e":"bookTicker","E":1700000000456,"s":"ETHUSDT","b":"2010.20","a":"2010.30"}
+	}`), "ethusdt", 7, 3, receivedAt)
+	if err != nil || !recognized {
+		t.Fatalf("book parse = recognized:%v err:%v", recognized, err)
+	}
+	if book.BestBid != 2010.20 || book.BestAsk != 2010.30 || book.QuoteVersion != 8 ||
+		book.StreamEpoch != 3 || !book.EventTime.Equal(time.UnixMilli(1_700_000_000_456)) {
+		t.Fatalf("book update = %+v", book)
+	}
+}
+
+func TestParseCombinedMarketUpdateRejectsInvalidBookAndSymbol(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		symbol  string
+	}{
+		{
+			name: "crossed book",
+			message: `{"stream":"ethusdt@bookTicker","data":` +
+				`{"e":"bookTicker","s":"ETHUSDT","b":"2010.30","a":"2010.20"}}`,
+			symbol: "ETHUSDT",
+		},
+		{
+			name: "non finite bid",
+			message: `{"stream":"ethusdt@bookTicker","data":` +
+				`{"e":"bookTicker","s":"ETHUSDT","b":"NaN","a":"2010.20"}}`,
+			symbol: "ETHUSDT",
+		},
+		{
+			name: "wrong symbol",
+			message: `{"stream":"btcusdt@bookTicker","data":` +
+				`{"e":"bookTicker","s":"BTCUSDT","b":"100","a":"101"}}`,
+			symbol: "ETHUSDT",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, recognized, err := parseCombinedMarketUpdate(
+				[]byte(tt.message), tt.symbol, 1, 1, time.Now(),
+			); err == nil || recognized {
+				t.Fatalf("recognized=%v err=%v, want rejected message", recognized, err)
+			}
+		})
+	}
+}
+
 type fakeUserStreamConnection struct {
 	done      chan struct{}
 	stop      chan struct{}

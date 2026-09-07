@@ -91,6 +91,38 @@ type Account struct {
 	AccountLeverage    int // 账户级别的杠杆倍数（部分交易所支持）
 }
 
+// MarketUpdate 是唯一市场数据 WebSocket 送入 PriceMonitor 的增量事件。
+// LastPrice 来自真实逐笔成交；BestBid/BestAsk 来自最优盘口。Reset 表示底层
+// 连接已切换到新的 epoch，消费者必须先使旧盘口失效，等新连接同时收到
+// 成交价与盘口后再恢复下单。
+type MarketUpdate struct {
+	Symbol       string
+	LastPrice    float64
+	BestBid      float64
+	BestAsk      float64
+	EventTime    time.Time
+	ReceivedAt   time.Time
+	QuoteVersion uint64
+	StreamEpoch  uint64
+	Reset        bool
+}
+
+// MarketSnapshot 是全局 PriceMonitor 发布的原子市场快照。
+// 网格定位使用 LastPrice；Maker 可提交边界必须使用 BestBid/BestAsk。
+type MarketSnapshot struct {
+	Symbol          string
+	LastPrice       float64
+	BestBid         float64
+	BestAsk         float64
+	TradeTime       time.Time
+	QuoteTime       time.Time
+	QuoteReceivedAt time.Time
+	ReceivedAt      time.Time
+	QuoteVersion    uint64
+	StreamEpoch     uint64
+	Ready           bool
+}
+
 // OrderUpdate WebSocket 订单更新事件（通用）
 type OrderUpdate struct {
 	OrderID                int64

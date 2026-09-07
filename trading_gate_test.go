@@ -765,9 +765,12 @@ func (e *healthyTradingGateExchange) GetOrderStreamState() string { return "READ
 func (e *healthyTradingGateExchange) StartPriceStream(
 	_ context.Context,
 	_ string,
-	callback func(float64),
+	callback func(exchange.MarketUpdate),
 ) error {
-	callback(100)
+	callback(exchange.MarketUpdate{
+		Symbol: "BTCUSDT", LastPrice: 100, BestBid: 99.99, BestAsk: 100.01,
+		EventTime: time.Now(), ReceivedAt: time.Now(), QuoteVersion: 1, StreamEpoch: 1,
+	})
 	return nil
 }
 

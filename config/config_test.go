@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,13 @@ func TestDashboardDefaults(t *testing.T) {
 	if c.Trading.OrderCleanupThreshold != 100 {
 		t.Fatalf("cleanup threshold = %d, want default 100", c.Trading.OrderCleanupThreshold)
 	}
+	if c.Execution.MakerGuardTicks != 2 || c.Execution.QuoteStaleMS != 1500 ||
+		c.Execution.PostOnlyRetryMinMS != 50 || c.Execution.PostOnlyRetryMaxMS != 500 ||
+		c.Execution.PostOnlyRetryBurst != 5 || c.Execution.CatchUpMode != "passive" ||
+		c.Execution.MaxActiveCatchUpSlots != 1 || c.Execution.MaxCatchUpSlotsPerAdjust != 1 ||
+		c.Execution.MaxCatchUpDistanceRatio != 0.5 || c.Execution.NearTouchSingleOrderRatio != 0.15 {
+		t.Fatalf("execution defaults = %+v", c.Execution)
+	}
 	c.Dashboard.PushIntervalMS = 50
 	if err := c.applyDashboardDefaults(); err != nil {
 		t.Fatal(err)
@@ -40,6 +48,44 @@ func TestDashboardDefaults(t *testing.T) {
 	c.Dashboard.Enabled = &off
 	if c.DashboardEnabled() {
 		t.Fatal("explicit false should disable")
+	}
+}
+
+func TestExecutionConfigValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		want      string
+	}{
+		{name: "negative guard", configure: func(c *Config) { c.Execution.MakerGuardTicks = -1 }, want: "maker_guard_ticks"},
+		{name: "negative stale", configure: func(c *Config) { c.Execution.QuoteStaleMS = -1 }, want: "quote_stale_ms"},
+		{name: "retry bounds", configure: func(c *Config) {
+			c.Execution.PostOnlyRetryMinMS = 100
+			c.Execution.PostOnlyRetryMaxMS = 50
+		}, want: "post_only_retry_max_ms"},
+		{name: "negative burst", configure: func(c *Config) { c.Execution.PostOnlyRetryBurst = -1 }, want: "post_only_retry_burst"},
+		{name: "catch up mode", configure: func(c *Config) { c.Execution.CatchUpMode = "taker" }, want: "catch_up_mode"},
+		{name: "active catch up", configure: func(c *Config) { c.Execution.MaxActiveCatchUpSlots = -1 }, want: "max_active_catch_up_slots"},
+		{name: "per adjust", configure: func(c *Config) { c.Execution.MaxCatchUpSlotsPerAdjust = -1 }, want: "max_catch_up_slots_per_adjust"},
+		{name: "catch up ratio", configure: func(c *Config) { c.Execution.MaxCatchUpDistanceRatio = 1.01 }, want: "max_catch_up_distance_ratio"},
+		{name: "near touch ratio", configure: func(c *Config) { c.Execution.NearTouchSingleOrderRatio = math.NaN() }, want: "near_touch_single_order_ratio"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validTradingConfig()
+			tt.configure(c)
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Validate() error = %v, want field %q", err, tt.want)
+			}
+		})
+	}
+
+	c := validTradingConfig()
+	c.Execution.CatchUpMode = " PASSIVE "
+	if err := c.Validate(); err != nil || c.Execution.CatchUpMode != "passive" {
+		t.Fatalf("normalized catch-up mode=%q err=%v", c.Execution.CatchUpMode, err)
 	}
 }
 

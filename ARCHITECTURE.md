@@ -1,6 +1,6 @@
 # OpenSQT 做市商系统架构说明
 
-> **版本**: v3.5.7
+> **版本**: v3.5.8
 > **最近更新**: 2026-09-07
 > **目的**: 说明当前运行架构、交易安全边界与扩展约束
 
@@ -47,7 +47,8 @@ OpenSQT 是一个 WebSocket 驱动的加密货币永续合约**单向做多网�
 ```
 ✅ 全局唯一的价格流（PriceMonitor）
 ✅ WebSocket 是唯一的价格来源（不使用 REST API 轮询）
-✅ 所有组件通过 priceMonitor.GetLastPrice() 获取价格
+✅ 单条 combined WebSocket 同时接收 trade 与 bookTicker
+✅ 网格定位读取成交价，Maker 边界读取同一原子快照的最优盘口
 ❌ 禁止在其他地方独立启动价格流
 ```
 
@@ -146,8 +147,8 @@ opensqt_platform/
    └── Binance：同步服务器时间、加载合约过滤器、校验交易权限/单向持仓/空头持仓
    ↓
 3. 启动价格监控 (PriceMonitor.Start)
-   ├── 唯一价格 WebSocket
-   └── 等待首个有效价格
+   ├── 唯一 combined 市场数据 WebSocket（trade + bookTicker）
+   └── 等待首个完整成交价与最优盘口快照
    ↓
 4. 启动前安全检查
    ├── Binance 查询账户真实 Maker 费率
@@ -196,11 +197,11 @@ Shutdown 订单执行器，取消后台上下文
 
 ### 价格流
 ```
-Exchange WebSocket
+Binance combined WebSocket (trade + bookTicker)
     ↓
-PriceMonitor.updatePrice()
+PriceMonitor.updateMarket()
     ↓
-latestPriceChange (atomic.Value)
+MarketSnapshot (atomic.Value: LastPrice + BestBid/BestAsk + Epoch/Version)
     ↓
 periodicPriceSender (定期推送)
     ↓
@@ -208,7 +209,7 @@ priceChangeCh (channel)
     ↓
 tradingGateRuntime 串行协调器
     ↓
-联合健康检查（订单流 / 风控 / 对账 / 价格新鲜度）
+联合健康检查（订单流 / 风控 / 对账 / 成交价与盘口新鲜度）
     ├── ❌ 任一异常 → 停新单、撤买单、等待恢复对账
     └── ✅ 全部健康 → SuperPositionManager.AdjustOrders()
 ```
@@ -223,7 +224,7 @@ Binance 适配器校验连接代际、订阅确认、交易对与订单字段
     ↓
 main.go 回调函数
     ↓
-反射提取字段 (解决匿名结构体问题)
+显式转换 exchange.OrderUpdate → position.OrderUpdate
     ↓
 position.OrderUpdate
     ↓
@@ -429,7 +430,8 @@ slot.mu.Unlock()
 #### 设计原则
 - **全局唯一**: 整个系统只有一个实例
 - **WebSocket Only**: 不使用 REST API 轮询
-- **原子操作**: 使用 `atomic.Value` 存储价格
+- **原子操作**: 使用 `atomic.Value` 整份发布成交价、最优盘口、连接代际和盘口版本
+- **断线失效**: 连接异常立即发布 Reset，新代际重新收到 trade 与 bookTicker 前禁止新单
 
 #### 核心字段
 ```go
@@ -437,6 +439,7 @@ type PriceMonitor struct {
     exchange      exchange.IExchange
     lastPrice     atomic.Value  // float64
     lastPriceStr  atomic.Value  // string（用于检测精度）
+    market        atomic.Value  // exchange.MarketSnapshot
     
     priceChangeCh     chan PriceChange
     latestPriceChange atomic.Value  // *PriceChange
@@ -450,9 +453,9 @@ type PriceMonitor struct {
 ```
 1. StartPriceStream (启动 WebSocket)
    ↓
-2. updatePrice (收到价格推送)
+2. updateMarket (合并 trade / bookTicker 增量)
    ↓
-3. lastPrice / lastPriceTime / latestPriceChange 原子更新
+3. 原子发布完整 MarketSnapshot；断线 Reset 立即使旧盘口失效
    ↓
 4. periodicPriceSender (定期发送到 channel)
    ↓
@@ -594,7 +597,10 @@ type OrderCleaner struct {
 - **交易门禁**: 启动、异常恢复和停机期间可原子停止新单
 - **有界请求**: 下单、撤单与重试等待均可由上下文取消
 - **分类重试**: 仅重试明确可安全重试的失败
-- **严格 PostOnly**: 所有网格单只做 Maker；明确会吃单时不做同价重试，等待槽位冷却后按最新价格重算，绝不降级为普通单
+- **严格 PostOnly**: 所有网格单只做 Maker；提交边界以最新最优盘口复检，绝不降级为普通单
+- **被动补格**: 穿价 BUY 只允许向更低的 Maker 安全价移动；逻辑槽位价不变，固定报价金额按实际委托价重算数量
+- **版本化退避**: 同一盘口版本不重复尝试；`-5022` 默认按 50/100/200/400/500ms 退避，超过 burst 后至少等待 1 秒
+- **批量隔离**: 原生批量请求使用同一原子盘口复检；近盘口订单拆成单笔提交
 - **明确拒绝局部收敛**: 交易所已确认未受理的订单只释放对应槽位并短暂冷却，不关闭全局门禁、不撤销其它买单
 - **UNKNOWN 传播**: 结果未知时不释放槽位、不换 ClientOrderID 盲目重下
 
@@ -603,6 +609,9 @@ type OrderCleaner struct {
 PlaceOrder(req *OrderRequest) (*Order, error) {
     requireNewOrderGateOpen()
     rateLimiter.Wait(ctx)
+    acquireSlotSubmissionLease()
+    requireFreshAtomicBookTickerSnapshot()
+    rejectLocallyIfOrderWouldCrossMakerBoundary()
     req.PostOnly = true
     order, err := exchange.PlaceOrder(requestTimeoutCtx, req)
     if resultIsUnknown(err) || unclassifiedAfterSubmission(err) {
@@ -696,18 +705,16 @@ type IExchange interface {
 #### 问题3: WebSocket 回调类型
 **问题**: exchange 订单流回调需要传递 position.OrderUpdate，但会循环依赖
 
-**解决方案**: 使用 `interface{}` + 反射
+**解决方案**: exchange 层定义通用 `exchange.OrderUpdate`，main 显式转换成 position 类型
 ```go
 // exchange/interface.go
-StartOrderStream(ctx, callback func(interface{})) error
+StartOrderStream(ctx, callback func(exchange.OrderUpdate)) error
 
 // main.go
-ex.StartOrderStream(ctx, func(updateInterface interface{}) {
-    v := reflect.ValueOf(updateInterface)
-    // 反射提取字段
+ex.StartOrderStream(ctx, func(update exchange.OrderUpdate) {
     posUpdate := position.OrderUpdate{
-        OrderID:       getInt64Field("OrderID"),
-        ClientOrderID: getStringField("ClientOrderID"),
+        OrderID:       update.OrderID,
+        ClientOrderID: update.ClientOrderID,
         ...
     }
     superPositionManager.OnOrderUpdate(posUpdate)
@@ -1018,5 +1025,5 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 
 **官网**:
 - Website: www.OpenSQT.com
-- Version: v3.5.7
+- Version: v3.5.8
 - Last Updated: 2026-09-07

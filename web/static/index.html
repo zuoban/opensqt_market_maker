@@ -193,6 +193,27 @@
                         <p class="risk-msg" id="riskMsg">等待风控读数</p>
                         <div id="riskList" class="risk-list"></div>
                     </section>
+
+					<section class="panel maker-panel is-waiting" id="makerPanel" aria-labelledby="makerTitle">
+						<div class="panel-head">
+							<div class="panel-title">
+								<span>03 / MAKER EXECUTION</span>
+								<h2 id="makerTitle">Maker 执行健康</h2>
+							</div>
+							<div class="maker-status" id="makerStatus" role="status" aria-live="polite">
+								<i aria-hidden="true"></i><span>等待盘口</span>
+							</div>
+						</div>
+						<div class="maker-grid" aria-label="Maker 执行指标">
+							<div class="maker-stat"><span>接受率</span><strong id="makerAcceptance">—</strong></div>
+							<div class="maker-stat"><span>接受 / 尝试</span><strong id="makerAttempts">0 / 0</strong></div>
+							<div class="maker-stat"><span>远端 -5022</span><strong id="makerPostOnly">0</strong></div>
+							<div class="maker-stat"><span>本地盘口拦截</span><strong id="makerGuardSkips">0</strong></div>
+							<div class="maker-stat"><span>补格 活跃 / 累计</span><strong id="makerCatchUp">0 / 0</strong></div>
+							<div class="maker-stat"><span>买一 / 卖一</span><strong id="makerQuote">—</strong></div>
+						</div>
+						<p class="maker-note" id="makerNote">等待单一行情流送达完整盘口。</p>
+					</section>
                 </aside>
             </section>
 
@@ -200,7 +221,7 @@
                 <section class="panel filled-orders-panel" id="section-fills">
                     <div class="panel-head">
                         <div class="panel-title">
-                            <span>03 / EXECUTION TAPE</span>
+							<span>04 / EXECUTION TAPE</span>
                             <h2>成交订单</h2>
                         </div>
                         <span class="panel-meta" id="filledCount">本次运行 · 0 笔 · 列表最近 20</span>
@@ -271,7 +292,7 @@
                 <section class="panel log-panel">
                     <div class="panel-head">
                         <div class="panel-title">
-                            <span>04 / EVENT STREAM</span>
+							<span>05 / EVENT STREAM</span>
                             <h2>最近日志</h2>
                         </div>
                         <span class="panel-meta">最新事件优先</span>

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -131,6 +132,121 @@ func TestPlaceOrderForcesPostOnlyAtExecutionBoundary(t *testing.T) {
 	}
 	if !ex.requests[0].PostOnly {
 		t.Fatal("execution boundary submitted a non-PostOnly order")
+	}
+}
+
+func TestMakerGuardAllowsSafeBuyAndSell(t *testing.T) {
+	ex := &recordingExchange{
+		placeOrder: func(req *exchange.OrderRequest) (*exchange.Order, error) {
+			return &exchange.Order{
+				OrderID: 1, ClientOrderID: req.ClientOrderID, Symbol: req.Symbol,
+				Side: req.Side, Price: req.Price, Quantity: req.Quantity, Status: exchange.OrderStatusNew,
+			}, nil
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	executor.SetMakerGuard(func() exchange.MarketSnapshot {
+		return exchange.MarketSnapshot{
+			Symbol: "ETHUSDT", BestBid: 100, BestAsk: 100.10, Ready: true,
+			QuoteReceivedAt: time.Now(), QuoteVersion: 1, StreamEpoch: 1,
+		}
+	}, 0.01, 2, time.Second)
+
+	for _, req := range []*OrderRequest{
+		{Symbol: "ETHUSDT", Side: "BUY", Price: 100.08, Quantity: 0.1, ClientOrderID: "safe-buy"},
+		{Symbol: "ETHUSDT", Side: "SELL", Price: 100.02, Quantity: 0.1, ReduceOnly: true, ClientOrderID: "safe-sell"},
+	} {
+		if _, err := executor.PlaceOrder(req); err != nil {
+			t.Fatalf("safe %s rejected: %v", req.Side, err)
+		}
+	}
+	if len(ex.requests) != 2 {
+		t.Fatalf("exchange request count = %d, want 2", len(ex.requests))
+	}
+}
+
+func TestMakerGuardRejectsCrossedOrderBeforeExchange(t *testing.T) {
+	ex := &recordingExchange{
+		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {
+			t.Fatal("unsafe maker request reached exchange")
+			return nil, nil
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	executor.SetMakerGuard(func() exchange.MarketSnapshot {
+		return exchange.MarketSnapshot{
+			Symbol: "ETHUSDT", BestBid: 100, BestAsk: 100.10, Ready: true,
+			QuoteReceivedAt: time.Now(), QuoteVersion: 8, StreamEpoch: 2,
+		}
+	}, 0.01, 2, time.Second)
+
+	var gotKind OrderRejectionKind
+	_, err := executor.PlaceOrder(&OrderRequest{
+		Symbol: "ETHUSDT", Side: "BUY", Price: 100.09, Quantity: 0.1, ClientOrderID: "crossed",
+		OnDefiniteRejection: func(kind OrderRejectionKind) { gotKind = kind },
+	})
+	var rejected *OrderRejectedError
+	if !errors.As(err, &rejected) || rejected.Kind != OrderRejectionMakerMoved {
+		t.Fatalf("error = %v, want maker-moved rejection", err)
+	}
+	if gotKind != OrderRejectionMakerMoved || len(ex.requests) != 0 {
+		t.Fatalf("callback kind=%q exchange requests=%d", gotKind, len(ex.requests))
+	}
+}
+
+func TestMakerGuardRejectsStaleQuoteBeforeExchange(t *testing.T) {
+	ex := &recordingExchange{
+		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {
+			t.Fatal("stale-quote request reached exchange")
+			return nil, nil
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	executor.SetMakerGuard(func() exchange.MarketSnapshot {
+		return exchange.MarketSnapshot{
+			Symbol: "ETHUSDT", BestBid: 100, BestAsk: 101, Ready: true,
+			QuoteReceivedAt: time.Now().Add(-2 * time.Second), QuoteVersion: 1, StreamEpoch: 1,
+		}
+	}, 0.01, 1, time.Second)
+
+	_, err := executor.PlaceOrder(&OrderRequest{
+		Symbol: "ETHUSDT", Side: "SELL", Price: 102, Quantity: 0.1, ReduceOnly: true,
+	})
+	var rejected *OrderRejectedError
+	if !errors.As(err, &rejected) || rejected.Kind != OrderRejectionMarketDataStale {
+		t.Fatalf("error = %v, want market-data-stale rejection", err)
+	}
+	if len(ex.requests) != 0 {
+		t.Fatalf("exchange request count = %d, want 0", len(ex.requests))
+	}
+}
+
+func TestMakerGuardRejectsInvalidOrderPriceBeforeExchange(t *testing.T) {
+	ex := &recordingExchange{
+		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {
+			t.Fatal("invalid-price request reached exchange")
+			return nil, nil
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	executor.SetMakerGuard(func() exchange.MarketSnapshot {
+		return exchange.MarketSnapshot{
+			Symbol: "ETHUSDT", BestBid: 100, BestAsk: 101, Ready: true,
+			QuoteReceivedAt: time.Now(), QuoteVersion: 1, StreamEpoch: 1,
+		}
+	}, 0.01, 1, time.Second)
+
+	for _, price := range []float64{0, -1, math.NaN(), math.Inf(1)} {
+		_, err := executor.PlaceOrder(&OrderRequest{
+			Symbol: "ETHUSDT", Side: "BUY", Price: price, Quantity: 0.1,
+		})
+		var rejected *OrderRejectedError
+		if !errors.As(err, &rejected) || rejected.Kind != OrderRejectionMakerMoved {
+			t.Fatalf("price=%v error=%v, want local maker rejection", price, err)
+		}
+	}
+	if len(ex.requests) != 0 {
+		t.Fatalf("exchange request count = %d, want 0", len(ex.requests))
 	}
 }
 

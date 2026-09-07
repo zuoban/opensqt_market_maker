@@ -136,8 +136,35 @@ func (w *WebSocketManager) Start(ctx context.Context, callback OrderUpdateCallba
 	return nil
 }
 
-// StartPriceStream 启动价格流
-func (w *WebSocketManager) StartPriceStream(ctx context.Context, symbol string, callback func(price float64)) error {
+type combinedMarketEnvelope struct {
+	Stream string          `json:"stream"`
+	Data   json.RawMessage `json:"data"`
+}
+
+type combinedMarketHeader struct {
+	EventType string `json:"e"`
+	EventTime int64  `json:"E"`
+	Symbol    string `json:"s"`
+}
+
+// MarketUpdate 是 Binance 包内部的市场增量；wrapper 会转换成 exchange
+// 层的通用类型，避免子包反向导入父包形成循环依赖。
+type MarketUpdate struct {
+	Symbol       string
+	LastPrice    float64
+	BestBid      float64
+	BestAsk      float64
+	EventTime    time.Time
+	ReceivedAt   time.Time
+	QuoteVersion uint64
+	StreamEpoch  uint64
+	Reset        bool
+}
+
+// StartPriceStream 启动全局唯一市场数据流。同一条 combined WebSocket
+// 同时订阅 trade 与 bookTicker：成交价用于网格和 K 线，最优盘口用于
+// 最终 Maker 判断，禁止为了盘口再开第二条价格连接。
+func (w *WebSocketManager) StartPriceStream(ctx context.Context, symbol string, callback func(MarketUpdate)) error {
 	if ctx == nil {
 		return fmt.Errorf("价格流上下文不能为空")
 	}
@@ -148,62 +175,49 @@ func (w *WebSocketManager) StartPriceStream(ctx context.Context, symbol string, 
 		return fmt.Errorf("价格流回调不能为空")
 	}
 
-	// 使用原生 WebSocket 连接（go-binance 的 WsAggTradeServe 有 Bug）
-	// 新路由优先，旧地址保留为回退，避免 Binance 路由迁移时直接断流
-
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	symbolLower := strings.ToLower(symbol)
-	streamName := fmt.Sprintf("%s@aggTrade", symbolLower)
+	streamNames := fmt.Sprintf("%s@trade/%s@bookTicker", symbolLower, symbolLower)
 	urls := []string{
-		fmt.Sprintf("wss://fstream.binance.com/market/ws/%s", streamName),
-		fmt.Sprintf("wss://fstream.binance.com/ws/%s", streamName),
+		fmt.Sprintf("wss://fstream.binance.com/stream?streams=%s", streamNames),
 	}
-
-	// 使用通道等待首个价格
-	firstPriceCh := make(chan struct{})
-	firstPriceReceived := false
+	firstMarketCh := make(chan struct{})
+	var firstMarketOnce sync.Once
 
 	go func() {
+		var streamEpoch uint64
+		var quoteVersion uint64
 		for {
-			select {
-			case <-ctx.Done():
-				logger.Info("✅ [Binance] 价格流已停止")
+			if ctx.Err() != nil {
+				logger.Info("✅ [Binance] 市场数据流已停止")
 				return
-			default:
 			}
+			streamEpoch++
+			callback(MarketUpdate{
+				Symbol: symbol, StreamEpoch: streamEpoch, ReceivedAt: time.Now(), Reset: true,
+			})
 
-			var (
-				conn      *websocket.Conn
-				activeURL string
-				err       error
-			)
-
+			var conn *websocket.Conn
+			var activeURL string
 			for i, url := range urls {
-				logger.Debug("🔗 [Binance] 正在连接价格 WebSocket: %s", url)
+				var err error
 				conn, _, err = websocket.DefaultDialer.DialContext(ctx, url, nil)
 				if err == nil {
 					activeURL = url
 					if i > 0 {
-						logger.Warn("⚠️ [Binance] 价格流已回退到兼容地址: %s", url)
+						logger.Warn("⚠️ [Binance] 市场数据流已回退到兼容地址: %s", url)
 					}
 					break
 				}
-				logger.Warn("⚠️ [Binance] 价格 WebSocket 连接失败: %s, err=%v", url, err)
+				logger.Warn("⚠️ [Binance] 市场数据 WebSocket 连接失败: %s, err=%v", url, err)
 			}
-
 			if conn == nil {
-				if ctx.Err() != nil {
-					logger.Info("✅ [Binance] 价格流已停止")
-					return
-				}
-				logger.Error("❌ [Binance] 所有价格 WebSocket 地址连接失败，5秒后重试")
 				if !waitPriceReconnect(ctx, 5*time.Second) {
-					logger.Info("✅ [Binance] 价格流已停止")
 					return
 				}
 				continue
 			}
 
-			// ReadMessage 会阻塞；上下文取消时主动关闭连接以唤醒读取，确保退出不挂住。
 			cancelWatchDone := make(chan struct{})
 			go func(activeConn *websocket.Conn) {
 				select {
@@ -213,78 +227,149 @@ func (w *WebSocketManager) StartPriceStream(ctx context.Context, symbol string, 
 				}
 			}(conn)
 
-			logger.Info("✅ [Binance] WebSocket 已连接: %s", activeURL) // 读取消息循环
+			logger.Info("✅ [Binance] 市场数据 WebSocket 已连接: %s", activeURL)
+			var lastPrice, bestBid, bestAsk float64
 			for {
-				select {
-				case <-ctx.Done():
-					conn.Close()
-					logger.Info("✅ [Binance] 价格流已停止")
-					return
-				default:
-				}
-
-				_, message, err := conn.ReadMessage()
-				if err != nil {
+				_, message, readErr := conn.ReadMessage()
+				if readErr != nil {
 					close(cancelWatchDone)
-					if ctx.Err() != nil {
-						logger.Info("✅ [Binance] 价格流已停止")
-						return
-					}
-					logger.Warn("⚠️ [Binance] WebSocket 读取错误: %v，正在重连", err)
 					_ = conn.Close()
-					if !waitPriceReconnect(ctx, 2*time.Second) {
-						logger.Info("✅ [Binance] 价格流已停止")
+					if ctx.Err() != nil {
 						return
 					}
-					break // 跳出内层循环，重新连接
+					// 立即使旧盘口失效，不能在重连等待期间继续用旧报价下单。
+					callback(MarketUpdate{
+						Symbol: symbol, StreamEpoch: streamEpoch, ReceivedAt: time.Now(), Reset: true,
+					})
+					logger.Warn("⚠️ [Binance] 市场数据 WebSocket 读取错误: %v，正在重连", readErr)
+					if !waitPriceReconnect(ctx, 2*time.Second) {
+						return
+					}
+					break
 				}
 
-				// 解析消息（只提取必要字段）
-				var event struct {
-					Symbol string `json:"s"`
-					Price  string `json:"p"`
-				}
-
-				if err := json.Unmarshal(message, &event); err != nil {
-					logger.Debug("解析消息失败: %v", err)
+				receivedAt := time.Now()
+				update, recognized, parseErr := parseCombinedMarketUpdate(
+					message, symbol, quoteVersion, streamEpoch, receivedAt,
+				)
+				if parseErr != nil {
+					logger.Debug("忽略非法市场数据: %v", parseErr)
 					continue
 				}
-				if !strings.EqualFold(strings.TrimSpace(event.Symbol), strings.TrimSpace(symbol)) {
-					logger.Warn("⚠️ [Binance] 忽略交易对不匹配的价格推送: got=%q, want=%q", event.Symbol, symbol)
+				if !recognized {
 					continue
 				}
-
-				price, err := parseFiniteFloat("aggTrade.price", event.Price)
-				if err != nil || price <= 0 {
-					logger.Debug("解析价格失败: %v", err)
-					continue
-				} // 更新价格缓存
-				w.priceMu.Lock()
-				w.latestPrice = price
-				w.priceMu.Unlock()
-
-				// 通知首个价格已接收
-				if !firstPriceReceived {
-					firstPriceReceived = true
-					logger.Debug("✅ [Binance] 收到首个价格: %.2f", price)
-					close(firstPriceCh)
+				if update.LastPrice > 0 {
+					lastPrice = update.LastPrice
+					w.priceMu.Lock()
+					w.latestPrice = update.LastPrice
+					w.priceMu.Unlock()
 				}
+				if update.BestBid > 0 {
+					bestBid, bestAsk = update.BestBid, update.BestAsk
+					quoteVersion = update.QuoteVersion
+				}
+				callback(update)
 
-				// 调用回调
-				callback(price)
+				if lastPrice > 0 && bestBid > 0 && bestAsk > bestBid {
+					firstMarketOnce.Do(func() { close(firstMarketCh) })
+				}
 			}
 		}
 	}()
 
-	// 等待接收首个价格（最多10秒）
 	select {
-	case <-firstPriceCh:
-		logger.Debug("✅ [Binance] 价格流已启动: %s", streamName)
+	case <-firstMarketCh:
+		logger.Debug("✅ [Binance] 市场数据流已启动: %s", streamNames)
 		return nil
 	case <-time.After(10 * time.Second):
-		return fmt.Errorf("等待首个价格超时（10秒）")
+		return fmt.Errorf("等待首个完整市场快照超时（10秒）")
 	case <-ctx.Done():
 		return fmt.Errorf("上下文已取消")
+	}
+}
+
+// parseCombinedMarketUpdate 将 Binance combined stream 消息解析为单一市场增量。
+// recognized=false 表示合法但不是本策略订阅的事件；所有畸形值和交易对串线
+// 都返回错误，由上层忽略且不污染当前快照。
+func parseCombinedMarketUpdate(
+	message []byte,
+	expectedSymbol string,
+	quoteVersion uint64,
+	streamEpoch uint64,
+	receivedAt time.Time,
+) (MarketUpdate, bool, error) {
+	var envelope combinedMarketEnvelope
+	if err := json.Unmarshal(message, &envelope); err != nil {
+		return MarketUpdate{}, false, fmt.Errorf("解析 combined envelope: %w", err)
+	}
+	if len(envelope.Data) == 0 {
+		return MarketUpdate{}, false, fmt.Errorf("combined envelope 缺少 data")
+	}
+
+	var header combinedMarketHeader
+	if err := json.Unmarshal(envelope.Data, &header); err != nil {
+		return MarketUpdate{}, false, fmt.Errorf("解析市场消息头: %w", err)
+	}
+	expectedSymbol = strings.ToUpper(strings.TrimSpace(expectedSymbol))
+	if !strings.EqualFold(strings.TrimSpace(header.Symbol), expectedSymbol) {
+		return MarketUpdate{}, false, fmt.Errorf("市场数据交易对不匹配: got=%q want=%q", header.Symbol, expectedSymbol)
+	}
+	if receivedAt.IsZero() {
+		receivedAt = time.Now()
+	}
+	eventTime := receivedAt
+	if header.EventTime > 0 {
+		eventTime = time.UnixMilli(header.EventTime)
+	}
+	update := MarketUpdate{
+		Symbol: expectedSymbol, EventTime: eventTime, ReceivedAt: receivedAt, StreamEpoch: streamEpoch,
+	}
+	streamName := strings.ToLower(strings.TrimSpace(envelope.Stream))
+
+	switch {
+	case header.EventType == "trade" || strings.HasSuffix(streamName, "@trade"):
+		var event struct {
+			Price string `json:"p"`
+		}
+		if err := json.Unmarshal(envelope.Data, &event); err != nil {
+			return MarketUpdate{}, false, fmt.Errorf("解析 trade: %w", err)
+		}
+		price, err := parseFiniteFloat("trade.price", event.Price)
+		if err != nil {
+			return MarketUpdate{}, false, err
+		}
+		if price <= 0 {
+			return MarketUpdate{}, false, fmt.Errorf("非法成交价 %q", event.Price)
+		}
+		update.LastPrice = price
+		return update, true, nil
+
+	case header.EventType == "bookTicker" || strings.HasSuffix(streamName, "@bookticker"):
+		var event struct {
+			BestBid string `json:"b"`
+			BestAsk string `json:"a"`
+		}
+		if err := json.Unmarshal(envelope.Data, &event); err != nil {
+			return MarketUpdate{}, false, fmt.Errorf("解析 bookTicker: %w", err)
+		}
+		bid, bidErr := parseFiniteFloat("bookTicker.bestBid", event.BestBid)
+		ask, askErr := parseFiniteFloat("bookTicker.bestAsk", event.BestAsk)
+		if bidErr != nil {
+			return MarketUpdate{}, false, bidErr
+		}
+		if askErr != nil {
+			return MarketUpdate{}, false, askErr
+		}
+		if bid <= 0 || ask <= bid {
+			return MarketUpdate{}, false, fmt.Errorf("非法最优盘口: bid=%q ask=%q", event.BestBid, event.BestAsk)
+		}
+		update.BestBid = bid
+		update.BestAsk = ask
+		update.QuoteVersion = quoteVersion + 1
+		return update, true, nil
+	default:
+		return MarketUpdate{}, false, nil
 	}
 }
 

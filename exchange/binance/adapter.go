@@ -1059,7 +1059,7 @@ func (b *BinanceAdapter) GetLatestPrice(ctx context.Context, symbol string) (flo
 }
 
 // StartPriceStream 启动价格流（WebSocket）
-func (b *BinanceAdapter) StartPriceStream(ctx context.Context, symbol string, callback func(price float64)) error {
+func (b *BinanceAdapter) StartPriceStream(ctx context.Context, symbol string, callback func(MarketUpdate)) error {
 	// 启动价格流
 	return b.wsManager.StartPriceStream(ctx, symbol, callback)
 }

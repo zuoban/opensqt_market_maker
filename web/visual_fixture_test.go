@@ -91,9 +91,11 @@ func visualFixtureSnapshot() map[string]interface{} {
 		"uptimeSec": 8280,
 		"app": map[string]interface{}{
 			"exchange": "binance", "symbol": "ETHUSDT", "orderQuantity": 30,
+			"makerGuardTicks": 2, "quoteStaleMs": 1500, "catchUpMode": "passive",
 		},
 		"price": map[string]interface{}{
-			"last": latest, "lastText": "4,222.02", "updatedAt": time.Now(), "ageMs": 80,
+			"last": latest, "lastText": "4,222.02", "bestBid": 4221.99, "bestAsk": 4222.03,
+			"quoteUpdatedAt": time.Now(), "quoteAgeMs": 46, "updatedAt": time.Now(), "ageMs": 80,
 		},
 		"kline": map[string]interface{}{
 			"interval": "5m", "updatedAt": time.Now(), "historyReady": true, "degraded": false, "candles": candles,
@@ -107,6 +109,10 @@ func visualFixtureSnapshot() map[string]interface{} {
 			"filledOrders":     filledOrders,
 			"filledHourly":     filledHourly,
 			"filledOrderCount": int64(48),
+			"makerExecution": map[string]interface{}{
+				"attempts": 126, "accepted": 121, "guardSkips": 3, "postOnlyRejects": 2,
+				"catchUpOrders": 7, "catchUpAbandoned": 1, "activeCatchUp": 1,
+			},
 		},
 		"risk": map[string]interface{}{
 			"enabled": true, "triggered": false, "lastMsg": "监控正常 · 量价均在阈值内",

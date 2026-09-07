@@ -57,8 +57,9 @@ type IExchange interface {
 	// GetLatestPrice 获取最新价格
 	GetLatestPrice(ctx context.Context, symbol string) (float64, error)
 
-	// StartPriceStream 启动价格流（WebSocket）
-	StartPriceStream(ctx context.Context, symbol string, callback func(price float64)) error
+	// StartPriceStream 启动全局唯一市场数据流（WebSocket）。同一条底层连接
+	// 同时提供成交价和最优盘口，禁止其它模块另开价格流。
+	StartPriceStream(ctx context.Context, symbol string, callback func(MarketUpdate)) error
 
 	// StartKlineStream 启动K线流（WebSocket）
 	// symbols: 交易对列表，interval: K线周期（如 "1m"），callback: K线更新回调

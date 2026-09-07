@@ -293,8 +293,16 @@ func (w *binanceWrapper) GetLatestPrice(ctx context.Context, symbol string) (flo
 	return w.adapter.GetLatestPrice(ctx, symbol)
 }
 
-func (w *binanceWrapper) StartPriceStream(ctx context.Context, symbol string, callback func(price float64)) error {
-	return w.adapter.StartPriceStream(ctx, symbol, callback)
+func (w *binanceWrapper) StartPriceStream(ctx context.Context, symbol string, callback func(MarketUpdate)) error {
+	return w.adapter.StartPriceStream(ctx, symbol, func(update binance.MarketUpdate) {
+		callback(MarketUpdate{
+			Symbol: update.Symbol, LastPrice: update.LastPrice,
+			BestBid: update.BestBid, BestAsk: update.BestAsk,
+			EventTime: update.EventTime, ReceivedAt: update.ReceivedAt,
+			QuoteVersion: update.QuoteVersion, StreamEpoch: update.StreamEpoch,
+			Reset: update.Reset,
+		})
+	})
 }
 
 func (w *binanceWrapper) StartKlineStream(ctx context.Context, symbols []string, interval string, callback CandleUpdateCallback) error {

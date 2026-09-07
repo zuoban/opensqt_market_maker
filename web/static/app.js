@@ -12,6 +12,7 @@
             buildSnapshotHealthModel,
             buildSnapshotAcceptanceModel,
             buildFreshnessModel,
+			buildMakerExecutionModel,
             centeredScrollLeft,
             formatRelativeTime,
             candleChangePct,
@@ -443,6 +444,90 @@
         if (node.textContent !== text) node.textContent = text;
     }
 
+	function buildMakerExecutionModel(price, position, app) {
+		const market = price || {};
+		const execution = position && position.makerExecution || {};
+		const settings = app || {};
+		const count = (value) => {
+			const number = Number(value);
+			return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+		};
+		const attempts = count(execution.attempts);
+		const accepted = count(execution.accepted);
+		const guardSkips = count(execution.guardSkips);
+		const postOnlyRejects = count(execution.postOnlyRejects);
+		const catchUpOrders = count(execution.catchUpOrders);
+		const catchUpAbandoned = count(execution.catchUpAbandoned);
+		const activeCatchUp = count(execution.activeCatchUp);
+		const bestBid = finiteOrNull(market.bestBid);
+		const bestAsk = finiteOrNull(market.bestAsk);
+		const quoteReady = bestBid != null && bestAsk != null && bestBid > 0 && bestAsk > bestBid;
+		const age = finiteOrNull(market.quoteAgeMs);
+		const quoteAgeMs = quoteReady && age != null ? Math.max(0, age) : null;
+		const staleSetting = finiteOrNull(settings.quoteStaleMs);
+		const quoteStaleMs = staleSetting != null && staleSetting > 0 ? staleSetting : 1500;
+		const quoteStale = !quoteReady || quoteAgeMs == null || quoteAgeMs > quoteStaleMs;
+		const acceptanceRate = attempts > 0 ? clamp(accepted / attempts * 100, 0, 100) : null;
+
+		let state = "healthy";
+		let statusText = "提交健康";
+		if (!quoteReady) {
+			state = "waiting";
+			statusText = "等待盘口";
+		} else if (quoteStale) {
+			state = "warning";
+			statusText = "盘口陈旧 · 暂停新单";
+		} else if (attempts >= 10 && acceptanceRate < 90) {
+			state = "warning";
+			statusText = "接受率偏低";
+		}
+
+		return {
+			state,
+			statusText,
+			attempts,
+			accepted,
+			acceptanceRate,
+			guardSkips,
+			postOnlyRejects,
+			catchUpOrders,
+			catchUpAbandoned,
+			activeCatchUp,
+			bestBid,
+			bestAsk,
+			quoteReady,
+			quoteAgeMs,
+			quoteStaleMs,
+			makerGuardTicks: count(settings.makerGuardTicks),
+			catchUpMode: String(settings.catchUpMode || "passive")
+		};
+	}
+
+	function renderMakerExecution(model, decimals) {
+		const panel = $("makerPanel");
+		if (!panel) return;
+		["is-healthy", "is-warning", "is-waiting"].forEach((name) => panel.classList.remove(name));
+		panel.classList.add("is-" + model.state);
+		setText($("makerStatus").querySelector("span"), model.statusText);
+		setText($("makerAcceptance"), model.acceptanceRate == null ? "—" : fmt(model.acceptanceRate, 1) + "%");
+		$("makerAcceptance").className = model.state === "warning" ? "warn" : (model.acceptanceRate == null ? "" : "pos");
+		setText($("makerAttempts"), model.accepted + " / " + model.attempts);
+		setText($("makerPostOnly"), model.postOnlyRejects);
+		$("makerPostOnly").className = model.postOnlyRejects > 0 ? "warn" : "";
+		setText($("makerGuardSkips"), model.guardSkips);
+		setText($("makerCatchUp"), model.activeCatchUp + " / " + model.catchUpOrders);
+		setText($("makerQuote"), model.quoteReady
+			? fmt(model.bestBid, decimals) + " / " + fmt(model.bestAsk, decimals)
+			: "—");
+		const ageText = model.quoteAgeMs == null ? "等待盘口" : "盘口 " + ago(model.quoteAgeMs);
+		const modeText = model.catchUpMode === "exact_wait" ? "原价等待" : "被动补格";
+		setText(
+			$("makerNote"),
+			ageText + " · 保护 " + model.makerGuardTicks + " tick · " + modeText +
+			" · 放弃补格 " + model.catchUpAbandoned
+		);
+	}
+
     function replaceChildren(container, nodes) {
         const fragment = document.createDocumentFragment();
         nodes.forEach((node) => fragment.appendChild(node));
@@ -506,6 +591,7 @@
         const dec = pos.priceDecimals ?? 2;
         const quote = margin.quoteAsset || acc.quoteAsset || "USDT";
         const marginModel = buildMarginUsageModel(margin, quote);
+		const makerModel = buildMakerExecutionModel(price, pos, app);
 
         setText($("pair"), (app.exchange || "—") + " · " + (app.symbol || pos.symbol || "—"));
         const priceNode = $("lastPrice");
@@ -596,6 +682,7 @@
         updateSection("primary-kpis", primaryItems, () => renderMetrics($("kpis"), primaryItems));
         updateSection("margin-usage", { margin, quote }, () => renderMarginUsage(marginModel));
         updateSection("strategy-kpis", strategyItems, () => renderMetrics($("strategyKpis"), strategyItems));
+		updateSection("maker-execution", { makerModel, dec }, () => renderMakerExecution(makerModel, dec));
         $("strategySummary").textContent =
             "已运行 " + uptimeText +
             " · 网格 " + fmt(pos.gridPrice, dec) +

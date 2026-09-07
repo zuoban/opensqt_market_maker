@@ -9,12 +9,55 @@ const {
     buildSnapshotHealthModel,
     buildSnapshotAcceptanceModel,
     buildFreshnessModel,
+	buildMakerExecutionModel,
     centeredScrollLeft,
     formatRelativeTime,
     candleChangePct,
     formatCandleChange,
     candleDetail
 } = require("./static/app.js");
+
+test("maker execution model reports quote health and strict-maker outcomes", () => {
+	const healthy = buildMakerExecutionModel(
+		{ bestBid: 100, bestAsk: 100.1, quoteAgeMs: 400 },
+		{ makerExecution: {
+			attempts: 20,
+			accepted: 19,
+			guardSkips: 1,
+			postOnlyRejects: 0,
+			catchUpOrders: 3,
+			catchUpAbandoned: 1,
+			activeCatchUp: 1
+		} },
+		{ quoteStaleMs: 1500, makerGuardTicks: 2, catchUpMode: "passive" }
+	);
+	assert.equal(healthy.state, "healthy");
+	assert.equal(healthy.acceptanceRate, 95);
+	assert.equal(healthy.quoteReady, true);
+	assert.equal(healthy.activeCatchUp, 1);
+	assert.equal(healthy.makerGuardTicks, 2);
+
+	const stale = buildMakerExecutionModel(
+		{ bestBid: 100, bestAsk: 100.1, quoteAgeMs: 1501 },
+		{ makerExecution: { attempts: 4, accepted: 4 } },
+		{ quoteStaleMs: 1500 }
+	);
+	assert.equal(stale.state, "warning");
+	assert.equal(stale.statusText, "盘口陈旧 · 暂停新单");
+
+	const lowAcceptance = buildMakerExecutionModel(
+		{ bestBid: 100, bestAsk: 100.1, quoteAgeMs: 20 },
+		{ makerExecution: { attempts: 10, accepted: 8, postOnlyRejects: 2 } },
+		{ quoteStaleMs: 1500 }
+	);
+	assert.equal(lowAcceptance.state, "warning");
+	assert.equal(lowAcceptance.acceptanceRate, 80);
+	assert.equal(lowAcceptance.postOnlyRejects, 2);
+
+	const waiting = buildMakerExecutionModel({}, {}, {});
+	assert.equal(waiting.state, "waiting");
+	assert.equal(waiting.acceptanceRate, null);
+});
 
 function fixture() {
     return {
@@ -363,13 +406,16 @@ test("a delayed REST instance cannot retire the current websocket generation", (
 
 test("event stream follows execution tape at the end of the dashboard", () => {
     const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
+	const maker = html.indexOf('id="makerPanel"');
     const fills = html.indexOf('id="section-fills"');
     const logs = html.indexOf('id="section-logs"');
     const mainEnd = html.indexOf("</main>");
-    assert.ok(fills >= 0);
+	assert.ok(maker >= 0);
+	assert.ok(fills > maker);
     assert.ok(logs > fills);
     assert.ok(mainEnd > logs);
-    assert.ok(html.indexOf("03 / EXECUTION TAPE") < html.indexOf("04 / EVENT STREAM"));
+	assert.ok(html.indexOf("03 / MAKER EXECUTION") < html.indexOf("04 / EXECUTION TAPE"));
+	assert.ok(html.indexOf("04 / EXECUTION TAPE") < html.indexOf("05 / EVENT STREAM"));
 });
 
 test("margin capacity surface exposes status, exact amounts and an accessible gauge", () => {

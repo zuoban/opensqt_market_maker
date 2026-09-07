@@ -9,6 +9,8 @@ type OrderRejectionKind string
 
 const (
 	OrderRejectionPostOnly         OrderRejectionKind = "post_only"
+	OrderRejectionMakerMoved       OrderRejectionKind = "maker_quote_moved"
+	OrderRejectionMarketDataStale  OrderRejectionKind = "market_data_stale"
 	OrderRejectionRateLimit        OrderRejectionKind = "rate_limit"
 	OrderRejectionMargin           OrderRejectionKind = "margin"
 	OrderRejectionPositionMode     OrderRejectionKind = "position_mode"

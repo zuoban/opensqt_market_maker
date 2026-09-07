@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"opensqt/exchange"
 	"opensqt/exchange/exchangeerr"
@@ -70,6 +71,73 @@ func TestNativeBatchPlaceOrdersUsesOneHTTPCallAndForcesPostOnly(t *testing.T) {
 		if !req.PostOnly {
 			t.Fatalf("request %d was not forced PostOnly", i)
 		}
+	}
+}
+
+func TestNativeBatchFiltersUnsafeMakerItemBeforeExchange(t *testing.T) {
+	ex := &batchRecordingExchange{batchSize: 5}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	executor.rateLimiter = &countingWaiter{}
+	providerCalls := 0
+	executor.SetMakerGuard(func() exchange.MarketSnapshot {
+		providerCalls++
+		return exchange.MarketSnapshot{
+			Symbol: "ETHUSDT", BestBid: 100, BestAsk: 100.10, Ready: true,
+			QuoteReceivedAt: time.Now(), QuoteVersion: 5, StreamEpoch: 1,
+		}
+	}, 0.01, 2, time.Second)
+
+	var unsafeKind OrderRejectionKind
+	placed, margin, err := executor.BatchPlaceOrders([]*OrderRequest{
+		{Symbol: "ETHUSDT", Side: "BUY", Price: 99, Quantity: 0.1, ClientOrderID: "safe"},
+		{
+			Symbol: "ETHUSDT", Side: "BUY", Price: 100.09, Quantity: 0.1, ClientOrderID: "unsafe",
+			OnDefiniteRejection: func(kind OrderRejectionKind) { unsafeKind = kind },
+		},
+	})
+	if err == nil || margin {
+		t.Fatalf("BatchPlaceOrders() error=%v margin=%v, want local rejection only", err, margin)
+	}
+	if len(placed) != 1 || placed[0].ClientOrderID != "safe" {
+		t.Fatalf("placed = %+v, want safe item only", placed)
+	}
+	if unsafeKind != OrderRejectionMakerMoved {
+		t.Fatalf("unsafe rejection kind = %q", unsafeKind)
+	}
+	if ex.batchCalls != 1 || len(ex.requests) != 1 || ex.requests[0].ClientOrderID != "safe" {
+		t.Fatalf("batchCalls=%d requests=%+v", ex.batchCalls, ex.requests)
+	}
+	if providerCalls != 1 {
+		t.Fatalf("market snapshot provider calls = %d, want one atomic snapshot per batch", providerCalls)
+	}
+}
+
+func TestNativeBatchSubmitsNearTouchOrderSeparately(t *testing.T) {
+	ex := &batchRecordingExchange{batchSize: 5}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	executor.rateLimiter = &countingWaiter{}
+
+	placed, margin, err := executor.BatchPlaceOrders([]*OrderRequest{
+		{Symbol: "ETHUSDT", Side: "BUY", Price: 90, Quantity: 0.1, ClientOrderID: "deep-1"},
+		{Symbol: "ETHUSDT", Side: "BUY", Price: 99, Quantity: 0.1, ClientOrderID: "near", NearTouch: true},
+		{Symbol: "ETHUSDT", Side: "BUY", Price: 89, Quantity: 0.1, ClientOrderID: "deep-2"},
+	})
+	if err != nil || margin || len(placed) != 3 {
+		t.Fatalf("placed=%d margin=%v err=%v", len(placed), margin, err)
+	}
+	if ex.batchCalls != 3 {
+		t.Fatalf("native batch calls = %d, want deep/near/deep as 3 calls", ex.batchCalls)
+	}
+}
+
+func TestBatchPlaceOrdersRejectsNilRequestWithoutPanic(t *testing.T) {
+	ex := &batchRecordingExchange{batchSize: 5}
+	executor := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
+	executor.rateLimiter = &countingWaiter{}
+
+	placed, margin, err := executor.BatchPlaceOrders([]*OrderRequest{nil})
+	if err == nil || margin || len(placed) != 0 || ex.batchCalls != 0 {
+		t.Fatalf("placed=%d margin=%v err=%v batchCalls=%d", len(placed), margin, err, ex.batchCalls)
 	}
 }
 

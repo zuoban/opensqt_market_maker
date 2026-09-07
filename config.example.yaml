@@ -51,6 +51,20 @@ trading:
   # 持仓安全性配置
   position_safety_check: 100        # 持仓安全性检查（默认100，最少能向下持有多少仓）
 
+# 严格 Maker 执行策略。逻辑网格价保持不变，实际 BUY 委托在穿价时只允许
+# 向更低、更有利的价格被动补挂；任何路径都不会降级成 Taker。
+execution:
+  maker_guard_ticks: 2                 # 距离对手最优价至少保留多少个 tick
+  quote_stale_ms: 1500                 # 盘口超过此时长只暂停新提交，不盲用旧盘口
+  post_only_retry_min_ms: 50           # -5022 首次退避
+  post_only_retry_max_ms: 500          # -5022 指数退避上限
+  post_only_retry_burst: 5             # 前 N 次走指数退避；超过后每次至少暂停 1 秒
+  catch_up_mode: "passive"             # passive / exact_wait
+  max_active_catch_up_slots: 1         # 同时最多一个穿价补格单
+  max_catch_up_slots_per_adjust: 1      # 每轮最多创建一个补格单
+  max_catch_up_distance_ratio: 0.5      # 最大补格距离占 price_interval 的比例
+  near_touch_single_order_ratio: 0.15   # 距盘口过近的订单改用单笔提交
+
 
 # 时间间隔配置
 timing:

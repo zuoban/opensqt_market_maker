@@ -469,6 +469,8 @@ func (r *tradingGateRuntime) snapshot() tradingGateHealth {
 		marginReady = r.margin.IsReady()
 		marginTriggered = r.margin.IsTriggered()
 	}
+	market := r.price.GetMarketSnapshot()
+	now := time.Now()
 	return tradingGateHealth{
 		OrderStreamReady: orderReady,
 		OrderStreamState: orderState,
@@ -477,7 +479,9 @@ func (r *tradingGateRuntime) snapshot() tradingGateHealth {
 		MarginReady:      marginReady,
 		MarginTriggered:  marginTriggered,
 		ReconcilerReady:  r.reconciler.IsHealthy(),
-		PriceFresh:       r.price.GetLastPrice() > 0 && priceIsFresh(r.price.GetLastPriceTime(), time.Now(), r.priceStaleAfter),
+		PriceFresh: market.Ready && market.LastPrice > 0 &&
+			priceIsFresh(r.price.GetLastPriceTime(), now, r.priceStaleAfter) &&
+			priceIsFresh(market.QuoteReceivedAt, now, r.priceStaleAfter),
 	}
 }
 

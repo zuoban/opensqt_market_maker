@@ -63,6 +63,32 @@ func TestEnvOverridesYAMLSecrets(t *testing.T) {
 	}
 }
 
+func TestExecutionEnvOverrides(t *testing.T) {
+	t.Setenv("OPENSQT_EXECUTION_MAKER_GUARD_TICKS", "3")
+	t.Setenv("OPENSQT_EXECUTION_QUOTE_STALE_MS", "2500")
+	t.Setenv("OPENSQT_EXECUTION_POST_ONLY_RETRY_MIN_MS", "75")
+	t.Setenv("OPENSQT_EXECUTION_POST_ONLY_RETRY_MAX_MS", "600")
+	t.Setenv("OPENSQT_EXECUTION_POST_ONLY_RETRY_BURST", "7")
+	t.Setenv("OPENSQT_EXECUTION_CATCH_UP_MODE", "exact_wait")
+	t.Setenv("OPENSQT_EXECUTION_MAX_ACTIVE_CATCH_UP_SLOTS", "2")
+	t.Setenv("OPENSQT_EXECUTION_MAX_CATCH_UP_SLOTS_PER_ADJUST", "2")
+	t.Setenv("OPENSQT_EXECUTION_MAX_CATCH_UP_DISTANCE_RATIO", "0.4")
+	t.Setenv("OPENSQT_EXECUTION_NEAR_TOUCH_SINGLE_ORDER_RATIO", "0.2")
+
+	cfg, err := LoadConfig(writeTempYAML(t, envTestYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.Execution
+	if got.MakerGuardTicks != 3 || got.QuoteStaleMS != 2500 ||
+		got.PostOnlyRetryMinMS != 75 || got.PostOnlyRetryMaxMS != 600 ||
+		got.PostOnlyRetryBurst != 7 || got.CatchUpMode != "exact_wait" ||
+		got.MaxActiveCatchUpSlots != 2 || got.MaxCatchUpSlotsPerAdjust != 2 ||
+		got.MaxCatchUpDistanceRatio != 0.4 || got.NearTouchSingleOrderRatio != 0.2 {
+		t.Fatalf("execution overrides = %+v", got)
+	}
+}
+
 func TestEmptyEnvDoesNotOverrideYAML(t *testing.T) {
 	t.Setenv("OPENSQT_EXCHANGES_BINANCE_API_KEY", "   ")
 	t.Setenv("OPENSQT_TRADING_SYMBOL", "")

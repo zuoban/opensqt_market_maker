@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,10 +32,13 @@ PriceMonitor 架构说明：
 
 // PriceChange 价格变化事件
 type PriceChange struct {
-	OldPrice  float64
-	NewPrice  float64
-	Change    float64
-	Timestamp time.Time
+	OldPrice     float64
+	NewPrice     float64
+	Change       float64
+	Timestamp    time.Time
+	QuoteChanged bool
+	Reset        bool
+	Market       exchange.MarketSnapshot
 }
 
 // PriceMonitor 价格监控器
@@ -44,6 +48,8 @@ type PriceMonitor struct {
 	lastPrice     atomic.Value       // float64
 	lastPriceStr  atomic.Value       // string - 原始价格字符串（用于检测小数位数）
 	lastPriceTime atomic.Value       // time.Time
+	marketMu      sync.Mutex
+	market        atomic.Value // exchange.MarketSnapshot，整份原子发布
 
 	priceChangeCh     chan PriceChange
 	latestPriceChange atomic.Value // *PriceChange - 保存最新的价格更新（不阻塞）
@@ -58,7 +64,7 @@ type PriceMonitor struct {
 
 // NewPriceMonitor 创建价格监控器
 // 参数说明：
-// - ex: 交易所接口（用于启动价格流和轮询价格）
+// - ex: 交易所接口（仅用于启动全局唯一 WebSocket 市场数据流）
 // - symbol: 交易对符号
 // - priceSendInterval: 价格推送间隔（毫秒）
 func NewPriceMonitor(ex exchange.IExchange, symbol string, priceSendInterval int) *PriceMonitor {
@@ -74,6 +80,7 @@ func NewPriceMonitor(ex exchange.IExchange, symbol string, priceSendInterval int
 	pm.lastPrice.Store(0.0)
 	pm.lastPriceStr.Store("")
 	pm.lastPriceTime.Store(time.Time{})
+	pm.market.Store(exchange.MarketSnapshot{Symbol: symbol})
 	pm.latestPriceChange.Store((*PriceChange)(nil))
 	return pm
 }
@@ -88,8 +95,8 @@ func (pm *PriceMonitor) Start() error {
 
 	// 启动价格流（WebSocket）- 这是唯一的价格来源
 	// 注意：毫秒级量化系统不能容忍 REST API 轮询的延迟
-	err := pm.exchange.StartPriceStream(pm.ctx, pm.symbol, func(price float64) {
-		pm.updatePrice(price)
+	err := pm.exchange.StartPriceStream(pm.ctx, pm.symbol, func(update exchange.MarketUpdate) {
+		pm.updateMarket(update)
 	})
 	if err != nil {
 		// WebSocket 失败时直接返回错误，系统将停止
@@ -106,32 +113,89 @@ func (pm *PriceMonitor) Start() error {
 // pollPrice 已移除 - 毫秒级量化系统不使用 REST API 轮询
 // WebSocket 是唯一的价格来源，失败时系统应该停止运行
 
-// updatePrice 更新价格状态
-func (pm *PriceMonitor) updatePrice(newPrice float64) {
-	if newPrice <= 0 {
+// updateMarket 合并成交价与盘口增量，并以一份原子快照发布。Reset 会立即
+// 丢弃旧连接的盘口；重连后必须重新收到成交价和 bookTicker 才 Ready。
+func (pm *PriceMonitor) updateMarket(update exchange.MarketUpdate) {
+	pm.marketMu.Lock()
+	defer pm.marketMu.Unlock()
+
+	current := pm.GetMarketSnapshot()
+	if update.StreamEpoch > 0 && current.StreamEpoch > update.StreamEpoch {
 		return
 	}
-
-	oldPrice := pm.GetLastPrice()
-
-	// 存储新价格
-	pm.lastPrice.Store(newPrice)
-	pm.lastPriceStr.Store(fmt.Sprintf("%f", newPrice)) // 简单转换，精度由后续逻辑处理
-	now := time.Now()
-	pm.lastPriceTime.Store(now)
-	pm.recordCandlePrice(newPrice, now)
-
-	// 如果价格有变化，生成事件
-	if oldPrice > 0 && newPrice != oldPrice {
-		change := newPrice - oldPrice
-		event := &PriceChange{
-			OldPrice:  oldPrice,
-			NewPrice:  newPrice,
-			Change:    change,
-			Timestamp: now,
+	if update.Reset {
+		now := update.ReceivedAt
+		if now.IsZero() {
+			now = time.Now()
 		}
-		pm.latestPriceChange.Store(event)
+		reset := exchange.MarketSnapshot{
+			Symbol: update.Symbol, StreamEpoch: update.StreamEpoch, ReceivedAt: now,
+		}
+		pm.market.Store(reset)
+		pm.latestPriceChange.Store(&PriceChange{
+			OldPrice: current.LastPrice, Timestamp: now, QuoteChanged: true, Reset: true, Market: reset,
+		})
+		return
 	}
+	if update.StreamEpoch > current.StreamEpoch {
+		current = exchange.MarketSnapshot{Symbol: update.Symbol, StreamEpoch: update.StreamEpoch}
+	}
+	if update.Symbol != "" {
+		current.Symbol = update.Symbol
+	}
+	now := update.ReceivedAt
+	if now.IsZero() {
+		now = time.Now()
+	}
+	oldPrice := current.LastPrice
+	quoteChanged := false
+	if update.LastPrice > 0 {
+		current.LastPrice = update.LastPrice
+		current.TradeTime = update.EventTime
+		if current.TradeTime.IsZero() {
+			current.TradeTime = now
+		}
+		pm.lastPrice.Store(update.LastPrice)
+		pm.lastPriceStr.Store(fmt.Sprintf("%f", update.LastPrice))
+		pm.lastPriceTime.Store(now)
+		pm.recordCandlePrice(update.LastPrice, now)
+	}
+	if update.BestBid > 0 && update.BestAsk > update.BestBid {
+		quoteChanged = current.BestBid != update.BestBid || current.BestAsk != update.BestAsk ||
+			current.QuoteVersion != update.QuoteVersion
+		current.BestBid = update.BestBid
+		current.BestAsk = update.BestAsk
+		current.QuoteVersion = update.QuoteVersion
+		current.QuoteTime = update.EventTime
+		if current.QuoteTime.IsZero() {
+			current.QuoteTime = now
+		}
+		current.QuoteReceivedAt = now
+	}
+	current.ReceivedAt = now
+	current.Ready = current.LastPrice > 0 && current.BestBid > 0 && current.BestAsk > current.BestBid
+	pm.market.Store(current)
+
+	if update.LastPrice > 0 || quoteChanged {
+		pm.latestPriceChange.Store(&PriceChange{
+			OldPrice: oldPrice, NewPrice: current.LastPrice,
+			Change: current.LastPrice - oldPrice, Timestamp: now,
+			QuoteChanged: quoteChanged, Market: current,
+		})
+	}
+}
+
+// GetMarketSnapshot 返回成交价与最优盘口来自同一市场数据连接的原子快照。
+func (pm *PriceMonitor) GetMarketSnapshot() exchange.MarketSnapshot {
+	if pm == nil {
+		return exchange.MarketSnapshot{}
+	}
+	if value := pm.market.Load(); value != nil {
+		if snapshot, ok := value.(exchange.MarketSnapshot); ok {
+			return snapshot
+		}
+	}
+	return exchange.MarketSnapshot{}
 }
 
 // periodicPriceSender 定期发送最新价格
@@ -151,8 +215,9 @@ func (pm *PriceMonitor) periodicPriceSender() {
 					// 尝试非阻塞发送
 					select {
 					case pm.priceChangeCh <- *latestChange:
-						// 成功发送，清空latestPriceChange
-						pm.latestPriceChange.Store((*PriceChange)(nil))
+						// 只清掉本次实际发送的版本。若发送期间又到了更新，
+						// CAS 会失败并保留新版本，避免旧发送覆盖新盘口。
+						pm.latestPriceChange.CompareAndSwap(latestChange, (*PriceChange)(nil))
 					default:
 						// channel已满，保留最新价格等待下次机会
 					}
@@ -225,7 +290,10 @@ func (pm *PriceMonitor) Subscribe() <-chan PriceChange {
 					}
 					return
 				}
-				if change.NewPrice <= 0 {
+				// Reset 和纯盘口变化也必须唤醒交易协调器。Reset 的
+				// NewPrice 会是 0，但它需要立即使交易门禁 fail-closed；
+				// bookTicker 变化则负责驱动同 QuoteVersion 去重后的重试。
+				if change.NewPrice <= 0 && !change.QuoteChanged && !change.Reset {
 					continue
 				}
 

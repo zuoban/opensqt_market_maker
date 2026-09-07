@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,7 @@ type OrderRequest struct {
 	ReduceOnly    bool   // 是否只减仓（平仓单）
 	PostOnly      bool   // 是否只做 Maker（Post Only）
 	ClientOrderID string // 自定义订单ID
+	NearTouch     bool   // 距离盘口较近，避免与深度订单共享陈旧批次
 
 	// AcquireSubmissionLease 必须在每次真正的交易所请求前调用，并在该次请求
 	// 返回后释放。实现会在 lease 期间持有槽位锁，因此不得从 PlaceOrder 同步
@@ -54,6 +56,9 @@ type OrderRequest struct {
 	AcquireSubmissionLease func() (release func(), ok bool)
 	// OnSubmissionUnknown 在请求已进入交易所边界、但结果无法确认时调用。
 	OnSubmissionUnknown func()
+	// OnDefiniteRejection 将逐笔明确拒绝原因回传到槽位层。回调只记录状态，
+	// 不得同步重入订单提交。
+	OnDefiniteRejection func(OrderRejectionKind)
 }
 
 // Order 订单信息
@@ -87,6 +92,11 @@ type ExchangeOrderExecutor struct {
 	newOrdersEnabled atomic.Bool
 	healthGuardMu    sync.RWMutex
 	healthGuard      func() error
+	makerGuardMu     sync.RWMutex
+	marketSnapshot   func() exchange.MarketSnapshot
+	priceTickSize    float64
+	makerGuardTicks  int
+	quoteStaleAfter  time.Duration
 
 	// 时间配置
 	rateLimitRetryDelay time.Duration
@@ -110,6 +120,122 @@ func (oe *ExchangeOrderExecutor) checkSubmissionHealth() error {
 		return nil
 	}
 	return guard()
+}
+
+// SetMakerGuard 配置真实提交边界的盘口复检。provider 必须返回全局唯一
+// PriceMonitor 的原子快照；nil 表示测试或迁移路径暂不启用盘口复检。
+func (oe *ExchangeOrderExecutor) SetMakerGuard(
+	provider func() exchange.MarketSnapshot,
+	priceTickSize float64,
+	guardTicks int,
+	quoteStaleAfter time.Duration,
+) {
+	oe.makerGuardMu.Lock()
+	oe.marketSnapshot = provider
+	oe.priceTickSize = priceTickSize
+	oe.makerGuardTicks = guardTicks
+	oe.quoteStaleAfter = quoteStaleAfter
+	oe.makerGuardMu.Unlock()
+}
+
+func noteDefiniteRejection(req *OrderRequest, kind OrderRejectionKind) {
+	if req != nil && req.OnDefiniteRejection != nil {
+		req.OnDefiniteRejection(kind)
+	}
+}
+
+func (oe *ExchangeOrderExecutor) makerGuardSettings() (
+	func() exchange.MarketSnapshot,
+	float64,
+	int,
+	time.Duration,
+) {
+	oe.makerGuardMu.RLock()
+	defer oe.makerGuardMu.RUnlock()
+	return oe.marketSnapshot, oe.priceTickSize, oe.makerGuardTicks, oe.quoteStaleAfter
+}
+
+func checkMakerGuardSnapshot(
+	req *OrderRequest,
+	snapshot exchange.MarketSnapshot,
+	tickSize float64,
+	guardTicks int,
+	staleAfter time.Duration,
+) error {
+	if req == nil {
+		return NewOrderRejectedError(OrderRejectionMakerMoved, fmt.Errorf("订单请求为空"))
+	}
+	if req.Price <= 0 || math.IsNaN(req.Price) || math.IsInf(req.Price, 0) {
+		return NewOrderRejectedError(OrderRejectionMakerMoved, fmt.Errorf("订单价格无效: %g", req.Price))
+	}
+	if math.IsNaN(snapshot.BestBid) || math.IsInf(snapshot.BestBid, 0) ||
+		math.IsNaN(snapshot.BestAsk) || math.IsInf(snapshot.BestAsk, 0) ||
+		!snapshot.Ready || snapshot.BestBid <= 0 || snapshot.BestAsk <= snapshot.BestBid {
+		return NewOrderRejectedError(OrderRejectionMarketDataStale,
+			fmt.Errorf("完整盘口尚未就绪"))
+	}
+	if snapshot.Symbol != "" && req.Symbol != "" &&
+		!strings.EqualFold(snapshot.Symbol, req.Symbol) {
+		return NewOrderRejectedError(OrderRejectionMarketDataStale,
+			fmt.Errorf("盘口交易对不匹配: got %s, want %s", snapshot.Symbol, req.Symbol))
+	}
+	if staleAfter > 0 && (snapshot.QuoteReceivedAt.IsZero() || time.Since(snapshot.QuoteReceivedAt) > staleAfter) {
+		return NewOrderRejectedError(OrderRejectionMarketDataStale,
+			fmt.Errorf("最优盘口已过期: age=%s", time.Since(snapshot.QuoteReceivedAt).Round(time.Millisecond)))
+	}
+	if tickSize <= 0 || math.IsNaN(tickSize) || math.IsInf(tickSize, 0) {
+		return NewOrderRejectedError(OrderRejectionMarketDataStale,
+			fmt.Errorf("交易所价格步长无效: %g", tickSize))
+	}
+	if guardTicks < 1 {
+		guardTicks = 1
+	}
+	guard := float64(guardTicks) * tickSize
+	switch strings.ToUpper(req.Side) {
+	case "BUY":
+		capPrice := snapshot.BestAsk - guard
+		if req.Price > capPrice+tickSize*1e-6 {
+			return NewOrderRejectedError(OrderRejectionMakerMoved,
+				fmt.Errorf("BUY %.12g 超过 Maker 上限 %.12g (ask=%.12g)", req.Price, capPrice, snapshot.BestAsk))
+		}
+	case "SELL":
+		floorPrice := snapshot.BestBid + guard
+		if req.Price < floorPrice-tickSize*1e-6 {
+			return NewOrderRejectedError(OrderRejectionMakerMoved,
+				fmt.Errorf("SELL %.12g 低于 Maker 下限 %.12g (bid=%.12g)", req.Price, floorPrice, snapshot.BestBid))
+		}
+	default:
+		return NewOrderRejectedError(OrderRejectionMakerMoved,
+			fmt.Errorf("未知订单方向 %q", req.Side))
+	}
+	return nil
+}
+
+func (oe *ExchangeOrderExecutor) checkMakerGuard(req *OrderRequest) error {
+	provider, tickSize, guardTicks, staleAfter := oe.makerGuardSettings()
+	if provider == nil {
+		return nil
+	}
+	return checkMakerGuardSnapshot(req, provider(), tickSize, guardTicks, staleAfter)
+}
+
+func (oe *ExchangeOrderExecutor) checkMakerGuardBatch(reqs []leasedMakerRequest) []error {
+	provider, tickSize, guardTicks, staleAfter := oe.makerGuardSettings()
+	if provider == nil {
+		return make([]error, len(reqs))
+	}
+	snapshot := provider()
+	errs := make([]error, len(reqs))
+	for i, item := range reqs {
+		errs[i] = checkMakerGuardSnapshot(item.req, snapshot, tickSize, guardTicks, staleAfter)
+	}
+	return errs
+}
+
+type leasedMakerRequest struct {
+	req         *OrderRequest
+	exchangeReq *exchange.OrderRequest
+	release     func()
 }
 
 // NewExchangeOrderExecutor 创建基于交易所接口的订单执行器
@@ -373,6 +499,7 @@ func (oe *ExchangeOrderExecutor) interpretSubmittedResult(req *OrderRequest, exc
 	if definitelyRejected {
 		rejectedErr := NewOrderRejectedError(rejectionKind, err)
 		if rejectionKind == OrderRejectionPostOnly {
+			noteDefiniteRejection(req, rejectionKind)
 			logger.Warn("⚠️ [%s] PostOnly被拒: %s %.2f，严格Maker模式不降级且不做同价重试",
 				oe.exchange.GetName(), req.Side, req.Price)
 		}
@@ -386,6 +513,9 @@ func (oe *ExchangeOrderExecutor) interpretSubmittedResult(req *OrderRequest, exc
 
 // PlaceOrder 下单（严格 PostOnly，仅对明确限流做有界重试）
 func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
+	if req == nil {
+		return nil, fmt.Errorf("订单请求不能为空")
+	}
 	placeCtx, err := oe.newOrderContext()
 	if err != nil {
 		return nil, err
@@ -434,6 +564,14 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 				gateErr = ErrNewOrdersStopped
 			}
 			return nil, oe.placementContextError("健康复检后交易门禁已关闭", gateErr)
+		}
+		if makerErr := oe.checkMakerGuard(req); makerErr != nil {
+			release()
+			var rejected *OrderRejectedError
+			if errors.As(makerErr, &rejected) {
+				noteDefiniteRejection(req, rejected.Kind)
+			}
+			return nil, makerErr
 		}
 
 		exchangeReq := &exchange.OrderRequest{
@@ -556,11 +694,29 @@ func (oe *ExchangeOrderExecutor) nativeBatcher() (exchange.PlaceOrderBatcher, bo
 func (oe *ExchangeOrderExecutor) BatchPlaceOrders(orders []*OrderRequest) ([]*Order, bool, error) {
 	state := &batchPlaceState{placed: make([]*Order, 0, len(orders))}
 	exchangeName := oe.exchange.GetName()
+	validOrders := make([]*OrderRequest, 0, len(orders))
+	for i, req := range orders {
+		if req == nil {
+			state.errs = append(state.errs, fmt.Errorf("第 %d 个订单请求为空", i+1))
+			continue
+		}
+		validOrders = append(validOrders, req)
+	}
+	orders = validOrders
 	if batcher, ok := oe.nativeBatcher(); ok {
 		size := batcher.PlaceOrderBatchSize()
 		for i := 0; i < len(orders); {
-			chunk := make([]*OrderRequest, 0, size)
-			for i < len(orders) && len(chunk) < size {
+			chunkLimit := size
+			if orders[i] != nil && orders[i].NearTouch {
+				chunkLimit = 1
+			}
+			chunk := make([]*OrderRequest, 0, chunkLimit)
+			for i < len(orders) && len(chunk) < chunkLimit {
+				// 深度批次遇到近盘口请求时先提交已有项目，让近盘口请求在
+				// 下一轮独立获取最新 quote guard，缩短规划到撮合的窗口。
+				if len(chunk) > 0 && orders[i] != nil && orders[i].NearTouch {
+					break
+				}
 				req := orders[i]
 				i++
 				if state.shouldSkipBuy(exchangeName, req) {
@@ -615,12 +771,7 @@ func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk 
 		}
 	}
 
-	type leasedRequest struct {
-		req         *OrderRequest
-		exchangeReq *exchange.OrderRequest
-		release     func()
-	}
-	submitted := make([]leasedRequest, 0, len(chunk))
+	submitted := make([]leasedMakerRequest, 0, len(chunk))
 	releaseSubmitted := func() {
 		for _, item := range submitted {
 			item.release()
@@ -653,7 +804,7 @@ func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk 
 			}
 			return state.note(exchangeName, req, nil, oe.placementContextError("下单前交易门禁已关闭", gateErr))
 		}
-		submitted = append(submitted, leasedRequest{
+		submitted = append(submitted, leasedMakerRequest{
 			req:         req,
 			exchangeReq: nativeExchangeRequest(req),
 			release:     release,
@@ -688,6 +839,34 @@ func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk 
 			}
 		}
 		return stop
+	}
+
+	// 批量请求只提交在同一最新盘口下仍满足 Maker 边界的项目。被本地
+	// guard 拦截的 reservation 明确尚未进入交易所，可以逐项安全释放。
+	guarded := submitted[:0]
+	stopAfterGuard := false
+	guardErrors := oe.checkMakerGuardBatch(submitted)
+	for i, item := range submitted {
+		makerErr := guardErrors[i]
+		if makerErr == nil {
+			guarded = append(guarded, item)
+			continue
+		}
+		item.release()
+		var rejected *OrderRejectedError
+		if errors.As(makerErr, &rejected) {
+			noteDefiniteRejection(item.req, rejected.Kind)
+			if rejected.Kind == OrderRejectionMarketDataStale {
+				stopAfterGuard = true
+			}
+		}
+		if state.note(exchangeName, item.req, nil, makerErr) {
+			stopAfterGuard = true
+		}
+	}
+	submitted = guarded
+	if len(submitted) == 0 {
+		return stopAfterGuard
 	}
 
 	exchangeReqs := make([]*exchange.OrderRequest, len(submitted))
@@ -735,7 +914,7 @@ func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk 
 			stop = true
 		}
 	}
-	return stop
+	return stop || stopAfterGuard
 }
 
 // CancelOrder 取消订单

@@ -34,10 +34,14 @@ type Snapshot struct {
 
 // PriceView 最新价格
 type PriceView struct {
-	Last      float64   `json:"last"`
-	LastText  string    `json:"lastText"`
-	UpdatedAt time.Time `json:"updatedAt"`
-	AgeMs     int64     `json:"ageMs"`
+	Last           float64   `json:"last"`
+	LastText       string    `json:"lastText"`
+	BestBid        float64   `json:"bestBid"`
+	BestAsk        float64   `json:"bestAsk"`
+	QuoteUpdatedAt time.Time `json:"quoteUpdatedAt"`
+	QuoteAgeMs     int64     `json:"quoteAgeMs"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+	AgeMs          int64     `json:"ageMs"`
 }
 
 // KlineView 面板使用的真实 OHLC 序列。
@@ -114,6 +118,7 @@ func (a *assembler) Build() *Snapshot {
 	}
 	if a.price != nil {
 		last := a.price.GetLastPrice()
+		market := a.price.GetMarketSnapshot()
 		updated := a.price.GetLastPriceTime()
 		text := a.price.GetLastPriceString()
 		if snap.Position.PriceDecimals > 0 && last > 0 {
@@ -123,7 +128,15 @@ func (a *assembler) Build() *Snapshot {
 		if !updated.IsZero() {
 			age = now.Sub(updated).Milliseconds()
 		}
-		snap.Price = PriceView{Last: last, LastText: text, UpdatedAt: updated, AgeMs: age}
+		quoteAge := int64(0)
+		if !market.QuoteReceivedAt.IsZero() {
+			quoteAge = now.Sub(market.QuoteReceivedAt).Milliseconds()
+		}
+		snap.Price = PriceView{
+			Last: last, LastText: text, UpdatedAt: updated, AgeMs: age,
+			BestBid: market.BestBid, BestAsk: market.BestAsk,
+			QuoteUpdatedAt: market.QuoteReceivedAt, QuoteAgeMs: quoteAge,
+		}
 		series := a.price.GetKlineSnapshot()
 		snap.Kline.Interval = series.Interval
 		snap.Kline.UpdatedAt = series.UpdatedAt

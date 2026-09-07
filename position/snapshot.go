@@ -7,57 +7,72 @@ import (
 
 // SlotSnapshot 单个槽位的只读拷贝
 type SlotSnapshot struct {
-	Price             float64   `json:"price"`
-	PriceText         string    `json:"priceText"`
-	PositionStatus    string    `json:"positionStatus"`
-	PositionQty       float64   `json:"positionQty"`
-	PositionQtyText   string    `json:"positionQtyText"`
-	OrderID           int64     `json:"orderId"`
-	ClientOID         string    `json:"clientOid"`
-	OrderSide         string    `json:"orderSide"`
-	OrderStatus       string    `json:"orderStatus"`
-	OrderPrice        float64   `json:"orderPrice"`
-	OrderFilledQty    float64   `json:"orderFilledQty"`
-	OrderCreatedAt    time.Time `json:"orderCreatedAt"`
-	SlotStatus        string    `json:"slotStatus"`
-	PostOnlyFailCount int       `json:"postOnlyFailCount"`
-	InBuyWindow       bool      `json:"inBuyWindow"`
-	InSellWindow      bool      `json:"inSellWindow"`
+	Price                      float64   `json:"price"`
+	PriceText                  string    `json:"priceText"`
+	PositionStatus             string    `json:"positionStatus"`
+	PositionQty                float64   `json:"positionQty"`
+	PositionQtyText            string    `json:"positionQtyText"`
+	OrderID                    int64     `json:"orderId"`
+	ClientOID                  string    `json:"clientOid"`
+	OrderSide                  string    `json:"orderSide"`
+	OrderStatus                string    `json:"orderStatus"`
+	OrderPrice                 float64   `json:"orderPrice"`
+	OrderFilledQty             float64   `json:"orderFilledQty"`
+	OrderCreatedAt             time.Time `json:"orderCreatedAt"`
+	SlotStatus                 string    `json:"slotStatus"`
+	PostOnlyFailCount          int       `json:"postOnlyFailCount"`
+	MakerGuardSkipCount        int       `json:"makerGuardSkipCount"`
+	TotalPostOnlyRejects       int       `json:"totalPostOnlyRejects"`
+	ConsecutivePostOnlyRejects int       `json:"consecutivePostOnlyRejects"`
+	CatchUp                    bool      `json:"catchUp"`
+	InBuyWindow                bool      `json:"inBuyWindow"`
+	InSellWindow               bool      `json:"inSellWindow"`
+}
+
+type MakerExecutionSnapshot struct {
+	Attempts         uint64 `json:"attempts"`
+	Accepted         uint64 `json:"accepted"`
+	GuardSkips       uint64 `json:"guardSkips"`
+	PostOnlyRejects  uint64 `json:"postOnlyRejects"`
+	CatchUpOrders    uint64 `json:"catchUpOrders"`
+	CatchUpAbandoned uint64 `json:"catchUpAbandoned"`
+	ActiveCatchUp    int    `json:"activeCatchUp"`
 }
 
 // PositionSnapshot 仓位管理器只读快照
 type PositionSnapshot struct {
-	Initialized          bool                `json:"initialized"`
-	Symbol               string              `json:"symbol"`
-	BaseAsset            string              `json:"baseAsset"`
-	AnchorPrice          float64             `json:"anchorPrice"`
-	LastPrice            float64             `json:"lastPrice"`
-	GridPrice            float64             `json:"gridPrice"`
-	PriceDecimals        int                 `json:"priceDecimals"`
-	QuantityDecimals     int                 `json:"quantityDecimals"`
-	PriceInterval        float64             `json:"priceInterval"`
-	OrderQuantity        float64             `json:"orderQuantity"`
-	BuyWindowSize        int                 `json:"buyWindowSize"`
-	SellWindowSize       int                 `json:"sellWindowSize"`
-	BuyWindowPrices      []float64           `json:"buyWindowPrices"`
-	SellWindowPrices     []float64           `json:"sellWindowPrices"`
-	Slots                []SlotSnapshot      `json:"slots"`
-	FilledOrders         []FilledOrderRecord `json:"filledOrders"`
-	FilledHourly         []HourlyFillBucket  `json:"filledHourly"`
-	FilledOrderCount     int64               `json:"filledOrderCount"`
-	FilledSlotCount      int                 `json:"filledSlotCount"`
-	PositionQty          float64             `json:"positionQty"`
-	PositionValue        float64             `json:"positionValue"`
-	ActiveBuyOrders      int                 `json:"activeBuyOrders"`
-	ActiveSellOrders     int                 `json:"activeSellOrders"`
-	TotalBuyQty          float64             `json:"totalBuyQty"`
-	TotalSellQty         float64             `json:"totalSellQty"`
-	EstimatedProfit      float64             `json:"estimatedProfit"`
-	RealizedPNL          float64             `json:"realizedPnl"`
-	ReconcileCount       int64               `json:"reconcileCount"`
-	LastReconcileTime    time.Time           `json:"lastReconcileTime"`
-	MarginLocked         bool                `json:"marginLocked"`
-	MarginLockRemainingS float64             `json:"marginLockRemainingSec"`
+	Initialized          bool                   `json:"initialized"`
+	Symbol               string                 `json:"symbol"`
+	BaseAsset            string                 `json:"baseAsset"`
+	AnchorPrice          float64                `json:"anchorPrice"`
+	LastPrice            float64                `json:"lastPrice"`
+	GridPrice            float64                `json:"gridPrice"`
+	PriceDecimals        int                    `json:"priceDecimals"`
+	QuantityDecimals     int                    `json:"quantityDecimals"`
+	PriceInterval        float64                `json:"priceInterval"`
+	OrderQuantity        float64                `json:"orderQuantity"`
+	BuyWindowSize        int                    `json:"buyWindowSize"`
+	SellWindowSize       int                    `json:"sellWindowSize"`
+	BuyWindowPrices      []float64              `json:"buyWindowPrices"`
+	SellWindowPrices     []float64              `json:"sellWindowPrices"`
+	Slots                []SlotSnapshot         `json:"slots"`
+	FilledOrders         []FilledOrderRecord    `json:"filledOrders"`
+	FilledHourly         []HourlyFillBucket     `json:"filledHourly"`
+	FilledOrderCount     int64                  `json:"filledOrderCount"`
+	FilledSlotCount      int                    `json:"filledSlotCount"`
+	PositionQty          float64                `json:"positionQty"`
+	PositionValue        float64                `json:"positionValue"`
+	ActiveBuyOrders      int                    `json:"activeBuyOrders"`
+	ActiveSellOrders     int                    `json:"activeSellOrders"`
+	TotalBuyQty          float64                `json:"totalBuyQty"`
+	TotalSellQty         float64                `json:"totalSellQty"`
+	EstimatedProfit      float64                `json:"estimatedProfit"`
+	RealizedPNL          float64                `json:"realizedPnl"`
+	ReconcileCount       int64                  `json:"reconcileCount"`
+	LastReconcileTime    time.Time              `json:"lastReconcileTime"`
+	MarginLocked         bool                   `json:"marginLocked"`
+	MarginLockRemainingS float64                `json:"marginLockRemainingSec"`
+	MakerExecution       MakerExecutionSnapshot `json:"makerExecution"`
 }
 
 func isActiveOrderStatus(status string) bool {
@@ -153,6 +168,12 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	snap.RealizedPNL = spm.GetRealizedPNL()
 	snap.ReconcileCount = spm.GetReconcileCount()
 	snap.LastReconcileTime = spm.GetLastReconcileTime()
+	snap.MakerExecution.Attempts = spm.makerAttempts.Load()
+	snap.MakerExecution.Accepted = spm.makerAccepted.Load()
+	snap.MakerExecution.GuardSkips = spm.makerGuardSkips.Load()
+	snap.MakerExecution.PostOnlyRejects = spm.postOnlyRejects.Load()
+	snap.MakerExecution.CatchUpOrders = spm.catchUpOrders.Load()
+	snap.MakerExecution.CatchUpAbandoned = spm.catchUpAbandoned.Load()
 
 	buyWindow := map[string]bool{}
 	sellWindow := map[string]bool{}
@@ -175,20 +196,25 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
 		item := SlotSnapshot{
-			Price:             price,
-			PriceText:         formatPrice(price, snap.PriceDecimals),
-			PositionStatus:    slot.PositionStatus,
-			PositionQty:       slot.PositionQty,
-			PositionQtyText:   formatPrice(slot.PositionQty, snap.QuantityDecimals),
-			OrderID:           slot.OrderID,
-			ClientOID:         slot.ClientOID,
-			OrderSide:         slot.OrderSide,
-			OrderStatus:       slot.OrderStatus,
-			OrderPrice:        slot.OrderPrice,
-			OrderFilledQty:    slot.OrderFilledQty,
-			OrderCreatedAt:    slot.OrderCreatedAt,
-			SlotStatus:        slot.SlotStatus,
-			PostOnlyFailCount: slot.PostOnlyFailCount,
+			Price:                      price,
+			PriceText:                  formatPrice(price, snap.PriceDecimals),
+			PositionStatus:             slot.PositionStatus,
+			PositionQty:                slot.PositionQty,
+			PositionQtyText:            formatPrice(slot.PositionQty, snap.QuantityDecimals),
+			OrderID:                    slot.OrderID,
+			ClientOID:                  slot.ClientOID,
+			OrderSide:                  slot.OrderSide,
+			OrderStatus:                slot.OrderStatus,
+			OrderPrice:                 slot.OrderPrice,
+			OrderFilledQty:             slot.OrderFilledQty,
+			OrderCreatedAt:             slot.OrderCreatedAt,
+			SlotStatus:                 slot.SlotStatus,
+			PostOnlyFailCount:          slot.PostOnlyFailCount,
+			MakerGuardSkipCount:        slot.MakerGuardSkipCount,
+			TotalPostOnlyRejects:       slot.TotalPostOnlyRejects,
+			ConsecutivePostOnlyRejects: slot.ConsecutivePostOnlyRejects,
+			CatchUp: slot.OrderSide == "BUY" && slot.OrderPrice > 0 &&
+				slot.OrderPrice < price-fillQtyTolerance,
 		}
 		slot.mu.RUnlock()
 
@@ -202,6 +228,9 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 			switch item.OrderSide {
 			case "BUY":
 				snap.ActiveBuyOrders++
+				if item.CatchUp {
+					snap.MakerExecution.ActiveCatchUp++
+				}
 			case "SELL":
 				snap.ActiveSellOrders++
 			}

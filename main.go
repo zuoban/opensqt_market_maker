@@ -22,7 +22,7 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.5.7"
+var Version = "v3.5.8"
 
 func main() {
 	programStartedAt := time.Now()
@@ -165,6 +165,12 @@ func main() {
 		cfg.Timing.RateLimitRetryDelay,
 		cfg.Timing.OrderRetryDelay,
 	)
+	exchangeExecutor.SetMakerGuard(
+		priceMonitor.GetMarketSnapshot,
+		priceTickSize,
+		cfg.Execution.MakerGuardTicks,
+		time.Duration(cfg.Execution.QuoteStaleMS)*time.Millisecond,
+	)
 	// 所有启动健康条件通过前，执行器必须保持 fail-closed。
 	exchangeExecutor.StopNewOrders()
 	executorAdapter := &exchangeExecutorAdapter{executor: exchangeExecutor}
@@ -179,6 +185,7 @@ func main() {
 		quantityDecimals,
 		priceTickSize,
 	)
+	superPositionManager.SetMarketSnapshotProvider(priceMonitor.GetMarketSnapshot)
 
 	// === 新增：初始化风控监视器 ===
 	riskMonitor := safety.NewRiskMonitor(cfg, ex)
@@ -197,7 +204,7 @@ func main() {
 	// 🔥 关键修复：先启动订单流，再下单（避免错过成交推送）
 	// 启动订单流（通过交易所接口）
 	// 架构说明：
-	// - 订单流与价格流共用同一个 WebSocket 连接（对于支持的交易所）
+	// - 订单流与唯一市场数据流分别连接，但由同一交易门禁统一判定健康状态
 	// - 订单更新通过回调函数实时推送给 SuperPositionManager
 	logger.Info("🔗 启动 WebSocket 订单流...")
 	if err := ex.StartOrderStream(ctx, func(update exchange.OrderUpdate) {
@@ -583,8 +590,12 @@ func (a *exchangeExecutorAdapter) PlaceOrder(req *position.OrderRequest) (*posit
 		ReduceOnly:             req.ReduceOnly,
 		PostOnly:               req.PostOnly,      // 传递 PostOnly 参数
 		ClientOrderID:          req.ClientOrderID, // 传递 ClientOrderID
+		NearTouch:              req.NearTouch,
 		AcquireSubmissionLease: req.AcquireSubmissionLease,
 		OnSubmissionUnknown:    req.MarkSubmissionUncertain,
+		OnDefiniteRejection: func(kind order.OrderRejectionKind) {
+			req.MarkDefiniteRejection(string(kind))
+		},
 	}
 	ord, err := a.executor.PlaceOrder(orderReq)
 	if err != nil {
@@ -618,8 +629,12 @@ func (a *exchangeExecutorAdapter) BatchPlaceOrders(orders []*position.OrderReque
 			ReduceOnly:             req.ReduceOnly,
 			PostOnly:               req.PostOnly,      // 传递 PostOnly 参数
 			ClientOrderID:          req.ClientOrderID, // 传递 ClientOrderID
+			NearTouch:              req.NearTouch,
 			AcquireSubmissionLease: req.AcquireSubmissionLease,
 			OnSubmissionUnknown:    req.MarkSubmissionUncertain,
+			OnDefiniteRejection: func(kind order.OrderRejectionKind) {
+				req.MarkDefiniteRejection(string(kind))
+			},
 		}
 	}
 	ords, marginError, placementErr := a.executor.BatchPlaceOrders(orderReqs)

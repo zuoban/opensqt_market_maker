@@ -85,6 +85,38 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 
+	execCfg := &cfg.Execution
+	if err := setInt(&execCfg.MakerGuardTicks, "OPENSQT_EXECUTION_MAKER_GUARD_TICKS"); err != nil {
+		return err
+	}
+	if err := setInt(&execCfg.QuoteStaleMS, "OPENSQT_EXECUTION_QUOTE_STALE_MS"); err != nil {
+		return err
+	}
+	if err := setInt(&execCfg.PostOnlyRetryMinMS, "OPENSQT_EXECUTION_POST_ONLY_RETRY_MIN_MS"); err != nil {
+		return err
+	}
+	if err := setInt(&execCfg.PostOnlyRetryMaxMS, "OPENSQT_EXECUTION_POST_ONLY_RETRY_MAX_MS"); err != nil {
+		return err
+	}
+	if err := setInt(&execCfg.PostOnlyRetryBurst, "OPENSQT_EXECUTION_POST_ONLY_RETRY_BURST"); err != nil {
+		return err
+	}
+	if err := setString(&execCfg.CatchUpMode, "OPENSQT_EXECUTION_CATCH_UP_MODE"); err != nil {
+		return err
+	}
+	if err := setInt(&execCfg.MaxActiveCatchUpSlots, "OPENSQT_EXECUTION_MAX_ACTIVE_CATCH_UP_SLOTS"); err != nil {
+		return err
+	}
+	if err := setInt(&execCfg.MaxCatchUpSlotsPerAdjust, "OPENSQT_EXECUTION_MAX_CATCH_UP_SLOTS_PER_ADJUST"); err != nil {
+		return err
+	}
+	if err := setFloat(&execCfg.MaxCatchUpDistanceRatio, "OPENSQT_EXECUTION_MAX_CATCH_UP_DISTANCE_RATIO"); err != nil {
+		return err
+	}
+	if err := setFloat(&execCfg.NearTouchSingleOrderRatio, "OPENSQT_EXECUTION_NEAR_TOUCH_SINGLE_ORDER_RATIO"); err != nil {
+		return err
+	}
+
 	if err := setString(&cfg.System.LogLevel, "OPENSQT_SYSTEM_LOG_LEVEL"); err != nil {
 		return err
 	}

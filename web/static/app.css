@@ -1426,6 +1426,94 @@ main { display: block; }
 .risk-item.ok .status { color: var(--positive); }
 .risk-item.warn .status { color: var(--warn); }
 
+.maker-panel {
+    margin-top: 12px;
+}
+
+.maker-panel::before { background: var(--primary); }
+
+.maker-status {
+    display: inline-flex;
+    min-height: 28px;
+    align-items: center;
+    gap: 7px;
+    padding: 0 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    color: var(--muted);
+    background: rgba(8, 11, 13, 0.7);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.maker-status i {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 8px currentColor;
+}
+
+.maker-panel.is-healthy .maker-status {
+    border-color: rgba(62, 224, 164, 0.32);
+    color: var(--positive);
+}
+
+.maker-panel.is-warning .maker-status {
+    border-color: rgba(240, 193, 90, 0.42);
+    color: var(--warn);
+}
+
+.maker-panel.is-waiting .maker-status {
+    color: var(--muted-soft);
+}
+
+.maker-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--line);
+}
+
+.maker-stat {
+    min-width: 0;
+    padding: 12px 14px;
+    background: rgba(5, 8, 9, 0.48);
+}
+
+.maker-stat span {
+    display: block;
+    margin-bottom: 5px;
+    color: var(--muted-soft);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+}
+
+.maker-stat strong {
+    display: block;
+    overflow: hidden;
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-weight: 680;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.maker-stat strong.pos { color: var(--positive); }
+.maker-stat strong.warn { color: var(--warn); }
+
+.maker-note {
+    margin: 0;
+    padding: 10px 14px 12px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 11px;
+}
+
 .log-panel { min-height: 0; }
 
 .log-panel .panel-head {
@@ -2205,6 +2293,7 @@ td { overflow-wrap: anywhere; color: var(--ink); }
 
     .board { margin-top: 16px; }
     .risk-list { grid-template-columns: 1fr; }
+	.maker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .panel { border-radius: 10px; }
     .panel-head { min-height: 58px; padding: 10px 13px; }
     .panel-title h2 { font-size: 17px; }

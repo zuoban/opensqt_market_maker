@@ -16,6 +16,9 @@ type SafeAppConfig struct {
 	RiskEnabled             bool     `json:"riskEnabled"`
 	MonitorSymbols          []string `json:"monitorSymbols"`
 	DashboardPushIntervalMS int      `json:"dashboardPushIntervalMs"`
+	MakerGuardTicks         int      `json:"makerGuardTicks"`
+	QuoteStaleMS            int      `json:"quoteStaleMs"`
+	CatchUpMode             string   `json:"catchUpMode"`
 }
 
 func safeAppView(cfg *config.Config) SafeAppConfig {
@@ -33,6 +36,9 @@ func safeAppView(cfg *config.Config) SafeAppConfig {
 		SellWindowSize:          cfg.Trading.SellWindowSize,
 		RiskEnabled:             cfg.RiskControl.Enabled,
 		DashboardPushIntervalMS: cfg.Dashboard.PushIntervalMS,
+		MakerGuardTicks:         cfg.Execution.MakerGuardTicks,
+		QuoteStaleMS:            cfg.Execution.QuoteStaleMS,
+		CatchUpMode:             cfg.Execution.CatchUpMode,
 	}
 	if len(cfg.RiskControl.MonitorSymbols) > 0 {
 		view.MonitorSymbols = append([]string(nil), cfg.RiskControl.MonitorSymbols...)

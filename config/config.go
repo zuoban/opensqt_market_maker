@@ -5,6 +5,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -25,6 +26,21 @@ type TradingConfig struct {
 	PositionSafetyCheck      int     `yaml:"position_safety_check"`        // 持仓安全性检查（默认100，最少能向下持有多少仓）
 	maxMarginUsagePercentSet bool
 	// 注意：price_decimals 和 quantity_decimals 已废弃，现在从交易所自动获取
+}
+
+// ExecutionConfig 控制严格 Maker 的盘口保护、拒单退避和被动补格。
+// 所有模式最终仍由订单执行边界强制 PostOnly，不提供 Taker 降级。
+type ExecutionConfig struct {
+	MakerGuardTicks           int     `yaml:"maker_guard_ticks"`
+	QuoteStaleMS              int     `yaml:"quote_stale_ms"`
+	PostOnlyRetryMinMS        int     `yaml:"post_only_retry_min_ms"`
+	PostOnlyRetryMaxMS        int     `yaml:"post_only_retry_max_ms"`
+	PostOnlyRetryBurst        int     `yaml:"post_only_retry_burst"`
+	CatchUpMode               string  `yaml:"catch_up_mode"`
+	MaxActiveCatchUpSlots     int     `yaml:"max_active_catch_up_slots"`
+	MaxCatchUpSlotsPerAdjust  int     `yaml:"max_catch_up_slots_per_adjust"`
+	MaxCatchUpDistanceRatio   float64 `yaml:"max_catch_up_distance_ratio"`
+	NearTouchSingleOrderRatio float64 `yaml:"near_touch_single_order_ratio"`
 }
 
 // UnmarshalYAML 记录 max_margin_usage_percent 是否由用户显式配置，
@@ -56,6 +72,8 @@ type Config struct {
 	} `yaml:"exchanges"`
 
 	Trading TradingConfig `yaml:"trading"`
+
+	Execution ExecutionConfig `yaml:"execution"`
 
 	System struct {
 		LogLevel     string `yaml:"log_level"`
@@ -222,6 +240,79 @@ func (c *Config) Validate() error {
 	}
 	if c.Timing.OrderCleanupInterval <= 0 {
 		c.Timing.OrderCleanupInterval = 60 // 默认60秒
+	}
+
+	if c.Execution.MakerGuardTicks < 0 {
+		return fmt.Errorf("execution.maker_guard_ticks 不能为负数")
+	}
+	if c.Execution.MakerGuardTicks == 0 {
+		c.Execution.MakerGuardTicks = 2
+	}
+	if c.Execution.QuoteStaleMS < 0 {
+		return fmt.Errorf("execution.quote_stale_ms 不能为负数")
+	}
+	if c.Execution.QuoteStaleMS == 0 {
+		c.Execution.QuoteStaleMS = 1500
+	}
+	if c.Execution.PostOnlyRetryMinMS < 0 {
+		return fmt.Errorf("execution.post_only_retry_min_ms 不能为负数")
+	}
+	if c.Execution.PostOnlyRetryMinMS == 0 {
+		c.Execution.PostOnlyRetryMinMS = 50
+	}
+	if c.Execution.PostOnlyRetryMaxMS < 0 {
+		return fmt.Errorf("execution.post_only_retry_max_ms 不能为负数")
+	}
+	if c.Execution.PostOnlyRetryMaxMS == 0 {
+		c.Execution.PostOnlyRetryMaxMS = 500
+	}
+	if c.Execution.PostOnlyRetryMaxMS < c.Execution.PostOnlyRetryMinMS {
+		return fmt.Errorf("execution.post_only_retry_max_ms 不能小于 post_only_retry_min_ms")
+	}
+	if c.Execution.PostOnlyRetryBurst < 0 {
+		return fmt.Errorf("execution.post_only_retry_burst 不能为负数")
+	}
+	if c.Execution.PostOnlyRetryBurst == 0 {
+		c.Execution.PostOnlyRetryBurst = 5
+	}
+	c.Execution.CatchUpMode = strings.ToLower(strings.TrimSpace(c.Execution.CatchUpMode))
+	if c.Execution.CatchUpMode == "" {
+		c.Execution.CatchUpMode = "passive"
+	}
+	if c.Execution.CatchUpMode != "passive" && c.Execution.CatchUpMode != "exact_wait" {
+		return fmt.Errorf("execution.catch_up_mode 仅支持 passive 或 exact_wait")
+	}
+	if c.Execution.MaxActiveCatchUpSlots < 0 {
+		return fmt.Errorf("execution.max_active_catch_up_slots 不能为负数")
+	}
+	if c.Execution.MaxActiveCatchUpSlots == 0 {
+		c.Execution.MaxActiveCatchUpSlots = 1
+	}
+	if c.Execution.MaxCatchUpSlotsPerAdjust < 0 {
+		return fmt.Errorf("execution.max_catch_up_slots_per_adjust 不能为负数")
+	}
+	if c.Execution.MaxCatchUpSlotsPerAdjust == 0 {
+		c.Execution.MaxCatchUpSlotsPerAdjust = 1
+	}
+	if math.IsNaN(c.Execution.MaxCatchUpDistanceRatio) || math.IsInf(c.Execution.MaxCatchUpDistanceRatio, 0) ||
+		c.Execution.MaxCatchUpDistanceRatio < 0 {
+		return fmt.Errorf("execution.max_catch_up_distance_ratio 必须在 (0, 1] 范围内")
+	}
+	if c.Execution.MaxCatchUpDistanceRatio == 0 {
+		c.Execution.MaxCatchUpDistanceRatio = 0.5
+	}
+	if c.Execution.MaxCatchUpDistanceRatio > 1 {
+		return fmt.Errorf("execution.max_catch_up_distance_ratio 必须在 (0, 1] 范围内")
+	}
+	if math.IsNaN(c.Execution.NearTouchSingleOrderRatio) || math.IsInf(c.Execution.NearTouchSingleOrderRatio, 0) ||
+		c.Execution.NearTouchSingleOrderRatio < 0 {
+		return fmt.Errorf("execution.near_touch_single_order_ratio 必须在 (0, 1] 范围内")
+	}
+	if c.Execution.NearTouchSingleOrderRatio == 0 {
+		c.Execution.NearTouchSingleOrderRatio = 0.15
+	}
+	if c.Execution.NearTouchSingleOrderRatio > 1 {
+		return fmt.Errorf("execution.near_touch_single_order_ratio 必须在 (0, 1] 范围内")
 	}
 
 	// 验证风控配置并设置默认值

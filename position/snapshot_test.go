@@ -49,6 +49,12 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	spm.totalBuyQty.Store(2.0)
 	spm.totalSellQty.Store(1.5)
 	spm.realizedPNL.Store(0.42)
+	spm.makerAttempts.Store(10)
+	spm.makerAccepted.Store(9)
+	spm.makerGuardSkips.Store(1)
+	spm.postOnlyRejects.Store(2)
+	spm.catchUpOrders.Store(3)
+	spm.catchUpAbandoned.Store(1)
 	spm.lastReconcileTime.Store(time.Unix(1700000000, 0))
 
 	s1 := spm.getOrCreateSlot(101)
@@ -89,6 +95,11 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	}
 	if snap.ActiveBuyOrders != 1 || snap.ActiveSellOrders != 1 {
 		t.Fatalf("active orders buy=%d sell=%d", snap.ActiveBuyOrders, snap.ActiveSellOrders)
+	}
+	if snap.MakerExecution.Attempts != 10 || snap.MakerExecution.Accepted != 9 ||
+		snap.MakerExecution.GuardSkips != 1 || snap.MakerExecution.PostOnlyRejects != 2 ||
+		snap.MakerExecution.CatchUpOrders != 3 || snap.MakerExecution.CatchUpAbandoned != 1 {
+		t.Fatalf("maker execution = %+v", snap.MakerExecution)
 	}
 	if snap.EstimatedProfit != 1.5 {
 		t.Fatalf("estimated profit = %v", snap.EstimatedProfit)
