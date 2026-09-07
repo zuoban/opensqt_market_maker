@@ -124,11 +124,6 @@ func TestCurrentOrderStreamHealth(t *testing.T) {
 			wantState: "HEALTH_UNAVAILABLE",
 		},
 		{
-			name:      "non-Binance without provider fails closed",
-			exchange:  &namedOnlyExchange{name: "Bitget"},
-			wantState: "HEALTH_UNAVAILABLE",
-		},
-		{
 			name: "provider ready",
 			exchange: &healthAwareExchange{
 				namedOnlyExchange: namedOnlyExchange{name: "Binance"},

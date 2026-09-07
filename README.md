@@ -5,7 +5,7 @@
   
   **毫秒级高频加密货币做市商系统 | High-Frequency Crypto Market Maker**
 
-  [![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue.svg)](https://golang.org/dl/)
+  [![Go Version](https://img.shields.io/badge/Go-1.25%2B-blue.svg)](https://golang.org/dl/)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 </div>
 
@@ -13,13 +13,13 @@
 
 ## 📖 项目简介 (Introduction)
 
-OpenSQT Market Maker 是一个高性能、低延迟的加密货币做市商系统，专注于永续合约市场的单向做多无限独立网格交易策略。系统采用 Go 语言开发，基于 WebSocket 实时数据流驱动，旨在为 Binance、Bitget、Bybit、Gate.io、backpack 等主流交易所提供稳定的流动性支持。
+OpenSQT Market Maker 是一个高性能、低延迟的 Binance 永续合约做市商系统，专注于单向做多无限独立网格交易策略。系统采用 Go 语言开发，基于 WebSocket 实时数据流驱动。
 
 经过数个版本迭代，我们已经使用此系统交易超过1亿美元的虚拟货币，例如，交易币安ETHUSDC，0手续，价格间隔1美元，每笔购买300美元，每天的交易量将达到300万美元以上，一个月可以交易5000万美元以上，只要市场是震荡或向上将持续产生盈利，如果市场单边下跌，3万美元保证金可以保证下跌1000个点不爆仓，通过不断交易拉低成本，只要回涨50%即可保本，涨回开仓原价可以赚到丰厚利润，如果出现单边极速下跌，主动风控系统将会自动识别立刻停止交易，当市场恢复后才允许继续下单，不担心插针爆仓。
 
 举例： eth 3000点开始交易，价格下跌到2700点，亏损约3000美元，价格涨回2850点以上已经保本，涨回3000点，盈利在1000-3000美元。
 
-OpenSQT is a high-performance, low-latency cryptocurrency market maker system focusing on long grid trading strategies for perpetual contract markets. Developed in Go and driven by WebSocket real-time data streams, it aims to provide stable liquidity support for major exchanges like Binance, Bitget, and Gate.io.
+OpenSQT is a high-performance, low-latency Binance perpetual futures market maker focused on long grid trading. It is developed in Go and driven by WebSocket real-time data streams.
 
 ## 📺 实时演示 (Live Demo)
 
@@ -29,7 +29,7 @@ OpenSQT is a high-performance, low-latency cryptocurrency market maker system fo
 
 ## ✨ 核心特性 (Key Features)
 
-- **多交易所支持**: 适配 Binance, Bitget, Gate.io, Bybit, EdgeX 等主流平台。
+- **Binance 专用**: 聚焦 Binance U 本位永续合约，减少无关适配层的复杂度。
 - **毫秒级响应**: 全 WebSocket 驱动（行情与订单流），拒绝轮询延迟。
 - **智能网格策略**: 
   - **固定金额模式**: 资金利用率更可控。
@@ -40,15 +40,12 @@ OpenSQT is a high-performance, low-latency cryptocurrency market maker system fo
   - **自动对账**: 定期同步本地与交易所状态，确保数据一致性。
 - **高并发架构**: 基于 Goroutine + Channel + Sync.Map 的高效并发模型。
 
-## 🏦 支持的交易所 (Supported Exchanges)
+## 🏦 支持的交易所 (Supported Exchange)
 
 | 交易所 (Exchange) | 状态 (Status) 
 |-------------------|---------------
 | **Binance**       | ✅ Stable      
-| **Bitget**        | ✅ Stable      
-| **Gate.io**       | ✅ Stable      
-| **Bybit**         | beta
-| **backpack**      | beta
+
 ## 模块架构
 
 ```
@@ -60,12 +57,10 @@ opensqt_platform/
 │
 ├── exchange/                  # 交易所抽象层（核心）
 │   ├── interface.go           # IExchange 统一接口
-│   ├── factory.go             # 工厂模式创建交易所实例
+│   ├── binance_exchange.go    # 创建 Binance 实例
 │   ├── types.go               # 通用数据结构
-│   ├── wrapper_*.go           # 适配器（包装各交易所）
-│   ├── binance/               # 币安实现
-│   ├── bitget/                # Bitget实现
-│   └── gate/                  # Gate.io实现
+│   ├── wrapper_binance*.go    # Binance 接口包装
+│   └── binance/               # Binance 实现
 │
 ├── logger/                    # 日志系统
 │   └── logger.go              # 文件日志 + 控制台日志
@@ -97,8 +92,8 @@ opensqt_platform/
 ## 🚀 快速开始 (Getting Started)
 
 ### 环境要求 (Prerequisites)
-- Go 1.21 或更高版本
-- 网络环境需能访问交易所 API
+- Go 1.25 或更高版本
+- 网络环境需能访问 Binance API
 
 ### 安装 (Installation)
 
@@ -124,9 +119,6 @@ opensqt_platform/
 2. 编辑 `config.yaml`，填入你的 API Key 和策略参数：
 
    ```yaml
-   app:
-     current_exchange: "binance"  # 选择交易所
-
    exchanges:
      binance:
        api_key: "YOUR_API_KEY"
@@ -141,6 +133,8 @@ opensqt_platform/
      buy_window_size: 10     # 买单挂单数量
      sell_window_size: 10    # 卖单挂单数量
    ```
+
+旧配置中的 `app.current_exchange` 已不再使用，可以直接删除；`exchanges.binance` 与原有 Binance 环境变量名称保持兼容。
 
 保证金占用比例按 `(保证金余额 - 可用余额) / 保证金余额 × 100%` 计算，既包含持仓占用，也包含未成交挂单冻结。超过 `max_margin_usage_percent` 后，程序会锁存停止新单，并撤销该交易对的全部挂单；即使占用比例随后下降，本次运行也不会自动恢复，需人工确认账户状态后重启。首次账户读数已经超限时，确认全撤后程序会以停单态继续运行，方便从只读面板观察；首次全撤后的 15 秒内还会每 2 秒复查一次迟到挂单。限制已经锁存时，即使配置了 `system.cancel_on_exit: false`，退出过程仍会强制全撤，并在固定 15 秒窗口内复查迟到挂单。
 
@@ -260,7 +254,7 @@ TARGET_OS=MacOS TARGET_ARCH=arm64 ./scripts/package_release.sh
 
 系统采用模块化设计，核心组件包括：
 
-- **Exchange Layer**: 统一的交易所接口抽象，屏蔽底层 API 差异。
+- **Exchange Layer**: Binance 适配器与交易核心之间的接口边界。
 - **Price Monitor**: 全局唯一的 WebSocket 价格源，确保决策一致性。
 - **Super Position Manager**: 核心仓位管理器，基于槽位 (Slot) 机制管理订单生命周期。
 - **Safety & Risk Control**: 多层级风控，包含启动检查、运行时监控和异常熔断。

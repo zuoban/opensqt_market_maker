@@ -35,3 +35,14 @@ func TestParseOrderIDAcceptsOnlyCanonicalDirections(t *testing.T) {
 		})
 	}
 }
+
+func TestBinanceBrokerPrefix(t *testing.T) {
+	plain := "100_B_1700000000001"
+	prefixed := AddBinanceBrokerPrefix(plain)
+	if got := RemoveBinanceBrokerPrefix(prefixed); got != plain {
+		t.Fatalf("RemoveBinanceBrokerPrefix(%q) = %q, want %q", prefixed, got, plain)
+	}
+	if len(AddBinanceBrokerPrefix("abcdefghijklmnopqrstuvwxyz0123456789")) != 36 {
+		t.Fatal("Binance client order ID should be truncated to 36 characters")
+	}
+}

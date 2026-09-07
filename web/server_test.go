@@ -18,14 +18,11 @@ import (
 
 func testDashCfg(listen, token string) *config.Config {
 	cfg := &config.Config{}
-	cfg.App.CurrentExchange = "bitget"
 	cfg.Trading.Symbol = "ETHUSDT"
 	cfg.Trading.OrderQuantity = 30
 	cfg.Trading.BuyWindowSize = 2
 	cfg.Trading.SellWindowSize = 2
-	cfg.Exchanges = map[string]config.ExchangeConfig{
-		"bitget": {APIKey: "k", SecretKey: "s", FeeRate: 0.0002},
-	}
+	cfg.Exchanges.Binance = config.BinanceConfig{APIKey: "k", SecretKey: "s", FeeRate: 0.0002}
 	enabled := true
 	cfg.Dashboard.Enabled = &enabled
 	cfg.Dashboard.Listen = listen

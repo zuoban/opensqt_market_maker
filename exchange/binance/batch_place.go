@@ -95,7 +95,7 @@ func (b *BinanceAdapter) placeOrderBatchChunk(ctx context.Context, orders []*Ord
 			results[i].Err = exchangeerr.WrapOrderPlacementRejected(fmt.Errorf("Binance 批量下单缺少 clientOrderID"))
 			continue
 		}
-		clientOID := utils.AddBrokerPrefix("binance", req.ClientOrderID)
+		clientOID := utils.AddBinanceBrokerPrefix(req.ClientOrderID)
 		svc := b.client.NewCreateOrderService().
 			Symbol(b.contractSpec.Symbol).
 			Side(futures.SideType(req.Side)).

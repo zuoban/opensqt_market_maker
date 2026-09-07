@@ -111,7 +111,7 @@ func TestNewBinanceAdapterRunsBoundedStartupValidation(t *testing.T) {
 	futures.BaseApiMainUrl = server.URL
 	defer func() { futures.BaseApiMainUrl = oldBaseURL }()
 
-	adapter, err := NewBinanceAdapter(map[string]string{"api_key": "key", "secret_key": "secret"}, "TESTUSDT")
+	adapter, err := NewBinanceAdapter("key", "secret", "TESTUSDT")
 	if err != nil {
 		t.Fatalf("NewBinanceAdapter() error = %v", err)
 	}
@@ -147,7 +147,7 @@ func TestNewBinanceAdapterFailsWhenServerTimeSyncFails(t *testing.T) {
 	futures.BaseApiMainUrl = server.URL
 	defer func() { futures.BaseApiMainUrl = oldBaseURL }()
 
-	_, err := NewBinanceAdapter(map[string]string{"api_key": "key", "secret_key": "secret"}, "TESTUSDT")
+	_, err := NewBinanceAdapter("key", "secret", "TESTUSDT")
 	if err == nil || !strings.Contains(err.Error(), "同步 Binance 服务器时间失败") {
 		t.Fatalf("NewBinanceAdapter() error = %v", err)
 	}

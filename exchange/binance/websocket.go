@@ -893,7 +893,7 @@ func parseOrderTradeUpdate(order futures.WsOrderTradeUpdate) (OrderUpdate, error
 }
 
 func strategyOrderSide(clientOrderID string) (string, bool) {
-	cleanID := utils.RemoveBrokerPrefix("binance", strings.TrimSpace(clientOrderID))
+	cleanID := utils.RemoveBinanceBrokerPrefix(strings.TrimSpace(clientOrderID))
 	_, side, _, valid := utils.ParseOrderID(cleanID, 0)
 	return side, valid
 }

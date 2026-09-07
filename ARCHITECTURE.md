@@ -1,7 +1,7 @@
 # OpenSQT 做市商系统架构说明
 
 > **版本**: v3.5.7
-> **最近更新**: 2026-09-02
+> **最近更新**: 2026-09-07
 > **目的**: 说明当前运行架构、交易安全边界与扩展约束
 
 ---
@@ -24,7 +24,7 @@
 OpenSQT 是一个 WebSocket 驱动的加密货币永续合约**单向做多网格做市系统**。每个网格使用固定报价货币金额，并以严格 PostOnly 限价单执行。
 
 ### 核心功能
-- ✅ 多交易所支持（Binance、Bitget、Gate.io、Bybit、Backpack）
+- ✅ Binance U 本位永续合约支持
 - ✅ 基于网格的自动做市策略
 - ✅ WebSocket 实时价格和订单流
 - ✅ 智能仓位管理（超级槽位系统）
@@ -107,12 +107,10 @@ opensqt_platform/
 │
 ├── exchange/                  # 交易所抽象层（核心）
 │   ├── interface.go           # IExchange 统一接口
-│   ├── factory.go             # 工厂模式创建交易所实例
+│   ├── binance_exchange.go    # 创建 Binance 实例
 │   ├── types.go               # 通用数据结构
-│   ├── wrapper_*.go           # 适配器（包装各交易所）
-│   ├── binance/               # 币安实现
-│   ├── bitget/                # Bitget实现
-│   └── gate/                  # Gate.io实现
+│   ├── wrapper_binance*.go    # Binance 接口包装
+│   └── binance/               # Binance 实现
 │
 ├── logger/                    # 日志系统
 │   └── logger.go              # 文件日志 + 控制台日志
@@ -144,7 +142,7 @@ opensqt_platform/
 ```
 1. 加载配置（YAML + OPENSQT_* 环境变量）
    ↓
-2. 创建交易所实例 (factory.go)
+2. 创建 Binance 实例 (binance_exchange.go)
    └── Binance：同步服务器时间、加载合约过滤器、校验交易权限/单向持仓/空头持仓
    ↓
 3. 启动价格监控 (PriceMonitor.Start)
@@ -159,7 +157,7 @@ opensqt_platform/
 5. 创建执行器与核心组件（新单门禁保持关闭）
    ↓
 6. 启动订单流 (exchange.StartOrderStream)
-   ├── 所有交易所必须完成私有订阅握手并进入 READY
+   ├── Binance 私有订单流必须完成握手并进入 READY
    ├── 连接代际、订阅确认或消息校验异常会立即转为 DEGRADED
    └── 回调 → SuperPositionManager.OnOrderUpdate
    ↓
@@ -219,7 +217,7 @@ tradingGateRuntime 串行协调器
 ```
 Exchange WebSocket (订单更新)
     ↓
-各交易所适配器校验连接代际、订阅确认、交易对与订单字段
+Binance 适配器校验连接代际、订阅确认、交易对与订单字段
     ├── ❌ 解码或字段异常 → DEGRADED、重连、门禁关闭
     └── ✅ 有效 OpenSQT 订单
     ↓
@@ -273,9 +271,9 @@ AdjustOrders(newPrice)
 ### 1. Exchange（交易所抽象层）
 
 #### 设计模式
-- **接口**: `IExchange` 统一所有交易所操作
-- **工厂**: `NewExchange()` 根据配置创建实例
-- **适配器**: `wrapper_*.go` 包装各交易所实现
+- **接口**: `IExchange` 隔离交易核心与 Binance SDK
+- **创建函数**: `NewBinance()` 创建 Binance 实例
+- **适配器**: `wrapper_binance*.go` 转换 Binance 与核心数据类型
 
 #### 核心接口
 ```go
@@ -328,21 +326,9 @@ binance/websocket.go (WebSocket)
 ```
 
 #### 关键挑战
-1. **API差异**:
-   - Binance: listenKey 订单流
-   - Bitget: 私有订单WebSocket
-   - Gate.io: 用户订单 WebSocket
-
-2. **精度处理**:
-   - Binance: 使用 `PRICE_FILTER.tickSize`
-   - Bitget: 使用 `priceEndStep × 10^-pricePlace`
-   - Gate.io: 使用 `order_price_round`
-   - Bybit / Backpack: 使用合约元数据中的 `tickSize`
-   - 真实 tick 缺失或非法时拒绝启动交易，不用展示小数位猜测
-
-3. **批量操作**:
-   - Bitget: 原生支持批量下单/撤单
-   - Binance/Gate: 循环调用单个API
+1. **订单流**: Binance 使用 listenKey 私有订单流，握手或保活失败必须关闭交易门禁。
+2. **精度处理**: 使用 `PRICE_FILTER.tickSize` 与 `LOT_SIZE.stepSize`；真实规格缺失或非法时拒绝启动交易。
+3. **批量操作**: 下单使用 Binance USD-M 原生批量接口，单批最多 5 笔；撤单与全撤按 Binance 接口语义确认结果。
 
 ---
 
@@ -633,7 +619,7 @@ PlaceOrder(req *OrderRequest) (*Order, error) {
 }
 ```
 
-Binance 适配器还会在创建订单返回 HTTP 408/409/5xx、超时、断连、异常 2xx 或重复 ClientOrderID 后，以**原始 ClientOrderID**查询订单；明确不存在时才使用同一 ID 重试。其他交易所遇到 408/409 或重复 ClientOrderID 类响应时也必须保留为 UNKNOWN，不得当作“远端无订单”释放槽位。
+Binance 适配器会在创建订单返回 HTTP 408/409/5xx、超时、断连、异常 2xx 或重复 ClientOrderID 后，以**原始 ClientOrderID**查询订单；明确不存在时才使用同一 ID 重试，否则保留为 UNKNOWN，不得释放槽位。
 
 #### 批量下单错误传播
 ```go
@@ -654,7 +640,7 @@ main.go
   ├── config (配置)
   ├── logger (日志)
   ├── exchange (交易所)
-  │     └── binance/bitget/gate (实现)
+  │     └── binance (实现)
   ├── monitor (价格监控)
   │     └── exchange.IExchange
   ├── order (订单执行)
@@ -756,7 +742,7 @@ ex.StartOrderStream(ctx, func(updateInterface interface{}) {
    容量: 1
    作用: 合并健康状态变化，唤醒串行协调器
 
-3. 交易所订单流生命周期 channel
+3. Binance 订单流生命周期 channel
    作用: 握手结果、连接完成、凭据失效和流错误通知
 
 4. sigChan (main)
@@ -933,19 +919,10 @@ if manager.insufficientMargin && time.Now().Before(manager.marginLockUntil) {
 
 ### A. 配置文件示例
 ```yaml
-app:
-  current_exchange: "binance"
-
 exchanges:
   binance:
     api_key: "your_api_key"
     secret_key: "your_secret_key"
-    fee_rate: 0.0002
-    
-  bitget:
-    api_key: "your_api_key"
-    secret_key: "your_secret_key"
-    passphrase: "your_passphrase"
     fee_rate: 0.0002
 
 trading:
@@ -1011,21 +988,6 @@ WebSocket: 10连接/IP
 订单: 10单/秒（单交易对）
 ```
 
-#### Bitget
-```
-REST API: 600次/分钟
-批量下单: 20单/次
-批量撤单: 20单/次
-WebSocket: 无特殊限制
-```
-
-#### Gate.io
-```
-REST API: 900次/分钟
-订单: 100单/秒
-WebSocket: 无特殊限制
-```
-
 ### D. 典型运行日志示例
 ```
 2025-12-24 10:00:00 [INFO] 🚀 www.OpenSQT.com 做市商系统启动...
@@ -1049,7 +1011,7 @@ WebSocket: 无特殊限制
 ## 总结
 
 OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构采用：
-- **接口抽象** + **工厂模式**（多交易所）
+- **接口抽象** + **Binance 适配器**
 - **WebSocket驱动** + **事件回调**（实时性）
 - **细粒度锁** + **原子操作**（并发安全）
 - **多层风控** + **状态机**（安全性）
@@ -1057,4 +1019,4 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 **官网**:
 - Website: www.OpenSQT.com
 - Version: v3.5.7
-- Last Updated: 2026-09-02
+- Last Updated: 2026-09-07

@@ -236,7 +236,7 @@ func TestUnknownReservationAcceptsPrefixedTerminalReplay(t *testing.T) {
 
 	spm.OnOrderUpdate(OrderUpdate{
 		OrderID:       88,
-		ClientOrderID: utils.AddBrokerPrefix("binance", clientOrderID),
+		ClientOrderID: utils.AddBinanceBrokerPrefix(clientOrderID),
 		Symbol:        "ETHUSDT",
 		Side:          "BUY",
 		Status:        "CANCELED",

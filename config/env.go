@@ -7,8 +7,6 @@ import (
 	"strings"
 )
 
-var knownExchanges = []string{"binance", "bitget", "bybit", "gate", "edgex", "backpack"}
-
 // LoadDotEnv 读取 .env 到进程环境。已存在的环境变量不覆盖（容器注入优先）。
 // 路径：OPENSQT_ENV_FILE，缺省为工作目录下的 .env。文件不存在则忽略。
 func LoadDotEnv() error {
@@ -42,24 +40,8 @@ func LoadDotEnv() error {
 }
 
 func applyEnvOverrides(cfg *Config) error {
-	if cfg.Exchanges == nil {
-		cfg.Exchanges = map[string]ExchangeConfig{}
-	}
-	if err := setString(&cfg.App.CurrentExchange, "OPENSQT_APP_CURRENT_EXCHANGE"); err != nil {
+	if err := applyBinanceEnv(&cfg.Exchanges.Binance); err != nil {
 		return err
-	}
-
-	names := map[string]struct{}{}
-	for name := range cfg.Exchanges {
-		names[strings.ToLower(name)] = struct{}{}
-	}
-	for _, name := range knownExchanges {
-		names[name] = struct{}{}
-	}
-	for name := range names {
-		if err := applyExchangeEnv(cfg, name); err != nil {
-			return err
-		}
 	}
 
 	t := &cfg.Trading
@@ -188,21 +170,13 @@ func applyEnvOverrides(cfg *Config) error {
 	return nil
 }
 
-func applyExchangeEnv(cfg *Config, name string) error {
-	prefix := "OPENSQT_EXCHANGES_" + strings.ToUpper(name) + "_"
-	ex := cfg.Exchanges[name]
-	changed := false
+func applyBinanceEnv(ex *BinanceConfig) error {
+	const prefix = "OPENSQT_EXCHANGES_BINANCE_"
 	if v, ok := lookupEnv(prefix + "API_KEY"); ok {
 		ex.APIKey = v
-		changed = true
 	}
 	if v, ok := lookupEnv(prefix + "SECRET_KEY"); ok {
 		ex.SecretKey = v
-		changed = true
-	}
-	if v, ok := lookupEnv(prefix + "PASSPHRASE"); ok {
-		ex.Passphrase = v
-		changed = true
 	}
 	if v, ok := lookupEnv(prefix + "FEE_RATE"); ok {
 		n, err := strconv.ParseFloat(v, 64)
@@ -210,10 +184,6 @@ func applyExchangeEnv(cfg *Config, name string) error {
 			return fmt.Errorf("%sFEE_RATE 不是有效数字: %q", prefix, v)
 		}
 		ex.FeeRate = n
-		changed = true
-	}
-	if changed {
-		cfg.Exchanges[name] = ex
 	}
 	return nil
 }

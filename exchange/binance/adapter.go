@@ -145,10 +145,7 @@ type BinanceAdapter struct {
 }
 
 // NewBinanceAdapter 创建币安适配器
-func NewBinanceAdapter(cfg map[string]string, symbol string) (*BinanceAdapter, error) {
-	apiKey := cfg["api_key"]
-	secretKey := cfg["secret_key"]
-
+func NewBinanceAdapter(apiKey, secretKey, symbol string) (*BinanceAdapter, error) {
 	if apiKey == "" || secretKey == "" {
 		return nil, fmt.Errorf("Binance API 配置不完整")
 	}
@@ -276,7 +273,7 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Or
 	// ClientOrderID 必须只加一次经纪商前缀，并在下单重试、结果确认时保持完全一致。
 	clientOrderID := req.ClientOrderID
 	if clientOrderID != "" {
-		clientOrderID = utils.AddBrokerPrefix("binance", clientOrderID)
+		clientOrderID = utils.AddBinanceBrokerPrefix(clientOrderID)
 	}
 
 	b.ensureStatusAwareTransport()

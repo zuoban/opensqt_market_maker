@@ -7,10 +7,7 @@ import (
 
 func TestDashboardDefaults(t *testing.T) {
 	c := &Config{}
-	c.App.CurrentExchange = "bitget"
-	c.Exchanges = map[string]ExchangeConfig{
-		"bitget": {APIKey: "k", SecretKey: "s"},
-	}
+	c.Exchanges.Binance = BinanceConfig{APIKey: "k", SecretKey: "s"}
 	c.Trading.Symbol = "ETHUSDT"
 	c.Trading.OrderQuantity = 30
 	c.Trading.BuyWindowSize = 2
@@ -48,10 +45,7 @@ func TestDashboardDefaults(t *testing.T) {
 
 func validTradingConfig() *Config {
 	c := &Config{}
-	c.App.CurrentExchange = "bitget"
-	c.Exchanges = map[string]ExchangeConfig{
-		"bitget": {APIKey: "k", SecretKey: "s"},
-	}
+	c.Exchanges.Binance = BinanceConfig{APIKey: "k", SecretKey: "s"}
 	c.Trading.Symbol = "ETHUSDT"
 	c.Trading.OrderQuantity = 30
 	c.Trading.BuyWindowSize = 10

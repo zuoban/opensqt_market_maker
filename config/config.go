@@ -50,13 +50,10 @@ func (c *TradingConfig) UnmarshalYAML(value *yaml.Node) error {
 
 // Config 做市商系统配置
 type Config struct {
-	// 应用配置
-	App struct {
-		CurrentExchange string `yaml:"current_exchange"` // 当前使用的交易所
-	} `yaml:"app"`
-
-	// 多交易所配置
-	Exchanges map[string]ExchangeConfig `yaml:"exchanges"`
+	// Binance 配置。继续使用 exchanges.binance 路径，兼容现有配置文件。
+	Exchanges struct {
+		Binance BinanceConfig `yaml:"binance"`
+	} `yaml:"exchanges"`
 
 	Trading TradingConfig `yaml:"trading"`
 
@@ -109,12 +106,11 @@ type DashboardConfig struct {
 	AccountRefreshSec int    `yaml:"account_refresh_sec"` // 账户缓存刷新秒数，默认10
 }
 
-// ExchangeConfig 交易所配置
-type ExchangeConfig struct {
-	APIKey     string  `yaml:"api_key"`
-	SecretKey  string  `yaml:"secret_key"`
-	Passphrase string  `yaml:"passphrase"` // Bitget 需要
-	FeeRate    float64 `yaml:"fee_rate"`   // 手续费率（例如 0.0002 表示 0.02%）
+// BinanceConfig Binance API 与手续费配置。
+type BinanceConfig struct {
+	APIKey    string  `yaml:"api_key"`
+	SecretKey string  `yaml:"secret_key"`
+	FeeRate   float64 `yaml:"fee_rate"` // 手续费率（例如 0.0002 表示 0.02%）
 }
 
 // LoadConfig 加载 YAML（文件可不存在），再用非空 OPENSQT_* 环境变量覆盖。
@@ -148,28 +144,15 @@ func LoadConfig(configPath string) (*Config, error) {
 
 // Validate 验证配置
 func (c *Config) Validate() error {
-	// 验证交易所配置
-	if c.App.CurrentExchange == "" {
-		return fmt.Errorf("必须指定当前使用的交易所 (app.current_exchange)")
-	}
-
-	// 验证多交易所配置
-	if len(c.Exchanges) == 0 {
-		return fmt.Errorf("未配置任何交易所，请在 exchanges 中添加配置")
-	}
-
-	exchangeCfg, exists := c.Exchanges[c.App.CurrentExchange]
-	if !exists {
-		return fmt.Errorf("交易所 %s 的配置不存在", c.App.CurrentExchange)
-	}
-
+	// 项目仅支持 Binance，配置路径固定为 exchanges.binance。
+	exchangeCfg := c.Exchanges.Binance
 	if exchangeCfg.APIKey == "" || exchangeCfg.SecretKey == "" {
-		return fmt.Errorf("交易所 %s 的 API 配置不完整", c.App.CurrentExchange)
+		return fmt.Errorf("Binance API 配置不完整 (exchanges.binance)")
 	}
 
 	// 验证手续费率配置
 	if exchangeCfg.FeeRate < 0 {
-		return fmt.Errorf("交易所 %s 的手续费率不能为负数", c.App.CurrentExchange)
+		return fmt.Errorf("Binance 手续费率不能为负数")
 	}
 
 	if c.Trading.Symbol == "" {

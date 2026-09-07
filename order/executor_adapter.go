@@ -245,11 +245,9 @@ func isPostOnlyError(err error) bool {
 		return true
 	}
 	errStr := err.Error()
-	// Binance: code=-5022, Bitget: Post Only order will be rejected, Gate.io: ORDER_POC_IMMEDIATE
+	// Binance 通常返回 code=-5022；保留文本判断以兼容 SDK 包装后的错误。
 	return strings.Contains(errStr, "Post Only") ||
-		strings.Contains(errStr, "post_only") ||
-		strings.Contains(errStr, "would immediately match") ||
-		strings.Contains(errStr, "ORDER_POC_IMMEDIATE")
+		strings.Contains(errStr, "would immediately match")
 }
 
 func classifyDefiniteOrderRejection(err error) (OrderRejectionKind, bool) {

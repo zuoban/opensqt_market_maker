@@ -33,7 +33,7 @@ var globalIDGen = &OrderIDGenerator{}
 //	65000_B_1702468800001  (价格65000，买单，约18字符)
 //	950_S_1702468800123    (价格0.950，卖单，约16字符)
 //
-// 注意: 为了兼容各交易所的限制，总长度控制在18字符以内
+// 注意: 为给 Binance 经纪商前缀预留空间，总长度控制在18字符以内
 func GenerateOrderID(price float64, side string, priceDecimals int) string {
 	globalIDGen.mu.Lock()
 	defer globalIDGen.mu.Unlock()
@@ -111,69 +111,24 @@ func ParseOrderID(clientOrderID string, priceDecimals int) (float64, string, int
 	return price, side, timestamp, true
 }
 
-// AddBrokerPrefix 为不同交易所添加返佣前缀
-//
-// 交易所限制:
-//   - Binance: 36字符限制，返佣前缀 "x-zdfVM8vY" (10字符)
-//   - Gate.io: 30字符限制，返佣前缀 "t-" (2字符)
-func AddBrokerPrefix(exchange, clientOrderID string) string {
-	switch exchange {
-	case "binance":
-		// 币安返佣前缀: x-zdfVM8vY (10字符)
-		prefix := "x-zdfVM8vY"
-		result := prefix + clientOrderID
-
-		// 长度检查（币安限制36字符）
-		if len(result) > 36 {
-			// 如果超长，截断 clientOrderID 部分
-			maxIDLen := 36 - len(prefix)
-			if maxIDLen > 0 {
-				result = prefix + clientOrderID[:maxIDLen]
-			} else {
-				result = prefix
-			}
-		}
-		return result
-
-	case "gate":
-		// Gate.io 返佣前缀: t- (2字符)
-		prefix := "t-"
-		result := prefix + clientOrderID
-
-		// 长度检查（Gate.io 限制30字符）
-		if len(result) > 30 {
-			// 如果超长，截断 clientOrderID 部分
-			maxIDLen := 30 - len(prefix)
-			if maxIDLen > 0 {
-				result = prefix + clientOrderID[:maxIDLen]
-			} else {
-				result = prefix
-			}
-		}
-		return result
-
-	default:
-		return clientOrderID
+// AddBinanceBrokerPrefix 添加 Binance 返佣前缀，并满足 36 字符限制。
+func AddBinanceBrokerPrefix(clientOrderID string) string {
+	const (
+		prefix      = "x-zdfVM8vY"
+		maxIDLength = 36
+	)
+	maxClientIDLength := maxIDLength - len(prefix)
+	if len(clientOrderID) > maxClientIDLength {
+		clientOrderID = clientOrderID[:maxClientIDLength]
 	}
+	return prefix + clientOrderID
 }
 
-// RemoveBrokerPrefix 移除交易所返佣前缀
-func RemoveBrokerPrefix(exchange, clientOrderID string) string {
-	switch exchange {
-	case "binance":
-		prefix := "x-zdfVM8vY"
-		if strings.HasPrefix(clientOrderID, prefix) {
-			return clientOrderID[len(prefix):]
-		}
-		return clientOrderID
-
-	case "gate":
-		if strings.HasPrefix(clientOrderID, "t-") {
-			return clientOrderID[2:]
-		}
-		return clientOrderID
-
-	default:
-		return clientOrderID
+// RemoveBinanceBrokerPrefix 移除 Binance 返佣前缀。
+func RemoveBinanceBrokerPrefix(clientOrderID string) string {
+	const prefix = "x-zdfVM8vY"
+	if strings.HasPrefix(clientOrderID, prefix) {
+		return clientOrderID[len(prefix):]
 	}
+	return clientOrderID
 }

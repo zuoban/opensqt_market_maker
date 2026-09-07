@@ -4,7 +4,7 @@
 
 ## 项目
 
-OpenSQT 是 Go 写的加密货币永续合约**单向做多网格做市**程序。行情和订单都走 WebSocket，不轮询价格。当前版本以 `main.go` 里的 `Version` 为准。
+OpenSQT 是 Go 写的 Binance 永续合约**单向做多网格做市**程序。行情和订单都走 WebSocket，不轮询价格。当前版本以 `main.go` 里的 `Version` 为准。
 
 模块路径：`opensqt`（Go 1.25）。
 
@@ -50,7 +50,7 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 |------|------|
 | `main.go` | 启动编排、版本号 |
 | `config/` | YAML 加载与校验 |
-| `exchange/` | `IExchange` + 各所 adapter/wrapper |
+| `exchange/` | `IExchange` + Binance adapter/wrapper |
 | `monitor/` | 唯一价格流；面板用的 5m K 线缓存 |
 | `order/` | 下单执行（限流、严格 PostOnly、重试） |
 | `position/` | 超级槽位、成交记录、小时汇总 |
@@ -60,7 +60,7 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 | `live_server/` | 独立演示页，**不是**主程序依赖 |
 | `scripts/package_release.sh` | 跨平台发行包 |
 
-交易所实现放在 `exchange/<name>/`，经 `wrapper_*.go` 接到 `IExchange`。新交易所走工厂 `exchange.NewExchange`，不要在 `main` 里写死所名分支。
+Binance 实现在 `exchange/binance/`，经 `wrapper_binance*.go` 接到 `IExchange`。项目只支持 Binance，不再维护交易所选择分支。
 
 ## 配置
 
@@ -94,6 +94,6 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 
 - 提交信息：`type(scope): 中文说明`，与现有 `feat(web):` / `feat:` 风格一致。
 - 交易路径改动要有测试：`position/`、`safety/`、`web/`、`monitor/` 已有包内测试。
-- 不要把 API Key、Passphrase、真实 `config.yaml` 写进代码、fixture 或文档示例以外的地方。
+- 不要把 API Key、Secret Key、真实 `config.yaml` 写进代码、fixture 或文档示例以外的地方。
 - `live_server/` 和 `部署教程.pdf` 不要塞进 Docker 构建上下文（已在 `.dockerignore`）。
 - 改 UI 时同步 `web/static/` 三件套，并跑前端单测；不要为了图方便去改 K 线逻辑，除非任务明确要求。

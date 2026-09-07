@@ -90,7 +90,7 @@ func visualFixtureSnapshot() map[string]interface{} {
 		"startedAt": time.Now().Add(-2*time.Hour - 18*time.Minute),
 		"uptimeSec": 8280,
 		"app": map[string]interface{}{
-			"exchange": "bitget", "symbol": "ETHUSDT", "orderQuantity": 30,
+			"exchange": "binance", "symbol": "ETHUSDT", "orderQuantity": 30,
 		},
 		"price": map[string]interface{}{
 			"last": latest, "lastText": "4,222.02", "updatedAt": time.Now(), "ageMs": 80,

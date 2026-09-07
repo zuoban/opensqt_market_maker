@@ -43,7 +43,7 @@ func TestPlaceOrderBatchPostsNativeBatchAndMapsMixedResults(t *testing.T) {
 			t.Errorf("timeInForce = %#v", payload)
 		}
 		writeJSON(t, w, http.StatusOK, []any{
-			orderFixture(11, utils.AddBrokerPrefix("binance", "buy-1")),
+			orderFixture(11, utils.AddBinanceBrokerPrefix("buy-1")),
 			map[string]any{"code": -5022, "msg": "Post Only order will be rejected."},
 		})
 	}))
@@ -76,7 +76,7 @@ func TestPlaceOrderBatchPostsNativeBatchAndMapsMixedResults(t *testing.T) {
 
 func TestPlaceOrderBatchAmbiguousHTTPConfirmsByClientOrderID(t *testing.T) {
 	const clientOID = "grid-order-1"
-	brokerID := utils.AddBrokerPrefix("binance", clientOID)
+	brokerID := utils.AddBinanceBrokerPrefix(clientOID)
 	var postCalls, queryCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -115,7 +115,7 @@ func TestPlaceOrderBatchConcurrentConfirmationKeepsRequestResultAlignment(t *tes
 		req := placementRequest()
 		req.ClientOrderID = fmt.Sprintf("grid-order-%d", i+1)
 		orders[i] = req
-		brokerID := utils.AddBrokerPrefix("binance", req.ClientOrderID)
+		brokerID := utils.AddBinanceBrokerPrefix(req.ClientOrderID)
 		wantOrderIDs[brokerID] = int64(101 + i)
 	}
 
@@ -149,7 +149,7 @@ func TestPlaceOrderBatchConcurrentConfirmationKeepsRequestResultAlignment(t *tes
 		t.Fatalf("items = %d, want %d", len(items), len(orders))
 	}
 	for i, item := range items {
-		brokerID := utils.AddBrokerPrefix("binance", orders[i].ClientOrderID)
+		brokerID := utils.AddBinanceBrokerPrefix(orders[i].ClientOrderID)
 		if item.Err != nil || item.Order == nil {
 			t.Fatalf("items[%d] = %+v, want confirmed order", i, item)
 		}

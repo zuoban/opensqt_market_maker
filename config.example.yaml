@@ -1,46 +1,11 @@
-# 应用配置
 # API Key 等敏感项可用环境变量覆盖，见 .env.example。非空 OPENSQT_* 优先于本文件。
-app:
-  current_exchange: "bitget"  # 当前使用的交易所: binance, bitget, bybit, gate, edgex
-
-# 多交易所配置
+# 项目固定使用 Binance，保留 exchanges.binance 路径以兼容已有配置。
 exchanges:
   binance:
-  #币安 开户邀请码【OPENSQT】开户链接：https://accounts.maxweb.chat/register?ref=OPENSQT
+    # 币安 开户邀请码【OPENSQT】开户链接：https://accounts.maxweb.chat/register?ref=OPENSQT
     api_key: "YOUR_API_KEY"
     secret_key: "YOUR_API_SECRET"
     fee_rate: 0.0002  # USDT 合约 Maker 手续费率 0.02%（实际费率以账户为准）
-  
-  bitget:
-  #BITGET 用我链接开户每笔交易省20%手续费 邀请码【opensqt】开户链接：https://partner.hdmune.cn/bg/mtm6553a
-    api_key: "YOUR_API_KEY"
-    secret_key: "YOUR_API_SECRET"
-    passphrase: "YOUR_PASSPHRASE"
-    fee_rate: 0.0002
-
-  bybit:
-  #BYBIT 开户邀请码【OPENSQT】开户链接：https://partner.bybit.com/b/OPENSQT
-    api_key: "YOUR_API_KEY"
-    secret_key: ""
-    fee_rate: 0.0002
-
-  gate:
-  #GATE.IO 用我链接开户每笔交易省20%手续费 邀请码【OPENSQTC】开户链接：https://www.gatenode.xyz/share/OPENSQTC
-    api_key: "YOUR_API_KEY"
-    secret_key: "YOUR_API_SECRET"
-    fee_rate: 0.0002
-
-  edgex:
-  #EDGEX 用我链接开户直升vip1,每笔交易省20%手续费 邀请码【OPENSQT】开户链接：https://pro.edgex.exchange/referral/OPENSQT
-    api_key: "YOUR_API_KEY"
-    secret_key: "YOUR_API_SECRET"
-    fee_rate: 0.0002
-    
-  backpack:
-  #BACKPACK 需要使用 API 公钥 + ED25519 私钥（SecretKey 填 base64 seed/private key）
-    api_key: ""
-    secret_key: ""
-    fee_rate: 0.0002
 ####################################
 
 trading:

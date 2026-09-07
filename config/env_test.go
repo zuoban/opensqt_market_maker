@@ -29,13 +29,10 @@ func writeTempYAML(t *testing.T, body string) string {
 }
 
 const envTestYAML = `
-app:
-  current_exchange: "bitget"
 exchanges:
-  bitget:
+  binance:
     api_key: "yaml-key"
     secret_key: "yaml-secret"
-    passphrase: "yaml-pass"
     fee_rate: 0.0002
 trading:
   symbol: "ETHUSDT"
@@ -44,9 +41,8 @@ trading:
 `
 
 func TestEnvOverridesYAMLSecrets(t *testing.T) {
-	t.Setenv("OPENSQT_EXCHANGES_BITGET_API_KEY", "env-key")
-	t.Setenv("OPENSQT_EXCHANGES_BITGET_SECRET_KEY", "env-secret")
-	t.Setenv("OPENSQT_EXCHANGES_BITGET_PASSPHRASE", "env-pass")
+	t.Setenv("OPENSQT_EXCHANGES_BINANCE_API_KEY", "env-key")
+	t.Setenv("OPENSQT_EXCHANGES_BINANCE_SECRET_KEY", "env-secret")
 	t.Setenv("OPENSQT_TRADING_SYMBOL", "BTCUSDC")
 	t.Setenv("OPENSQT_DASHBOARD_LISTEN", "0.0.0.0:8787")
 	t.Setenv("OPENSQT_DASHBOARD_TOKEN", "panel-token")
@@ -55,8 +51,8 @@ func TestEnvOverridesYAMLSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex := cfg.Exchanges["bitget"]
-	if ex.APIKey != "env-key" || ex.SecretKey != "env-secret" || ex.Passphrase != "env-pass" {
+	ex := cfg.Exchanges.Binance
+	if ex.APIKey != "env-key" || ex.SecretKey != "env-secret" {
 		t.Fatalf("exchange = %+v", ex)
 	}
 	if cfg.Trading.Symbol != "BTCUSDC" {
@@ -68,32 +64,46 @@ func TestEnvOverridesYAMLSecrets(t *testing.T) {
 }
 
 func TestEmptyEnvDoesNotOverrideYAML(t *testing.T) {
-	t.Setenv("OPENSQT_EXCHANGES_BITGET_API_KEY", "   ")
+	t.Setenv("OPENSQT_EXCHANGES_BINANCE_API_KEY", "   ")
 	t.Setenv("OPENSQT_TRADING_SYMBOL", "")
 	cfg, err := LoadConfig(writeTempYAML(t, envTestYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Exchanges["bitget"].APIKey != "yaml-key" {
-		t.Fatalf("api key = %s", cfg.Exchanges["bitget"].APIKey)
+	if cfg.Exchanges.Binance.APIKey != "yaml-key" {
+		t.Fatalf("api key = %s", cfg.Exchanges.Binance.APIKey)
 	}
 	if cfg.Trading.Symbol != "ETHUSDT" {
 		t.Fatalf("symbol = %s", cfg.Trading.Symbol)
 	}
 }
 
-func TestEnvCreatesMissingExchange(t *testing.T) {
-	t.Setenv("OPENSQT_APP_CURRENT_EXCHANGE", "binance")
-	t.Setenv("OPENSQT_EXCHANGES_BINANCE_API_KEY", "bnb-key")
-	t.Setenv("OPENSQT_EXCHANGES_BINANCE_SECRET_KEY", "bnb-secret")
-	cfg, err := LoadConfig(writeTempYAML(t, envTestYAML))
+func TestLegacyExchangeSelectorDoesNotAffectBinance(t *testing.T) {
+	cfg, err := LoadConfig(writeTempYAML(t, `
+app:
+  current_exchange: "legacy"
+`+envTestYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.App.CurrentExchange != "binance" {
-		t.Fatalf("exchange = %s", cfg.App.CurrentExchange)
+	if cfg.Exchanges.Binance.APIKey != "yaml-key" {
+		t.Fatalf("Binance config = %+v", cfg.Exchanges.Binance)
 	}
-	ex := cfg.Exchanges["binance"]
+}
+
+func TestEnvCreatesMissingBinanceConfig(t *testing.T) {
+	t.Setenv("OPENSQT_EXCHANGES_BINANCE_API_KEY", "bnb-key")
+	t.Setenv("OPENSQT_EXCHANGES_BINANCE_SECRET_KEY", "bnb-secret")
+	cfg, err := LoadConfig(writeTempYAML(t, `
+trading:
+  symbol: "ETHUSDT"
+  order_quantity: 30
+  buy_window_size: 10
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex := cfg.Exchanges.Binance
 	if ex.APIKey != "bnb-key" || ex.SecretKey != "bnb-secret" {
 		t.Fatalf("binance = %+v", ex)
 	}
@@ -147,10 +157,8 @@ func TestMaxMarginUsagePercentRejectsExplicitZeroFromYAMLMerge(t *testing.T) {
 	body := `
 trading_defaults: &trading_defaults
   max_margin_usage_percent: 0
-app:
-  current_exchange: "bitget"
 exchanges:
-  bitget:
+  binance:
     api_key: "yaml-key"
     secret_key: "yaml-secret"
 trading:
@@ -224,7 +232,6 @@ func TestLoadDotEnvDoesNotOverrideExisting(t *testing.T) {
 }
 
 func TestLoadConfigEnvOnlyWithoutYAML(t *testing.T) {
-	t.Setenv("OPENSQT_APP_CURRENT_EXCHANGE", "binance")
 	t.Setenv("OPENSQT_EXCHANGES_BINANCE_API_KEY", "env-key")
 	t.Setenv("OPENSQT_EXCHANGES_BINANCE_SECRET_KEY", "env-secret")
 	t.Setenv("OPENSQT_TRADING_SYMBOL", "ETHUSDC")
@@ -235,10 +242,10 @@ func TestLoadConfigEnvOnlyWithoutYAML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.App.CurrentExchange != "binance" || cfg.Trading.Symbol != "ETHUSDC" {
-		t.Fatalf("cfg = %+v", cfg.App)
+	if cfg.Trading.Symbol != "ETHUSDC" {
+		t.Fatalf("symbol = %s", cfg.Trading.Symbol)
 	}
-	ex := cfg.Exchanges["binance"]
+	ex := cfg.Exchanges.Binance
 	if ex.APIKey != "env-key" || ex.SecretKey != "env-secret" {
 		t.Fatalf("exchange = %+v", ex)
 	}

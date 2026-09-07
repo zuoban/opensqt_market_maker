@@ -23,7 +23,7 @@ func safeAppView(cfg *config.Config) SafeAppConfig {
 		return SafeAppConfig{}
 	}
 	view := SafeAppConfig{
-		Exchange:                cfg.App.CurrentExchange,
+		Exchange:                "binance",
 		Symbol:                  cfg.Trading.Symbol,
 		PriceInterval:           cfg.Trading.PriceInterval,
 		OrderQuantity:           cfg.Trading.OrderQuantity,
@@ -37,8 +37,6 @@ func safeAppView(cfg *config.Config) SafeAppConfig {
 	if len(cfg.RiskControl.MonitorSymbols) > 0 {
 		view.MonitorSymbols = append([]string(nil), cfg.RiskControl.MonitorSymbols...)
 	}
-	if ex, ok := cfg.Exchanges[cfg.App.CurrentExchange]; ok {
-		view.FeeRate = ex.FeeRate
-	}
+	view.FeeRate = cfg.Exchanges.Binance.FeeRate
 	return view
 }

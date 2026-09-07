@@ -445,8 +445,7 @@ func (spm *SuperPositionManager) parseClientOrderID(clientOrderID string) (float
 }
 
 func (spm *SuperPositionManager) canonicalClientOrderID(clientOrderID string) string {
-	exchangeName := strings.ToLower(spm.exchange.GetName())
-	return utils.RemoveBrokerPrefix(exchangeName, clientOrderID)
+	return utils.RemoveBinanceBrokerPrefix(clientOrderID)
 }
 
 func sameOrderQuantity(a, b float64) bool {
@@ -1561,7 +1560,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 
 	// 校验：确保这个更新属于当前的订单 (防止旧订单的延迟推送干扰新订单)
 	// 已记录终态的旧订单在上方走独立修正路径，不会重新绑定或清理当前订单。
-	// 优先使用 ClientOrderID 匹配 (某些交易所如 Gate.io 的 OrderID 可能略有差异)
+	// 优先使用 ClientOrderID 匹配，避免延迟推送里的旧 OrderID 干扰当前订单。
 	if slot.ClientOID != "" &&
 		spm.canonicalClientOrderID(slot.ClientOID) != update.ClientOrderID {
 		// ClientOrderID 不匹配，忽略此更新
@@ -1577,7 +1576,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		slot.ClientOID = update.ClientOrderID
 		slot.OrderSide = side
 	} else if slot.OrderID != update.OrderID {
-		// OrderID 不一致但 ClientOrderID 匹配，更新 OrderID (Gate.io 批量下单可能出现此情况)
+		// OrderID 不一致但 ClientOrderID 匹配时，以订单流返回的 OrderID 为准。
 		logger.Debug("📝 [更新OrderID] 槽位 %.2f: %d -> %d (ClientOID: %s)", price, slot.OrderID, update.OrderID, update.ClientOrderID)
 		slot.OrderID = update.OrderID
 	}

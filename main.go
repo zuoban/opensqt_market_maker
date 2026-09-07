@@ -55,15 +55,15 @@ func main() {
 	logger.SetLevel(logLevel)
 	logger.Info("日志级别设置为: %s", logLevel.String())
 
-	logger.Info("✅ 配置加载成功: 交易对=%s, 窗口大小=%d, 当前交易所=%s",
-		cfg.Trading.Symbol, cfg.Trading.BuyWindowSize, cfg.App.CurrentExchange)
+	logger.Info("✅ 配置加载成功: 交易对=%s, 窗口大小=%d, 交易所=Binance",
+		cfg.Trading.Symbol, cfg.Trading.BuyWindowSize)
 	logger.Info("🧮 保证金占用上限: %.2f%%", cfg.Trading.MaxMarginUsagePercent)
 	if !cfg.System.CancelOnExit {
 		logger.Warn("⚠️ system.cancel_on_exit=false：普通退出会保留交易所挂单；保证金硬限制已锁存时仍会强制全撤")
 	}
 
-	// 2. 创建交易所实例（使用工厂模式）
-	ex, err := exchange.NewExchange(cfg)
+	// 2. 创建 Binance 交易所实例
+	ex, err := exchange.NewBinance(cfg)
 	if err != nil {
 		logger.Fatalf("❌ 创建交易所实例失败: %v", err)
 	}
@@ -126,7 +126,7 @@ func main() {
 	}
 
 	// 获取当前交易所的手续费率
-	exchangeCfg := cfg.Exchanges[cfg.App.CurrentExchange]
+	exchangeCfg := cfg.Exchanges.Binance
 	feeRate := exchangeCfg.FeeRate
 	if feeProvider, ok := ex.(exchange.MakerFeeRateProvider); ok {
 		feeCtx, feeCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -138,7 +138,7 @@ func main() {
 
 		feeRate = actualFeeRate
 		exchangeCfg.FeeRate = actualFeeRate
-		cfg.Exchanges[cfg.App.CurrentExchange] = exchangeCfg
+		cfg.Exchanges.Binance = exchangeCfg
 		logger.Info("✅ 已获取 %s 实际 Maker 手续费率: %.6f", ex.GetName(), actualFeeRate)
 	}
 	// 注意：支持0费率，不需要特殊处理
