@@ -29,6 +29,37 @@ func TestSlotPriceIndexInsertRemoveAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestSlotPriceIndexSnapshotRemainsImmutableAfterWrite(t *testing.T) {
+	var idx slotPriceIndex
+	idx.insert(99)
+	idx.insert(100)
+	old := idx.snapshot()
+
+	idx.insert(101)
+	idx.remove(99)
+	if len(old) != 2 || old[0] != 99 || old[1] != 100 {
+		t.Fatalf("旧快照被后续写入修改: %v", old)
+	}
+	current := idx.snapshot()
+	if len(current) != 2 || current[0] != 100 || current[1] != 101 {
+		t.Fatalf("当前快照 = %v, want [100 101]", current)
+	}
+}
+
+func BenchmarkSlotPriceIndexSnapshot(b *testing.B) {
+	var idx slotPriceIndex
+	for i := 0; i < 500; i++ {
+		idx.insert(float64(i))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if len(idx.snapshot()) != 500 {
+			b.Fatal("价格索引长度异常")
+		}
+	}
+}
+
 func TestSlotPriceIndexHasPriceInOpenClosedRange(t *testing.T) {
 	var idx slotPriceIndex
 	idx.insert(99)

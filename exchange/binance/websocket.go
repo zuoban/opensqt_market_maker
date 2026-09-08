@@ -137,14 +137,15 @@ func (w *WebSocketManager) Start(ctx context.Context, callback OrderUpdateCallba
 }
 
 type combinedMarketEnvelope struct {
-	Stream string          `json:"stream"`
-	Data   json.RawMessage `json:"data"`
-}
-
-type combinedMarketHeader struct {
-	EventType string `json:"e"`
-	EventTime int64  `json:"E"`
-	Symbol    string `json:"s"`
+	Stream string `json:"stream"`
+	Data   struct {
+		EventType string `json:"e"`
+		EventTime int64  `json:"E"`
+		Symbol    string `json:"s"`
+		Price     string `json:"p"`
+		BestBid   string `json:"b"`
+		BestAsk   string `json:"a"`
+	} `json:"data"`
 }
 
 // MarketUpdate 是 Binance 包内部的市场增量；wrapper 会转换成 exchange
@@ -303,58 +304,37 @@ func parseCombinedMarketUpdate(
 	if err := json.Unmarshal(message, &envelope); err != nil {
 		return MarketUpdate{}, false, fmt.Errorf("解析 combined envelope: %w", err)
 	}
-	if len(envelope.Data) == 0 {
-		return MarketUpdate{}, false, fmt.Errorf("combined envelope 缺少 data")
-	}
-
-	var header combinedMarketHeader
-	if err := json.Unmarshal(envelope.Data, &header); err != nil {
-		return MarketUpdate{}, false, fmt.Errorf("解析市场消息头: %w", err)
-	}
 	expectedSymbol = strings.ToUpper(strings.TrimSpace(expectedSymbol))
-	if !strings.EqualFold(strings.TrimSpace(header.Symbol), expectedSymbol) {
-		return MarketUpdate{}, false, fmt.Errorf("市场数据交易对不匹配: got=%q want=%q", header.Symbol, expectedSymbol)
+	if !strings.EqualFold(strings.TrimSpace(envelope.Data.Symbol), expectedSymbol) {
+		return MarketUpdate{}, false, fmt.Errorf("市场数据交易对不匹配: got=%q want=%q", envelope.Data.Symbol, expectedSymbol)
 	}
 	if receivedAt.IsZero() {
 		receivedAt = time.Now()
 	}
 	eventTime := receivedAt
-	if header.EventTime > 0 {
-		eventTime = time.UnixMilli(header.EventTime)
+	if envelope.Data.EventTime > 0 {
+		eventTime = time.UnixMilli(envelope.Data.EventTime)
 	}
 	update := MarketUpdate{
 		Symbol: expectedSymbol, EventTime: eventTime, ReceivedAt: receivedAt, StreamEpoch: streamEpoch,
 	}
-	streamName := strings.ToLower(strings.TrimSpace(envelope.Stream))
+	streamName := strings.TrimSpace(envelope.Stream)
 
 	switch {
-	case header.EventType == "trade" || strings.HasSuffix(streamName, "@trade"):
-		var event struct {
-			Price string `json:"p"`
-		}
-		if err := json.Unmarshal(envelope.Data, &event); err != nil {
-			return MarketUpdate{}, false, fmt.Errorf("解析 trade: %w", err)
-		}
-		price, err := parseFiniteFloat("trade.price", event.Price)
+	case envelope.Data.EventType == "trade" || hasSuffixFold(streamName, "@trade"):
+		price, err := parseFiniteFloat("trade.price", envelope.Data.Price)
 		if err != nil {
 			return MarketUpdate{}, false, err
 		}
 		if price <= 0 {
-			return MarketUpdate{}, false, fmt.Errorf("非法成交价 %q", event.Price)
+			return MarketUpdate{}, false, fmt.Errorf("非法成交价 %q", envelope.Data.Price)
 		}
 		update.LastPrice = price
 		return update, true, nil
 
-	case header.EventType == "bookTicker" || strings.HasSuffix(streamName, "@bookticker"):
-		var event struct {
-			BestBid string `json:"b"`
-			BestAsk string `json:"a"`
-		}
-		if err := json.Unmarshal(envelope.Data, &event); err != nil {
-			return MarketUpdate{}, false, fmt.Errorf("解析 bookTicker: %w", err)
-		}
-		bid, bidErr := parseFiniteFloat("bookTicker.bestBid", event.BestBid)
-		ask, askErr := parseFiniteFloat("bookTicker.bestAsk", event.BestAsk)
+	case envelope.Data.EventType == "bookTicker" || hasSuffixFold(streamName, "@bookTicker"):
+		bid, bidErr := parseFiniteFloat("bookTicker.bestBid", envelope.Data.BestBid)
+		ask, askErr := parseFiniteFloat("bookTicker.bestAsk", envelope.Data.BestAsk)
 		if bidErr != nil {
 			return MarketUpdate{}, false, bidErr
 		}
@@ -362,7 +342,7 @@ func parseCombinedMarketUpdate(
 			return MarketUpdate{}, false, askErr
 		}
 		if bid <= 0 || ask <= bid {
-			return MarketUpdate{}, false, fmt.Errorf("非法最优盘口: bid=%q ask=%q", event.BestBid, event.BestAsk)
+			return MarketUpdate{}, false, fmt.Errorf("非法最优盘口: bid=%q ask=%q", envelope.Data.BestBid, envelope.Data.BestAsk)
 		}
 		update.BestBid = bid
 		update.BestAsk = ask
@@ -371,6 +351,13 @@ func parseCombinedMarketUpdate(
 	default:
 		return MarketUpdate{}, false, nil
 	}
+}
+
+func hasSuffixFold(value, suffix string) bool {
+	if len(value) < len(suffix) {
+		return false
+	}
+	return strings.EqualFold(value[len(value)-len(suffix):], suffix)
 }
 
 func waitPriceReconnect(ctx context.Context, delay time.Duration) bool {

@@ -78,6 +78,19 @@ func TestParseCombinedMarketUpdateRejectsInvalidBookAndSymbol(t *testing.T) {
 	}
 }
 
+func BenchmarkParseCombinedMarketUpdate(b *testing.B) {
+	message := []byte(`{"stream":"ethusdt@bookTicker","data":{"e":"bookTicker","E":1700000000456,"s":"ETHUSDT","b":"2010.20","a":"2010.30"}}`)
+	receivedAt := time.Unix(1_700_000_100, 0)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, recognized, err := parseCombinedMarketUpdate(
+			message, "ETHUSDT", uint64(i), 3, receivedAt,
+		); err != nil || !recognized {
+			b.Fatalf("recognized=%v err=%v", recognized, err)
+		}
+	}
+}
+
 type fakeUserStreamConnection struct {
 	done      chan struct{}
 	stop      chan struct{}

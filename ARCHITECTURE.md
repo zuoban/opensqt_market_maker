@@ -1,6 +1,6 @@
 # OpenSQT 做市商系统架构说明
 
-> **版本**: v3.5.9
+> **版本**: v3.5.10
 > **最近更新**: 2026-09-08
 > **目的**: 说明当前运行架构、交易安全边界与扩展约束
 
@@ -48,7 +48,7 @@ OpenSQT 是一个 WebSocket 驱动的加密货币永续合约**单向做多网�
 ✅ 全局唯一的价格流（PriceMonitor）
 ✅ WebSocket 是唯一的价格来源（不使用 REST API 轮询）
 ✅ 单条 combined WebSocket 同时接收 trade 与 bookTicker
-✅ 网格定位读取成交价，Maker 边界读取同一原子快照的最优盘口
+✅ 网格定位读取成交价，Maker 边界读取同一一致快照的最优盘口
 ❌ 禁止在其他地方独立启动价格流
 ```
 
@@ -201,7 +201,7 @@ Binance combined WebSocket (trade + bookTicker)
     ↓
 PriceMonitor.updateMarket()
     ↓
-MarketSnapshot (atomic.Value: LastPrice + BestBid/BestAsk + Epoch/Version)
+MarketSnapshot（RWMutex 短临界区：LastPrice + BestBid/BestAsk + Epoch/Version）
     ↓
 periodicPriceSender (定期推送)
     ↓
@@ -432,21 +432,25 @@ slot.mu.Unlock()
 #### 设计原则
 - **全局唯一**: 整个系统只有一个实例
 - **WebSocket Only**: 不使用 REST API 轮询
-- **原子操作**: 使用 `atomic.Value` 整份发布成交价、最优盘口、连接代际和盘口版本
+- **一致快照**: 使用 `sync.RWMutex` 的短临界区合并并读取成交价、最优盘口、连接代际和盘口版本
+- **热值读取**: 最新成交价和接收时间使用标量原子类型，常用读取不需要获取快照锁
+- **事件合并**: 在配置的发送周期内只保留最新价格事件，慢消费者不会阻塞行情接收
 - **断线失效**: 连接异常立即发布 Reset，新代际重新收到 trade 与 bookTicker 前禁止新单
 
 #### 核心字段
 ```go
 type PriceMonitor struct {
-    exchange      exchange.IExchange
-    lastPrice     atomic.Value  // float64
-    lastPriceStr  atomic.Value  // string（用于检测精度）
-    market        atomic.Value  // exchange.MarketSnapshot
-    
-    priceChangeCh     chan PriceChange
-    latestPriceChange atomic.Value  // *PriceChange
-    
-    isRunning atomic.Bool
+    exchange          exchange.IExchange
+    lastPriceBits     atomic.Uint64 // float64 bits
+    lastPriceUnixNano atomic.Int64  // 最近成交价的本地接收时间
+
+    marketMu         sync.RWMutex
+    market           exchange.MarketSnapshot
+    pendingChange    PriceChange
+    hasPendingChange bool
+
+    priceChangeCh chan PriceChange
+    isRunning     atomic.Bool
     priceSendInterval time.Duration
 }
 ```
@@ -457,7 +461,7 @@ type PriceMonitor struct {
    ↓
 2. updateMarket (合并 trade / bookTicker 增量)
    ↓
-3. 原子发布完整 MarketSnapshot；断线 Reset 立即使旧盘口失效
+3. 在短临界区发布完整 MarketSnapshot；断线 Reset 立即使旧盘口失效
    ↓
 4. periodicPriceSender (定期发送到 channel)
    ↓
@@ -772,10 +776,13 @@ ex.StartOrderStream(ctx, func(update exchange.OrderUpdate) {
 3. sync.RWMutex (InventorySlot/mu)
    作用: 槽位级别锁（细粒度锁）
    
-4. atomic.Value (price/lastPrice)
-   作用: 无锁原子操作（价格读取）
-   
-5. atomic.Bool (price/isRunning)
+4. atomic.Uint64 / atomic.Int64 (price/lastPriceBits, lastPriceUnixNano)
+   作用: 无锁读取最新成交价和接收时间
+
+5. sync.RWMutex (price/marketMu)
+   作用: 保证成交价、最优盘口、连接代际和版本的一致快照
+
+6. atomic.Bool (price/isRunning)
    作用: 运行状态标志
 ```
 
@@ -792,7 +799,7 @@ ex.StartOrderStream(ctx, func(update exchange.OrderUpdate) {
 
 3. **价格读取**
    - 风险: 多个协程同时读取
-   - 保护: atomic.Value（无锁）
+   - 保护: 最新成交价/接收时间使用标量原子类型；完整市场快照使用短临界区 `RWMutex`
 
 #### 死锁风险
 ```
@@ -1028,5 +1035,5 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 
 **官网**:
 - Website: www.OpenSQT.com
-- Version: v3.5.9
+- Version: v3.5.10
 - Last Updated: 2026-09-08

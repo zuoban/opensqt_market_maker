@@ -142,3 +142,65 @@ func TestMarketResetWakesSubscribersImmediately(t *testing.T) {
 		t.Fatal("market reset did not wake subscriber")
 	}
 }
+
+func TestPendingMarketChangeKeepsNewerUpdateWhenSendIsDeferred(t *testing.T) {
+	pm := NewPriceMonitor(nil, "ETHUSDT", 50)
+	now := time.Now()
+	pm.updateMarket(exchange.MarketUpdate{
+		Symbol: "ETHUSDT", LastPrice: 100, ReceivedAt: now, StreamEpoch: 1,
+	})
+	pm.updateMarket(exchange.MarketUpdate{
+		Symbol: "ETHUSDT", BestBid: 99, BestAsk: 101, ReceivedAt: now,
+		QuoteVersion: 1, StreamEpoch: 1,
+	})
+
+	deferred, ok := pm.takePendingChange()
+	if !ok || deferred.Market.QuoteVersion != 1 {
+		t.Fatalf("deferred change = %+v, ok=%v", deferred, ok)
+	}
+	pm.updateMarket(exchange.MarketUpdate{
+		Symbol: "ETHUSDT", BestBid: 100, BestAsk: 102, ReceivedAt: now.Add(time.Millisecond),
+		QuoteVersion: 2, StreamEpoch: 1,
+	})
+	pm.restorePendingChange(deferred)
+
+	latest, ok := pm.takePendingChange()
+	if !ok || latest.Market.QuoteVersion != 2 || latest.Market.BestBid != 100 {
+		t.Fatalf("latest change was overwritten by deferred send: %+v, ok=%v", latest, ok)
+	}
+}
+
+func TestLastPriceAccessorsAvoidHotPathFormatting(t *testing.T) {
+	pm := NewPriceMonitor(nil, "ETHUSDT", 50)
+	receivedAt := time.Unix(1_700_000_100, 123)
+	pm.updateMarket(exchange.MarketUpdate{
+		Symbol: "ETHUSDT", LastPrice: 2010.25,
+		ReceivedAt: receivedAt, StreamEpoch: 1,
+	})
+	if got := pm.GetLastPrice(); got != 2010.25 {
+		t.Fatalf("last price = %v", got)
+	}
+	if got := pm.GetLastPriceString(); got != "2010.25" {
+		t.Fatalf("last price string = %q", got)
+	}
+	if got := pm.GetLastPriceTime(); !got.Equal(receivedAt) {
+		t.Fatalf("last price time = %v, want %v", got, receivedAt)
+	}
+}
+
+func BenchmarkPriceMonitorUpdateMarket(b *testing.B) {
+	pm := NewPriceMonitor(nil, "ETHUSDT", 50)
+	receivedAt := time.Unix(1_700_000_100, 0)
+	pm.updateMarket(exchange.MarketUpdate{
+		Symbol: "ETHUSDT", LastPrice: 2010.25,
+		ReceivedAt: receivedAt, StreamEpoch: 1,
+	})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pm.updateMarket(exchange.MarketUpdate{
+			Symbol: "ETHUSDT", BestBid: 2010.20, BestAsk: 2010.30,
+			ReceivedAt: receivedAt, QuoteVersion: uint64(i + 1), StreamEpoch: 1,
+		})
+	}
+}

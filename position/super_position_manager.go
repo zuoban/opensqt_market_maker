@@ -2583,7 +2583,10 @@ func (spm *SuperPositionManager) findNearestGridPrice(currentPrice float64) floa
 //
 // 返回：槽位价格列表，从网格价格开始，按价格间隔递减或递增，使用检测到的价格精度
 func (spm *SuperPositionManager) calculateSlotPrices(gridPrice float64, count int, direction string) []float64 {
-	var prices []float64
+	if count <= 0 {
+		return nil
+	}
+	prices := make([]float64, count)
 	priceInterval := spm.config.Trading.PriceInterval
 
 	for i := 0; i < count; i++ {
@@ -2597,7 +2600,7 @@ func (spm *SuperPositionManager) calculateSlotPrices(gridPrice float64, count in
 		}
 		// 使用检测到的价格精度进行舍入
 		price = roundPrice(price, spm.priceDecimals)
-		prices = append(prices, price)
+		prices[i] = price
 	}
 
 	return prices

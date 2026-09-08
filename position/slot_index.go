@@ -34,9 +34,13 @@ func (idx *slotPriceIndex) insertLocked(price float64) {
 	if i < len(idx.prices) && idx.prices[i] == price {
 		return
 	}
-	idx.prices = append(idx.prices, 0)
-	copy(idx.prices[i+1:], idx.prices[i:])
-	idx.prices[i] = price
+	// 读取远多于增删。写入时复制，保证 snapshot 返回的旧视图在解锁后
+	// 仍然不可变；热路径遍历因此无需每次复制整个价格索引。
+	next := make([]float64, len(idx.prices)+1)
+	copy(next, idx.prices[:i])
+	next[i] = price
+	copy(next[i+1:], idx.prices[i:])
+	idx.prices = next
 }
 
 func (idx *slotPriceIndex) removeLocked(price float64) {
@@ -44,18 +48,22 @@ func (idx *slotPriceIndex) removeLocked(price float64) {
 	if i == len(idx.prices) || idx.prices[i] != price {
 		return
 	}
-	idx.prices = append(idx.prices[:i], idx.prices[i+1:]...)
+	next := make([]float64, len(idx.prices)-1)
+	copy(next, idx.prices[:i])
+	copy(next[i:], idx.prices[i+1:])
+	idx.prices = next
 }
 
+// snapshot 返回只读的不可变价格视图。调用方不得修改返回的切片；后续索引
+// 写入会发布新的底层数组，因此当前视图可在解锁后安全遍历且不产生分配。
 func (idx *slotPriceIndex) snapshot() []float64 {
 	if idx == nil {
 		return nil
 	}
 	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	out := make([]float64, len(idx.prices))
-	copy(out, idx.prices)
-	return out
+	prices := idx.prices
+	idx.mu.RUnlock()
+	return prices
 }
 
 // hasPriceInOpenClosedRange reports whether the index contains a price in

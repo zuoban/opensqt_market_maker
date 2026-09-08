@@ -3,6 +3,8 @@ package monitor
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,19 +45,19 @@ type PriceChange struct {
 
 // PriceMonitor 价格监控器
 type PriceMonitor struct {
-	symbol        string
-	exchange      exchange.IExchange // 依赖交易所接口
-	lastPrice     atomic.Value       // float64
-	lastPriceStr  atomic.Value       // string - 原始价格字符串（用于检测小数位数）
-	lastPriceTime atomic.Value       // time.Time
-	marketMu      sync.Mutex
-	market        atomic.Value // exchange.MarketSnapshot，整份原子发布
+	symbol            string
+	exchange          exchange.IExchange // 依赖交易所接口
+	lastPriceBits     atomic.Uint64      // float64 bits
+	lastPriceUnixNano atomic.Int64       // 最近成交价的本地接收时间
+	marketMu          sync.RWMutex
+	market            exchange.MarketSnapshot
+	pendingChange     PriceChange
+	hasPendingChange  bool
 
-	priceChangeCh     chan PriceChange
-	latestPriceChange atomic.Value // *PriceChange - 保存最新的价格更新（不阻塞）
-	isRunning         atomic.Bool
-	ctx               context.Context
-	cancel            context.CancelFunc
+	priceChangeCh chan PriceChange
+	isRunning     atomic.Bool
+	ctx           context.Context
+	cancel        context.CancelFunc
 
 	// 时间配置
 	priceSendInterval time.Duration
@@ -77,11 +79,7 @@ func NewPriceMonitor(ex exchange.IExchange, symbol string, priceSendInterval int
 		cancel:            cancel,
 		priceSendInterval: time.Duration(priceSendInterval) * time.Millisecond,
 	}
-	pm.lastPrice.Store(0.0)
-	pm.lastPriceStr.Store("")
-	pm.lastPriceTime.Store(time.Time{})
-	pm.market.Store(exchange.MarketSnapshot{Symbol: symbol})
-	pm.latestPriceChange.Store((*PriceChange)(nil))
+	pm.market = exchange.MarketSnapshot{Symbol: symbol}
 	return pm
 }
 
@@ -113,14 +111,14 @@ func (pm *PriceMonitor) Start() error {
 // pollPrice 已移除 - 毫秒级量化系统不使用 REST API 轮询
 // WebSocket 是唯一的价格来源，失败时系统应该停止运行
 
-// updateMarket 合并成交价与盘口增量，并以一份原子快照发布。Reset 会立即
+// updateMarket 合并成交价与盘口增量，并以一份一致快照发布。Reset 会立即
 // 丢弃旧连接的盘口；重连后必须重新收到成交价和 bookTicker 才 Ready。
 func (pm *PriceMonitor) updateMarket(update exchange.MarketUpdate) {
 	pm.marketMu.Lock()
-	defer pm.marketMu.Unlock()
 
-	current := pm.GetMarketSnapshot()
+	current := pm.market
 	if update.StreamEpoch > 0 && current.StreamEpoch > update.StreamEpoch {
+		pm.marketMu.Unlock()
 		return
 	}
 	if update.Reset {
@@ -131,10 +129,12 @@ func (pm *PriceMonitor) updateMarket(update exchange.MarketUpdate) {
 		reset := exchange.MarketSnapshot{
 			Symbol: update.Symbol, StreamEpoch: update.StreamEpoch, ReceivedAt: now,
 		}
-		pm.market.Store(reset)
-		pm.latestPriceChange.Store(&PriceChange{
+		pm.market = reset
+		pm.pendingChange = PriceChange{
 			OldPrice: current.LastPrice, Timestamp: now, QuoteChanged: true, Reset: true, Market: reset,
-		})
+		}
+		pm.hasPendingChange = true
+		pm.marketMu.Unlock()
 		return
 	}
 	if update.StreamEpoch > current.StreamEpoch {
@@ -155,10 +155,8 @@ func (pm *PriceMonitor) updateMarket(update exchange.MarketUpdate) {
 		if current.TradeTime.IsZero() {
 			current.TradeTime = now
 		}
-		pm.lastPrice.Store(update.LastPrice)
-		pm.lastPriceStr.Store(fmt.Sprintf("%f", update.LastPrice))
-		pm.lastPriceTime.Store(now)
-		pm.recordCandlePrice(update.LastPrice, now)
+		pm.lastPriceBits.Store(math.Float64bits(update.LastPrice))
+		pm.lastPriceUnixNano.Store(now.UnixNano())
 	}
 	if update.BestBid > 0 && update.BestAsk > update.BestBid {
 		quoteChanged = current.BestBid != update.BestBid || current.BestAsk != update.BestAsk ||
@@ -174,28 +172,52 @@ func (pm *PriceMonitor) updateMarket(update exchange.MarketUpdate) {
 	}
 	current.ReceivedAt = now
 	current.Ready = current.LastPrice > 0 && current.BestBid > 0 && current.BestAsk > current.BestBid
-	pm.market.Store(current)
+	pm.market = current
 
 	if update.LastPrice > 0 || quoteChanged {
-		pm.latestPriceChange.Store(&PriceChange{
+		pm.pendingChange = PriceChange{
 			OldPrice: oldPrice, NewPrice: current.LastPrice,
 			Change: current.LastPrice - oldPrice, Timestamp: now,
 			QuoteChanged: quoteChanged, Market: current,
-		})
+		}
+		pm.hasPendingChange = true
+	}
+	pm.marketMu.Unlock()
+
+	if update.LastPrice > 0 {
+		pm.recordCandlePrice(update.LastPrice, now)
 	}
 }
 
-// GetMarketSnapshot 返回成交价与最优盘口来自同一市场数据连接的原子快照。
+// GetMarketSnapshot 返回成交价与最优盘口来自同一市场数据连接的一致快照。
 func (pm *PriceMonitor) GetMarketSnapshot() exchange.MarketSnapshot {
 	if pm == nil {
 		return exchange.MarketSnapshot{}
 	}
-	if value := pm.market.Load(); value != nil {
-		if snapshot, ok := value.(exchange.MarketSnapshot); ok {
-			return snapshot
-		}
+	pm.marketMu.RLock()
+	snapshot := pm.market
+	pm.marketMu.RUnlock()
+	return snapshot
+}
+
+func (pm *PriceMonitor) takePendingChange() (PriceChange, bool) {
+	pm.marketMu.Lock()
+	defer pm.marketMu.Unlock()
+	if !pm.hasPendingChange {
+		return PriceChange{}, false
 	}
-	return exchange.MarketSnapshot{}
+	change := pm.pendingChange
+	pm.hasPendingChange = false
+	return change, true
+}
+
+func (pm *PriceMonitor) restorePendingChange(change PriceChange) {
+	pm.marketMu.Lock()
+	if !pm.hasPendingChange {
+		pm.pendingChange = change
+		pm.hasPendingChange = true
+	}
+	pm.marketMu.Unlock()
 }
 
 // periodicPriceSender 定期发送最新价格
@@ -208,20 +230,15 @@ func (pm *PriceMonitor) periodicPriceSender() {
 		case <-pm.ctx.Done():
 			return
 		case <-ticker.C:
-			// 获取最新价格更新
-			if latestVal := pm.latestPriceChange.Load(); latestVal != nil {
-				latestChange := latestVal.(*PriceChange)
-				if latestChange != nil {
-					// 尝试非阻塞发送
-					select {
-					case pm.priceChangeCh <- *latestChange:
-						// 只清掉本次实际发送的版本。若发送期间又到了更新，
-						// CAS 会失败并保留新版本，避免旧发送覆盖新盘口。
-						pm.latestPriceChange.CompareAndSwap(latestChange, (*PriceChange)(nil))
-					default:
-						// channel已满，保留最新价格等待下次机会
-					}
-				}
+			change, ok := pm.takePendingChange()
+			if !ok {
+				continue
+			}
+			select {
+			case pm.priceChangeCh <- change:
+			default:
+				// 若发送期间已有更新到达，restore 会保留更新后的版本。
+				pm.restorePendingChange(change)
 			}
 		}
 	}
@@ -237,28 +254,32 @@ func (pm *PriceMonitor) Stop() {
 
 // GetLastPrice 获取最新价格
 func (pm *PriceMonitor) GetLastPrice() float64 {
-	if val := pm.lastPrice.Load(); val != nil {
-		return val.(float64)
+	if pm == nil {
+		return 0
 	}
-	return 0
+	return math.Float64frombits(pm.lastPriceBits.Load())
 }
 
-// GetLastPriceString 获取最新价格的原始字符串（用于检测小数位数）
+// GetLastPriceString 返回最新价格文本。交易精度来自合约规格，不再在行情
+// 热路径为每笔成交预先分配字符串。
 func (pm *PriceMonitor) GetLastPriceString() string {
-	if val := pm.lastPriceStr.Load(); val != nil {
-		return val.(string)
+	price := pm.GetLastPrice()
+	if price <= 0 {
+		return ""
 	}
-	return ""
+	return strconv.FormatFloat(price, 'f', -1, 64)
 }
 
 // GetLastPriceTime 最近一次收到价格推送的时间
 func (pm *PriceMonitor) GetLastPriceTime() time.Time {
-	if val := pm.lastPriceTime.Load(); val != nil {
-		if t, ok := val.(time.Time); ok {
-			return t
-		}
+	if pm == nil {
+		return time.Time{}
 	}
-	return time.Time{}
+	nanos := pm.lastPriceUnixNano.Load()
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
 }
 
 // Subscribe 订阅价格变化
@@ -266,15 +287,16 @@ func (pm *PriceMonitor) Subscribe() <-chan PriceChange {
 	outCh := make(chan PriceChange, 10)
 	go func() {
 		defer close(outCh)
-		var latestChange *PriceChange // 保存最新的价格更新
+		var latestChange PriceChange
+		hasLatestChange := false
 
 		for {
 			select {
 			case <-pm.ctx.Done():
 				// 尝试发送最后保存的更新（如果有）
-				if latestChange != nil {
+				if hasLatestChange {
 					select {
-					case outCh <- *latestChange:
+					case outCh <- latestChange:
 					default:
 					}
 				}
@@ -282,9 +304,9 @@ func (pm *PriceMonitor) Subscribe() <-chan PriceChange {
 			case change, ok := <-pm.priceChangeCh:
 				if !ok {
 					// priceChangeCh已关闭，尝试发送最后保存的更新（如果有）
-					if latestChange != nil {
+					if hasLatestChange {
 						select {
-						case outCh <- *latestChange:
+						case outCh <- latestChange:
 						default:
 						}
 					}
@@ -301,11 +323,12 @@ func (pm *PriceMonitor) Subscribe() <-chan PriceChange {
 				select {
 				case outCh <- change:
 					// 成功发送，清空latestChange
-					latestChange = nil
+					hasLatestChange = false
 				default:
 					// outCh已满，保存最新的价格更新，丢弃旧数据
 					// 这样确保消费者总是能收到最新的价格，而不是被旧数据阻塞
-					latestChange = &change
+					latestChange = change
+					hasLatestChange = true
 				}
 			}
 		}

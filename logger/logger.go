@@ -238,12 +238,12 @@ func logf(level LogLevel, format string, args ...interface{}) {
 	if !shouldLog(level) {
 		return
 	}
-	prefix := fmt.Sprintf("[%s] ", level.String())
-	message := fmt.Sprintf(prefix+format, args...)
-	recordLog(level, fmt.Sprintf(format, args...))
+	levelText := level.String()
+	message := fmt.Sprintf(format, args...)
+	recordLog(level, message)
 
-	// 输出到控制台（标准输出）
-	log.Printf(prefix+format, args...)
+	// 正文只格式化一次；控制台、环缓冲和 DEBUG 文件复用同一结果。
+	log.Printf("[%s] %s", levelText, message)
 
 	// 如果日志级别为DEBUG，同时写入文件
 	if globalLevel == DEBUG {
@@ -252,7 +252,7 @@ func logf(level LogLevel, format string, args ...interface{}) {
 		checkAndRotateLog()
 		if fileLogger != nil {
 			// 写入文件（包含时间戳）
-			fileLogger.Printf("%s %s", time.Now().Format("2006/01/02 15:04:05"), message)
+			fileLogger.Printf("%s [%s] %s", time.Now().Format("2006/01/02 15:04:05"), levelText, message)
 		}
 		fileMu.Unlock()
 	}
