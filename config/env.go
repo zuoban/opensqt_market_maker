@@ -116,6 +116,9 @@ func applyEnvOverrides(cfg *Config) error {
 	if err := setFloat(&execCfg.NearTouchSingleOrderRatio, "OPENSQT_EXECUTION_NEAR_TOUCH_SINGLE_ORDER_RATIO"); err != nil {
 		return err
 	}
+	if err := setInt(&execCfg.MaxGapStackSlots, "OPENSQT_EXECUTION_MAX_GAP_STACK_SLOTS"); err != nil {
+		return err
+	}
 
 	if err := setString(&cfg.System.LogLevel, "OPENSQT_SYSTEM_LOG_LEVEL"); err != nil {
 		return err

@@ -231,10 +231,12 @@ func (spm *SuperPositionManager) recordPendingOrderAbsent(target pendingOrderTar
 			target.clientOrderID, misses, pendingLookupMissLimit)
 		return nil
 	}
+	stackedParent, stackedCount := slot.Price, slot.gapStackCount
 	spm.clearReservationLocked(slot)
 	retryAt := time.Now().Add(pendingLateUpdateGrace)
 	slot.placementRetryNotBefore = retryAt
 	slot.mu.Unlock()
+	spm.releaseGapStackChildren(stackedParent, stackedCount)
 	spm.rememberResolvedAbsentOrder(target.clientOrderID, retryAt)
 	logger.Warn("🔓 [待确认订单恢复] ClientOID=%s 连续 %d 次明确不存在，释放槽位并保留迟到事件缓冲",
 		target.clientOrderID, pendingLookupMissLimit)

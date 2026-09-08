@@ -113,6 +113,7 @@ type OrderRequest struct {
 	LogicalPrice  float64
 	QuoteVersion  uint64
 	CatchUp       bool
+	GapStack      int
 	NearTouch     bool
 	PlannedAt     time.Time
 
@@ -239,6 +240,11 @@ type InventorySlot struct {
 	orderReportedPNL float64
 	// 当前订单从部分成交到完全成交累计的已实现盈亏（用于成交历史）。
 	orderAccumulatedPNL float64
+
+	// gapStackCount>1 表示本槽买单合并了上方被跳过的空格。
+	// 成交后按格拆到 stackedParentPrice 指向本槽的子槽，分别挂卖。
+	gapStackCount      int
+	stackedParentPrice float64
 
 	mu sync.RWMutex // 槽位级别的锁（细粒度锁）
 }
@@ -590,6 +596,10 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 	slot.OrderCreatedAt = time.Now()
 	slot.orderReportedPNL = 0
 	slot.orderAccumulatedPNL = 0
+	slot.gapStackCount = 1
+	if req.GapStack > 1 {
+		slot.gapStackCount = req.GapStack
+	}
 	slot.SlotStatus = SlotStatusPending
 	if req.QuoteVersion > 0 {
 		slot.LastTriedQuoteVersion = req.QuoteVersion
@@ -601,7 +611,11 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 			// 只清理由本请求创建且尚未被订单流确认的 reservation。若身份已经
 			// 变化，说明另一个时序已经接管槽位，绝不能碰它。
 			if spm.matchesReservationLocked(slot, req) {
+				parentPrice, stackCount := slot.Price, slot.gapStackCount
 				spm.clearReservationLocked(slot)
+				slot.mu.Unlock()
+				spm.releaseGapStackChildren(parentPrice, stackCount)
+				return nil, false
 			}
 			slot.mu.Unlock()
 			return nil, false
@@ -759,6 +773,7 @@ func (spm *SuperPositionManager) clearReservationLocked(slot *InventorySlot) {
 	slot.placementRetryNotBefore = time.Time{}
 	slot.pendingLookupMisses = 0
 	slot.pendingLastLookup = time.Time{}
+	slot.gapStackCount = 0
 	slot.SlotStatus = SlotStatusFree
 }
 
@@ -799,8 +814,11 @@ func (spm *SuperPositionManager) releaseFailedReservation(req *OrderRequest) tim
 	}
 	slot := spm.getOrCreateSlot(price)
 	var retryAt time.Time
+	var stackedParent float64
+	var stackedCount int
 	slot.mu.Lock()
 	if spm.matchesReservationLocked(slot, req) {
+		stackedParent, stackedCount = slot.Price, slot.gapStackCount
 		spm.clearReservationLocked(slot)
 		retryDelay := placementRetryCooldown
 		switch req.rejectionKind() {
@@ -828,6 +846,7 @@ func (spm *SuperPositionManager) releaseFailedReservation(req *OrderRequest) tim
 			formatPrice(price, spm.priceDecimals), req.ClientOrderID)
 	}
 	slot.mu.Unlock()
+	spm.releaseGapStackChildren(stackedParent, stackedCount)
 	return retryAt
 }
 
@@ -957,6 +976,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	// logger.Debug("🔄 [实时调整] 当前价格: %s, 网格价格: %s, 买单窗口: %d, 卖单窗口: %d",
 	// 	formatPrice(currentPrice, spm.priceDecimals), formatPrice(currentGridPrice, spm.priceDecimals), buyWindowSize, sellWindowSize)
 
+	// 跳格合并买单成交后先拆到被跳过的空格，再收集卖单候选，
+	// 以便本轮就能在更高网格挂出卖单。
+	spm.redistributeGapStackedInventory()
+	spm.ensureGapStackChildReservations()
+
 	// 计算当前网格价格下方buy_window_size个价格
 	slotPrices := spm.calculateSlotPrices(currentGridPrice, buyWindowSize, "down")
 
@@ -1037,6 +1061,10 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	})
 	if spm.afterSellCandidateScan != nil {
 		spm.afterSellCandidateScan()
+	}
+
+	if buy, ok := spm.undersizedGapStackBuy(currentGridPrice); ok {
+		outOfWindowBuys = append(outOfWindowBuys, buy)
 	}
 
 	cancelIDs, leftoverOutOfWindowBuys, committedCancels := spm.commitOutOfWindowBuyCancels(outOfWindowBuys)
@@ -1197,6 +1225,10 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 			slot.mu.Unlock()
 			continue
 		}
+		if slot.stackedParentPrice > 0 {
+			slot.mu.Unlock()
+			continue
+		}
 		if !placementRetryReadyLocked(slot, adjustmentTime) {
 			slot.mu.Unlock()
 			continue
@@ -1263,6 +1295,20 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				continue
 			}
 
+			stackCount := 1
+			var stackChildren []float64
+			if sameGridPrice(price, currentGridPrice) {
+				children, blocked := spm.collectGapStackSlots(price)
+				if !blocked && len(children) > 0 {
+					stackCount = 1 + len(children)
+					stackChildren = children
+					quantity = roundPrice(quantity*float64(stackCount), spm.quantityDecimals)
+					logger.Info("📦 [跳格合并] 当前格 %s 上方空出 %d 格，按 %d 倍金额在 %s 下一单",
+						formatPrice(price, spm.priceDecimals), len(children), stackCount,
+						formatPrice(orderPrice, spm.priceDecimals))
+				}
+			}
+
 			// 生成 ClientOrderID
 			clientOID := spm.generateClientOrderID(price, "BUY")
 
@@ -1277,6 +1323,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				LogicalPrice:  price,
 				QuoteVersion:  market.QuoteVersion,
 				CatchUp:       catchUp,
+				GapStack:      stackCount,
 				NearTouch: market.Ready && market.BestAsk-orderPrice <=
 					priceInterval*spm.nearTouchRatio()+fillQtyTolerance,
 				PlannedAt: adjustmentTime,
@@ -1289,6 +1336,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 				catchUpOrdersToCreate++
 				spm.catchUpOrders.Add(1)
 			}
+			slot.mu.Unlock()
+			if len(stackChildren) > 0 {
+				spm.reserveGapStackChildren(price, stackChildren)
+			}
+			continue
 		}
 
 		slot.mu.Unlock()
@@ -1770,6 +1822,9 @@ func slotIsRecyclableLocked(slot *InventorySlot) bool {
 	if !slot.placementRetryNotBefore.IsZero() && time.Now().Before(slot.placementRetryNotBefore) {
 		return false
 	}
+	if slot.stackedParentPrice > 0 {
+		return false
+	}
 	return true
 }
 
@@ -1806,10 +1861,15 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 	slot := spm.lockMappedSlot(price)
 	adjustmentNeeded := false
 	var adjustmentNotBefore time.Time
+	var releaseStackParent float64
+	var releaseStackCount int
 	defer func() {
 		// 通知必须发生在槽位解锁之后；协调器收到通知后可能立即调用
 		// AdjustOrders，并再次获取当前槽位锁。
 		slot.mu.Unlock()
+		if releaseStackCount > 1 {
+			spm.releaseGapStackChildren(releaseStackParent, releaseStackCount)
+		}
 		if adjustmentNeeded {
 			delay := time.Duration(0)
 			if !adjustmentNotBefore.IsZero() {
@@ -1986,6 +2046,11 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 					formatPrice(price, spm.priceDecimals))
 				slot.PositionStatus = PositionStatusEmpty
 				slot.SlotStatus = SlotStatusFree // 允许重新挂买单
+				if slot.gapStackCount > 1 {
+					releaseStackParent = price
+					releaseStackCount = slot.gapStackCount
+					slot.gapStackCount = 0
+				}
 			}
 		} else if side == "SELL" {
 			// 卖单被取消/拒绝：应该还持有币，保持持仓状态

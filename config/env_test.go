@@ -74,6 +74,7 @@ func TestExecutionEnvOverrides(t *testing.T) {
 	t.Setenv("OPENSQT_EXECUTION_MAX_CATCH_UP_SLOTS_PER_ADJUST", "2")
 	t.Setenv("OPENSQT_EXECUTION_MAX_CATCH_UP_DISTANCE_RATIO", "0.4")
 	t.Setenv("OPENSQT_EXECUTION_NEAR_TOUCH_SINGLE_ORDER_RATIO", "0.2")
+	t.Setenv("OPENSQT_EXECUTION_MAX_GAP_STACK_SLOTS", "3")
 
 	cfg, err := LoadConfig(writeTempYAML(t, envTestYAML))
 	if err != nil {
@@ -84,7 +85,8 @@ func TestExecutionEnvOverrides(t *testing.T) {
 		got.PostOnlyRetryMinMS != 75 || got.PostOnlyRetryMaxMS != 600 ||
 		got.PostOnlyRetryBurst != 7 || got.CatchUpMode != "exact_wait" ||
 		got.MaxActiveCatchUpSlots != 2 || got.MaxCatchUpSlotsPerAdjust != 2 ||
-		got.MaxCatchUpDistanceRatio != 0.4 || got.NearTouchSingleOrderRatio != 0.2 {
+		got.MaxCatchUpDistanceRatio != 0.4 || got.NearTouchSingleOrderRatio != 0.2 ||
+		got.MaxGapStackSlots != 3 {
 		t.Fatalf("execution overrides = %+v", got)
 	}
 }

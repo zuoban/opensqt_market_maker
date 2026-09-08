@@ -28,7 +28,7 @@ type TradingConfig struct {
 	// 注意：price_decimals 和 quantity_decimals 已废弃，现在从交易所自动获取
 }
 
-// ExecutionConfig 控制严格 Maker 的盘口保护、拒单退避和被动补格。
+// ExecutionConfig 控制严格 Maker 的盘口保护、拒单退避、被动补格和跳格合并。
 // 所有模式最终仍由订单执行边界强制 PostOnly，不提供 Taker 降级。
 type ExecutionConfig struct {
 	MakerGuardTicks           int     `yaml:"maker_guard_ticks"`
@@ -41,6 +41,7 @@ type ExecutionConfig struct {
 	MaxCatchUpSlotsPerAdjust  int     `yaml:"max_catch_up_slots_per_adjust"`
 	MaxCatchUpDistanceRatio   float64 `yaml:"max_catch_up_distance_ratio"`
 	NearTouchSingleOrderRatio float64 `yaml:"near_touch_single_order_ratio"`
+	MaxGapStackSlots          int     `yaml:"max_gap_stack_slots"`
 }
 
 // UnmarshalYAML 记录 max_margin_usage_percent 是否由用户显式配置，
@@ -313,6 +314,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Execution.NearTouchSingleOrderRatio > 1 {
 		return fmt.Errorf("execution.near_touch_single_order_ratio 必须在 (0, 1] 范围内")
+	}
+	if c.Execution.MaxGapStackSlots < 0 {
+		return fmt.Errorf("execution.max_gap_stack_slots 不能为负数")
+	}
+	if c.Execution.MaxGapStackSlots == 0 {
+		c.Execution.MaxGapStackSlots = 1
+	}
+	if c.Execution.MaxGapStackSlots > 10 {
+		return fmt.Errorf("execution.max_gap_stack_slots 不能大于 10")
 	}
 
 	// 验证风控配置并设置默认值

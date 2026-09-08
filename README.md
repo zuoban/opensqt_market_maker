@@ -157,6 +157,7 @@ execution:
   max_catch_up_slots_per_adjust: 1
   max_catch_up_distance_ratio: 0.5
   near_touch_single_order_ratio: 0.15
+  max_gap_stack_slots: 1            # 跳格时当前买单合并几格金额
 ```
 
 - 同一盘口版本只尝试一次；明确 `-5022` 后默认按 50/100/200/400/500ms 退避，超过 5 次后每次至少等待 1 秒。
@@ -164,6 +165,7 @@ execution:
 - 距盘口过近的订单拆成单笔请求，降低原生批量请求中共享陈旧盘口的概率。
 - 下单结果为 UNKNOWN 时保持原槽位 `PENDING` 和原 ClientOrderID，优先等待订单流；预留超过 5 秒后，对账会按同一 ClientOrderID 只读确认。只有 3 次、间隔至少 500ms 的查询都明确返回“订单不存在”才释放槽位；超时或异常响应仍保持关闭，避免重复下单。
 - `order_quantity` 始终表示每格报价货币金额；被动补格改变实际买价时会重新计算数量。
+- 价格向下跳过尚未成交的空格时，当前格会按跳过的格数合并金额下一单；成交后拆到被跳过的格，分别在各自上一格卖出。
 
 ### 运行 (Usage)
 

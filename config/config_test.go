@@ -34,7 +34,8 @@ func TestDashboardDefaults(t *testing.T) {
 		c.Execution.PostOnlyRetryMinMS != 50 || c.Execution.PostOnlyRetryMaxMS != 500 ||
 		c.Execution.PostOnlyRetryBurst != 5 || c.Execution.CatchUpMode != "passive" ||
 		c.Execution.MaxActiveCatchUpSlots != 1 || c.Execution.MaxCatchUpSlotsPerAdjust != 1 ||
-		c.Execution.MaxCatchUpDistanceRatio != 0.5 || c.Execution.NearTouchSingleOrderRatio != 0.15 {
+		c.Execution.MaxCatchUpDistanceRatio != 0.5 || c.Execution.NearTouchSingleOrderRatio != 0.15 ||
+		c.Execution.MaxGapStackSlots != 1 {
 		t.Fatalf("execution defaults = %+v", c.Execution)
 	}
 	c.Dashboard.PushIntervalMS = 50
@@ -69,6 +70,8 @@ func TestExecutionConfigValidation(t *testing.T) {
 		{name: "per adjust", configure: func(c *Config) { c.Execution.MaxCatchUpSlotsPerAdjust = -1 }, want: "max_catch_up_slots_per_adjust"},
 		{name: "catch up ratio", configure: func(c *Config) { c.Execution.MaxCatchUpDistanceRatio = 1.01 }, want: "max_catch_up_distance_ratio"},
 		{name: "near touch ratio", configure: func(c *Config) { c.Execution.NearTouchSingleOrderRatio = math.NaN() }, want: "near_touch_single_order_ratio"},
+		{name: "gap stack negative", configure: func(c *Config) { c.Execution.MaxGapStackSlots = -1 }, want: "max_gap_stack_slots"},
+		{name: "gap stack too large", configure: func(c *Config) { c.Execution.MaxGapStackSlots = 11 }, want: "max_gap_stack_slots"},
 	}
 
 	for _, tt := range tests {
