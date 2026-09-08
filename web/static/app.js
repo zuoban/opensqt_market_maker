@@ -13,6 +13,8 @@
             buildSnapshotAcceptanceModel,
             buildFreshnessModel,
 			buildMakerExecutionModel,
+            buildGridStatusModel,
+            buildEstimatedProfitModel,
             centeredScrollLeft,
             formatRelativeTime,
             candleChangePct,
@@ -636,6 +638,7 @@
 
         const realized = pos.realizedPnl != null ? pos.realizedPnl : 0;
         const mark = Number(price.last || pos.lastPrice);
+        const profitModel = buildEstimatedProfitModel(pos, mark);
         const positionValue = Number(pos.positionValue) > 0
             ? Number(pos.positionValue)
             : (Number(pos.positionQty) > 0 && Number.isFinite(mark) && mark > 0
@@ -663,9 +666,20 @@
                 "",
                 positionValueText
             ),
-            metric("活动买 / 卖", (pos.activeBuyOrders || 0) + " / " + (pos.activeSellOrders || 0))
+            metric("活动买 / 卖", (pos.activeBuyOrders || 0) + " / " + (pos.activeSellOrders || 0)),
+            metric(
+                "预计盈利",
+                fmt(profitModel.total) + " " + quote,
+                profitModel.total >= 0 ? "pos" : "neg",
+                "累计卖量 × 间距"
+            ),
+            metric(
+                "预计每笔盈利",
+                profitModel.perTrade == null ? "等待行情" : fmt(profitModel.perTrade, 4) + " " + quote,
+                profitModel.perTrade == null ? "warn" : (profitModel.perTrade >= 0 ? "pos" : "neg"),
+                "间距 × 每单数量"
+            )
         ];
-        const estimated = pos.estimatedProfit || 0;
         const startupPrice = Number(pos.anchorPrice || 0);
         const strategyItems = [
             metric("程序启动时间", formatDateTime(snapshot.startedAt)),
@@ -677,7 +691,6 @@
             ),
             metric("运行时长", uptimeText),
             metric("启动保证金余额", initialMarginReady ? fmt(acc.initialMargin) + " " + quote : "等待首次读取", initialMarginReady ? "" : "warn"),
-            metric("预计盈利", fmt(estimated) + " " + quote, estimated >= 0 ? "pos" : "neg"),
             metric("累计买 / 卖", fmt(pos.totalBuyQty, 4) + " / " + fmt(pos.totalSellQty, 4)),
             metric("最近对账", formatTime(pos.lastReconcileTime)),
             metric("保证金锁", pos.marginLocked ? fmt(pos.marginLockRemainingSec, 0) + "s" : "未锁定", pos.marginLocked ? "warn" : ""),
@@ -707,6 +720,11 @@
         ];
 
         updateSection("primary-kpis", primaryItems, () => renderMetrics($("kpis"), primaryItems));
+        updateSection("grid-status", (pos.slots || []).map((slot) => ({
+            slotStatus: slot.slotStatus || "",
+            positionStatus: slot.positionStatus || "",
+            orderStatus: slot.orderStatus || ""
+        })), () => renderGridStatus(buildGridStatusModel(pos.slots)));
         updateSection("margin-usage", { margin, quote }, () => renderMarginUsage(marginModel));
         updateSection("strategy-kpis", strategyItems, () => renderMetrics($("strategyKpis"), strategyItems));
 		updateSection("maker-execution", { makerModel, dec }, () => renderMakerExecution(makerModel, dec));
@@ -901,6 +919,97 @@
         replaceChildren(container, cards);
         container.classList.remove("is-loading");
         container.setAttribute("aria-busy", "false");
+    }
+
+    function buildEstimatedProfitModel(position, lastPrice) {
+        const pos = position || {};
+        const estimated = Number(pos.estimatedProfit);
+        const total = Number.isFinite(estimated) ? estimated : 0;
+        const interval = Number(pos.priceInterval);
+        const orderAmount = Number(pos.orderQuantity);
+        const mark = Number(lastPrice);
+        let perTrade = null;
+        if (interval > 0 && orderAmount > 0 && Number.isFinite(mark) && mark > 0) {
+            perTrade = interval * (orderAmount / mark);
+        }
+        return { total, perTrade, interval, orderAmount, mark };
+    }
+
+    function buildGridStatusModel(slots) {
+        const list = Array.isArray(slots) ? slots : [];
+        return {
+            total: list.length,
+            slotStatus: countStatus(list, "slotStatus", ["FREE", "PENDING", "LOCKED"], gridStatusTone),
+            positionStatus: countStatus(list, "positionStatus", ["EMPTY", "FILLED"], gridStatusTone),
+            orderStatus: countStatus(list, "orderStatus", [
+                "NOT_PLACED",
+                "PLACED",
+                "CONFIRMED",
+                "PARTIALLY_FILLED",
+                "FILLED",
+                "CANCEL_REQUESTED",
+                "CANCELED"
+            ], gridStatusTone)
+        };
+    }
+
+    function countStatus(slots, key, order, toneFor) {
+        const counts = Object.create(null);
+        (slots || []).forEach((slot) => {
+            const raw = slot && slot[key] != null ? String(slot[key]).trim() : "";
+            if (!raw) return;
+            counts[raw] = (counts[raw] || 0) + 1;
+        });
+        const items = [];
+        const seen = new Set();
+        (order || []).forEach((value) => {
+            seen.add(value);
+            const count = counts[value] || 0;
+            if (count <= 0) return;
+            items.push({ value, count, tone: toneFor(key, value) });
+        });
+        Object.keys(counts).sort().forEach((value) => {
+            if (seen.has(value) || counts[value] <= 0) return;
+            items.push({ value, count: counts[value], tone: toneFor(key, value) });
+        });
+        return items;
+    }
+
+    function gridStatusTone(kind, value) {
+        if (kind === "slotStatus") {
+            if (value === "PENDING") return "warn";
+            if (value === "LOCKED") return "live";
+            return "";
+        }
+        if (kind === "positionStatus") {
+            if (value === "FILLED") return "pos";
+            return "";
+        }
+        if (value === "PLACED" || value === "CONFIRMED") return "live";
+        if (value === "PARTIALLY_FILLED" || value === "CANCEL_REQUESTED") return "warn";
+        if (value === "FILLED") return "pos";
+        return "";
+    }
+
+    function renderGridStatus(model) {
+        const root = $("gridStatus");
+        if (!root) return;
+        renderGridStatusGroup("gridSlotStatus", "gridSlotStatusLabel", "槽位锁定", model.slotStatus, model.total);
+        renderGridStatusGroup("gridPositionStatus", "gridPositionStatusLabel", "持仓状态", model.positionStatus, model.total);
+        renderGridStatusGroup("gridOrderStatus", "gridOrderStatusLabel", "订单状态", model.orderStatus, model.total);
+    }
+
+    function renderGridStatusGroup(pillsId, titleId, title, items, total) {
+        const titleNode = $(titleId);
+        if (titleNode) setText(titleNode, title + " · " + safeCount(total));
+        const nodes = (items && items.length ? items : [{ value: "等待槽位", count: null, tone: "empty" }]).map((item) => {
+            const chip = element("span", "grid-chip" + (item.tone ? " is-" + item.tone : ""));
+            chip.append(element("span", "", item.value));
+            if (item.count != null) chip.append(element("b", "", String(item.count)));
+            return chip;
+        });
+        const pills = $(pillsId);
+        if (pills) replaceChildren(pills, nodes);
     }
 
     function buildKlineGridModel(kline, pos, includeOutside) {

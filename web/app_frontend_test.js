@@ -10,6 +10,8 @@ const {
     buildSnapshotAcceptanceModel,
     buildFreshnessModel,
 	buildMakerExecutionModel,
+    buildGridStatusModel,
+    buildEstimatedProfitModel,
     centeredScrollLeft,
     formatRelativeTime,
     candleChangePct,
@@ -841,6 +843,71 @@ test("edge grid slots fold into overflow while nearest orders stay labeled", () 
     assert.equal(model.railLabels.some((item) => item.price === 105.6), false);
     assert.ok(model.railLabels.some((item) => item.hasBuy && Math.abs(item.price - last) <= Math.abs(99 - last)));
     assert.ok(model.railLabels.some((item) => item.hasSell));
+});
+
+test("grid status model counts SlotStatus, PositionStatus and OrderStatus", () => {
+    const model = buildGridStatusModel([
+        { slotStatus: "LOCKED", positionStatus: "FILLED", orderStatus: "PLACED" },
+        { slotStatus: "LOCKED", positionStatus: "EMPTY", orderStatus: "CONFIRMED" },
+        { slotStatus: "FREE", positionStatus: "EMPTY", orderStatus: "NOT_PLACED" },
+        { slotStatus: "PENDING", positionStatus: "EMPTY", orderStatus: "NOT_PLACED" },
+        { slotStatus: "LOCKED", positionStatus: "EMPTY", orderStatus: "CANCEL_REQUESTED" },
+        { slotStatus: "", positionStatus: "  ", orderStatus: null }
+    ]);
+
+    assert.equal(model.total, 6);
+    assert.deepEqual(model.slotStatus.map((item) => [item.value, item.count, item.tone]), [
+        ["FREE", 1, ""],
+        ["PENDING", 1, "warn"],
+        ["LOCKED", 3, "live"]
+    ]);
+    assert.deepEqual(model.positionStatus.map((item) => [item.value, item.count, item.tone]), [
+        ["EMPTY", 4, ""],
+        ["FILLED", 1, "pos"]
+    ]);
+    assert.deepEqual(model.orderStatus.map((item) => [item.value, item.count, item.tone]), [
+        ["NOT_PLACED", 2, ""],
+        ["PLACED", 1, "live"],
+        ["CONFIRMED", 1, "live"],
+        ["CANCEL_REQUESTED", 1, "warn"]
+    ]);
+
+    const empty = buildGridStatusModel([]);
+    assert.equal(empty.total, 0);
+    assert.deepEqual(empty.slotStatus, []);
+
+    const unknown = buildGridStatusModel([{ slotStatus: "OCCUPIED", positionStatus: "FILLED", orderStatus: "OPEN" }]);
+    assert.equal(unknown.slotStatus[0].value, "OCCUPIED");
+    assert.equal(unknown.orderStatus[0].value, "OPEN");
+});
+
+test("estimated profit per trade is interval times order quantity at mark", () => {
+    const model = buildEstimatedProfitModel({
+        estimatedProfit: 7.14,
+        priceInterval: 6,
+        orderQuantity: 30
+    }, 4222.02);
+    assert.equal(model.total, 7.14);
+    assert.ok(Math.abs(model.perTrade - 6 * (30 / 4222.02)) < 1e-12);
+
+    const waiting = buildEstimatedProfitModel({ estimatedProfit: 0, priceInterval: 6, orderQuantity: 30 }, 0);
+    assert.equal(waiting.total, 0);
+    assert.equal(waiting.perTrade, null);
+});
+
+test("dashboard markup exposes grid status and moved profit metrics", () => {
+    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
+    const js = fs.readFileSync(__dirname + "/static/app.js", "utf8");
+    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
+    assert.match(html, /SlotStatus/);
+    assert.match(html, /PositionStatus/);
+    assert.match(html, /OrderStatus/);
+    assert.match(html, /id="gridStatus"/);
+    assert.match(cssBlock(css, ".grid-status"), /grid-template-columns:\s*repeat\(3/);
+    const primaryBlock = js.slice(js.indexOf("const primaryItems"), js.indexOf("const strategyItems"));
+    const strategyBlock = js.slice(js.indexOf("const strategyItems"), js.indexOf("updateSection(\"primary-kpis\""));
+    assert.match(primaryBlock, /活动买 \/ 卖[\s\S]*预计盈利[\s\S]*预计每笔盈利/);
+    assert.equal(strategyBlock.includes("预计盈利"), false);
 });
 
 test("visible candle count is capped for real-time canvas performance", () => {

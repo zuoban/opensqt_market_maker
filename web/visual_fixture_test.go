@@ -74,14 +74,14 @@ func visualFixtureSnapshot() map[string]interface{} {
 	}
 
 	slots := []map[string]interface{}{
-		{"price": 4244.0, "priceText": "4,244.00", "positionStatus": "FILLED", "positionQty": 0.014, "positionQtyText": "0.0140", "orderSide": "SELL", "orderStatus": "PLACED", "slotStatus": "OCCUPIED", "inSellWindow": true},
-		{"price": 4238.0, "priceText": "4,238.00", "orderSide": "SELL", "orderStatus": "CONFIRMED", "slotStatus": "OPEN", "inSellWindow": true},
-		{"price": 4232.0, "priceText": "4,232.00", "slotStatus": "ANCHOR"},
-		{"price": 4226.0, "priceText": "4,226.00", "orderSide": "BUY", "orderStatus": "PLACED", "slotStatus": "OPEN", "inBuyWindow": true},
-		{"price": 4220.0, "priceText": "4,220.00", "positionStatus": "FILLED", "positionQty": 0.011, "positionQtyText": "0.0110", "slotStatus": "OCCUPIED", "inBuyWindow": true},
-		{"price": 4214.0, "priceText": "4,214.00", "orderSide": "BUY", "orderStatus": "NOT_PLACED", "slotStatus": "PENDING", "waitState": "PENDING_CONFIRMATION", "inBuyWindow": true},
-		{"price": 4208.0, "priceText": "4,208.00", "orderSide": "BUY", "orderStatus": "CANCEL_REQUESTED", "slotStatus": "LOCKED", "waitState": "CANCEL_CONFIRMATION", "inBuyWindow": true},
-		{"price": 4202.0, "priceText": "4,202.00", "waitState": "RETRY_COOLDOWN", "retryRemainingSec": 0.8, "inBuyWindow": true},
+		{"price": 4244.0, "priceText": "4,244.00", "positionStatus": "FILLED", "positionQty": 0.014, "positionQtyText": "0.0140", "orderSide": "SELL", "orderStatus": "PLACED", "slotStatus": "LOCKED", "inSellWindow": true},
+		{"price": 4238.0, "priceText": "4,238.00", "positionStatus": "EMPTY", "orderSide": "SELL", "orderStatus": "CONFIRMED", "slotStatus": "LOCKED", "inSellWindow": true},
+		{"price": 4232.0, "priceText": "4,232.00", "positionStatus": "EMPTY", "orderStatus": "NOT_PLACED", "slotStatus": "FREE"},
+		{"price": 4226.0, "priceText": "4,226.00", "positionStatus": "EMPTY", "orderSide": "BUY", "orderStatus": "PLACED", "slotStatus": "LOCKED", "inBuyWindow": true},
+		{"price": 4220.0, "priceText": "4,220.00", "positionStatus": "FILLED", "positionQty": 0.011, "positionQtyText": "0.0110", "orderStatus": "NOT_PLACED", "slotStatus": "FREE", "inBuyWindow": true},
+		{"price": 4214.0, "priceText": "4,214.00", "positionStatus": "EMPTY", "orderSide": "BUY", "orderStatus": "NOT_PLACED", "slotStatus": "PENDING", "waitState": "PENDING_CONFIRMATION", "inBuyWindow": true},
+		{"price": 4208.0, "priceText": "4,208.00", "positionStatus": "EMPTY", "orderSide": "BUY", "orderStatus": "CANCEL_REQUESTED", "slotStatus": "LOCKED", "waitState": "CANCEL_CONFIRMATION", "inBuyWindow": true},
+		{"price": 4202.0, "priceText": "4,202.00", "positionStatus": "EMPTY", "orderStatus": "NOT_PLACED", "slotStatus": "FREE", "waitState": "RETRY_COOLDOWN", "retryRemainingSec": 0.8, "inBuyWindow": true},
 	}
 
 	latest := candles[len(candles)-1]["close"]
