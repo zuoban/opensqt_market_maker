@@ -225,6 +225,82 @@ func TestGapStackCancelsUndersizedLiveBuy(t *testing.T) {
 	}
 }
 
+func TestGapStackCancelsPreexistingCurrentBuyAfterUpperBuysLeaveWindow(t *testing.T) {
+	executor := &gapStackExecutor{}
+	spm := gapStackTestSetup(t, executor)
+	spm.config.Execution.MaxGapStackSlots = 5
+	spm.anchorPrice = 103.27
+	market := freshMarket(102.67, 102.66, 102.72, 2)
+	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
+
+	type liveBuy struct {
+		price    float64
+		orderID  int64
+		clientID string
+		quantity float64
+	}
+	liveBuys := make([]liveBuy, 0, 6)
+	for i := 0; i <= 5; i++ {
+		price := roundPrice(102.67+float64(i)*0.10, spm.priceDecimals)
+		slot := spm.getOrCreateSlot(price)
+		slot.OrderID = int64(100 + i)
+		slot.ClientOID = spm.generateClientOrderID(price, "BUY")
+		slot.OrderSide = "BUY"
+		slot.OrderStatus = OrderStatusConfirmed
+		slot.OrderPrice = price
+		slot.OrderQuantity = spm.gridBuyQuantity(price)
+		slot.SlotStatus = SlotStatusLocked
+		liveBuys = append(liveBuys, liveBuy{
+			price:    price,
+			orderID:  slot.OrderID,
+			clientID: slot.ClientOID,
+			quantity: slot.OrderQuantity,
+		})
+	}
+
+	if err := spm.AdjustOrders(102.67); err != nil {
+		t.Fatalf("first AdjustOrders() error = %v", err)
+	}
+	if len(executor.cancelIDs) != len(liveBuys) {
+		t.Fatalf("cancel IDs = %v, want current buy and five skipped buys", executor.cancelIDs)
+	}
+	current := spm.getOrCreateSlot(102.67)
+	if current.OrderStatus != OrderStatusCancelRequested {
+		t.Fatalf("current buy status = %s, want CANCEL_REQUESTED", current.OrderStatus)
+	}
+
+	for _, buy := range liveBuys {
+		spm.OnOrderUpdate(OrderUpdate{
+			OrderID:       buy.orderID,
+			ClientOrderID: buy.clientID,
+			Status:        "CANCELED",
+			Quantity:      buy.quantity,
+			ExecutedQty:   0,
+			Price:         buy.price,
+			Side:          "BUY",
+		})
+	}
+
+	if err := spm.AdjustOrders(102.67); err != nil {
+		t.Fatalf("second AdjustOrders() error = %v", err)
+	}
+	var replacement *OrderRequest
+	for _, req := range executor.orders {
+		if req != nil && req.Side == "BUY" && sameGridPrice(req.LogicalPrice, 102.67) {
+			replacement = req
+			break
+		}
+	}
+	if replacement == nil {
+		t.Fatalf("missing replacement BUY, orders=%+v", executor.orders)
+	}
+	unit := spm.gridBuyQuantity(replacement.Price)
+	if replacement.GapStack != 6 || replacement.Quantity != roundPrice(unit*6, spm.quantityDecimals) {
+		t.Fatalf("replacement = qty:%v gap:%d, want six slots (%v each)",
+			replacement.Quantity, replacement.GapStack, unit)
+	}
+}
+
 func TestGapStackFailedReservationReleasesChild(t *testing.T) {
 	executor := &recordingExecutor{}
 	spm := gapStackTestSetup(t, executor)

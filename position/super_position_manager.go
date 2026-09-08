@@ -1063,11 +1063,20 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		spm.afterSellCandidateScan()
 	}
 
-	if buy, ok := spm.undersizedGapStackBuy(currentGridPrice); ok {
-		outOfWindowBuys = append(outOfWindowBuys, buy)
-	}
-
 	cancelIDs, leftoverOutOfWindowBuys, committedCancels := spm.commitOutOfWindowBuyCancels(outOfWindowBuys)
+
+	// 上方刚离开窗口的买单在扫描时仍是活跃订单，会暂时挡住跳格判断。
+	// 先把它们线性化为 CANCEL_REQUESTED，再复查当前格已有买单是否需要扩容；
+	// 否则当前格可能以单格金额先成交，永久漏掉本轮跳过的空格。
+	if buy, ok := spm.undersizedGapStackBuy(currentGridPrice); ok {
+		moreIDs, moreLeftover, moreCommitted := spm.commitOutOfWindowBuyCancels([]outOfWindowBuy{buy})
+		cancelIDs = append(cancelIDs, moreIDs...)
+		if len(moreIDs) > 0 {
+			sort.Slice(cancelIDs, func(i, j int) bool { return cancelIDs[i] < cancelIDs[j] })
+		}
+		leftoverOutOfWindowBuys = leftoverOutOfWindowBuys || moreLeftover
+		committedCancels = append(committedCancels, moreCommitted...)
+	}
 
 	// 计算允许创建的订单数量上限
 	threshold := spm.config.Trading.OrderCleanupThreshold
