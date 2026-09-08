@@ -720,11 +720,23 @@
         ];
 
         updateSection("primary-kpis", primaryItems, () => renderMetrics($("kpis"), primaryItems));
-        updateSection("grid-status", (pos.slots || []).map((slot) => ({
-            slotStatus: slot.slotStatus || "",
-            positionStatus: slot.positionStatus || "",
-            orderStatus: slot.orderStatus || ""
-        })), () => renderGridStatus(buildGridStatusModel(pos.slots)));
+        updateSection("grid-status", {
+            gridPrice: pos.gridPrice,
+            priceDecimals: pos.priceDecimals,
+            quote,
+            slots: (pos.slots || []).map((slot) => ({
+                price: slot.price,
+                priceText: slot.priceText || "",
+                slotStatus: slot.slotStatus || "",
+                positionStatus: slot.positionStatus || "",
+                positionQty: slot.positionQty,
+                orderStatus: slot.orderStatus || "",
+                orderId: slot.orderId,
+                clientOid: slot.clientOid || "",
+                waitState: slot.waitState || "",
+                retryRemainingSec: slot.retryRemainingSec
+            }))
+        }, () => renderGridStatus(buildGridStatusModel(pos.slots, pos.gridPrice, pos.priceDecimals), quote));
         updateSection("margin-usage", { margin, quote }, () => renderMarginUsage(marginModel));
         updateSection("strategy-kpis", strategyItems, () => renderMetrics($("strategyKpis"), strategyItems));
 		updateSection("maker-execution", { makerModel, dec }, () => renderMakerExecution(makerModel, dec));
@@ -935,44 +947,63 @@
         return { total, perTrade, interval, orderAmount, mark };
     }
 
-    function buildGridStatusModel(slots) {
+    function buildGridStatusModel(slots, gridPrice, priceDecimals) {
         const list = Array.isArray(slots) ? slots : [];
+        const targetPrice = Number(gridPrice);
+        const decimalsValue = Number(priceDecimals);
+        const decimals = Number.isInteger(decimalsValue) && decimalsValue >= 0
+            ? Math.min(decimalsValue, 12)
+            : 2;
+        const tolerance = Math.max(1e-9, Math.pow(10, -decimals) / 2);
+        const current = Number.isFinite(targetPrice) && targetPrice > 0
+            ? list.find((slot) => {
+                const price = Number(slot && slot.price);
+                return Number.isFinite(price) && Math.abs(price - targetPrice) <= tolerance;
+            })
+            : null;
+        const modelPrice = current ? Number(current.price) : targetPrice;
+        const priceText = current && String(current.priceText || "").trim()
+            ? String(current.priceText).trim()
+            : (Number.isFinite(modelPrice) && modelPrice > 0 ? fmt(modelPrice, decimals) : "");
+
+        if (!current) {
+            return {
+                found: false,
+                price: Number.isFinite(modelPrice) && modelPrice > 0 ? modelPrice : null,
+                priceText,
+                summary: priceText ? "槽位尚未建立" : "等待网格定位",
+                slotStatus: null,
+                positionStatus: null,
+                orderStatus: null
+            };
+        }
+
+        const statusItem = (key) => {
+            const value = current[key] == null ? "" : String(current[key]).trim();
+            return value ? { value, tone: gridStatusTone(key, value) } : null;
+        };
         return {
-            total: list.length,
-            slotStatus: countStatus(list, "slotStatus", ["FREE", "PENDING", "LOCKED"], gridStatusTone),
-            positionStatus: countStatus(list, "positionStatus", ["EMPTY", "FILLED"], gridStatusTone),
-            orderStatus: countStatus(list, "orderStatus", [
-                "NOT_PLACED",
-                "PLACED",
-                "CONFIRMED",
-                "PARTIALLY_FILLED",
-                "FILLED",
-                "CANCEL_REQUESTED",
-                "CANCELED"
-            ], gridStatusTone)
+            found: true,
+            price: modelPrice,
+            priceText,
+            summary: gridWaitStateLabel(slotWaitState(current)),
+            slotStatus: statusItem("slotStatus"),
+            positionStatus: statusItem("positionStatus"),
+            orderStatus: statusItem("orderStatus")
         };
     }
 
-    function countStatus(slots, key, order, toneFor) {
-        const counts = Object.create(null);
-        (slots || []).forEach((slot) => {
-            const raw = slot && slot[key] != null ? String(slot[key]).trim() : "";
-            if (!raw) return;
-            counts[raw] = (counts[raw] || 0) + 1;
-        });
-        const items = [];
-        const seen = new Set();
-        (order || []).forEach((value) => {
-            seen.add(value);
-            const count = counts[value] || 0;
-            if (count <= 0) return;
-            items.push({ value, count, tone: toneFor(key, value) });
-        });
-        Object.keys(counts).sort().forEach((value) => {
-            if (seen.has(value) || counts[value] <= 0) return;
-            items.push({ value, count: counts[value], tone: toneFor(key, value) });
-        });
-        return items;
+    function gridWaitStateLabel(value) {
+        const labels = {
+            ACTIVE: "活动订单",
+            PENDING_CONFIRMATION: "等待下单确认",
+            CANCEL_CONFIRMATION: "等待撤单确认",
+            RETRY_COOLDOWN: "重试冷却",
+            LOCKED_INCONSISTENT: "状态异常",
+            POSITION: "已有持仓",
+            EMPTY: "空闲槽位"
+        };
+        return labels[value] || "状态已同步";
     }
 
     function gridStatusTone(kind, value) {
@@ -991,25 +1022,36 @@
         return "";
     }
 
-    function renderGridStatus(model) {
+    function renderGridStatus(model, quote) {
         const root = $("gridStatus");
         if (!root) return;
-        renderGridStatusGroup("gridSlotStatus", "gridSlotStatusLabel", "槽位锁定", model.slotStatus, model.total);
-        renderGridStatusGroup("gridPositionStatus", "gridPositionStatusLabel", "持仓状态", model.positionStatus, model.total);
-        renderGridStatusGroup("gridOrderStatus", "gridOrderStatusLabel", "订单状态", model.orderStatus, model.total);
+        root.classList.toggle("is-waiting", !model.found);
+        const quoteAsset = quote ? String(quote) : "";
+        setText($("gridCurrentSlotPrice"), model.priceText
+            ? model.priceText + (quoteAsset ? " " + quoteAsset : "")
+            : "—");
+        setText($("gridCurrentSlotCopy"), model.summary);
+        const stateLabel = [
+            "SlotStatus " + (model.slotStatus ? model.slotStatus.value : "—"),
+            "PositionStatus " + (model.positionStatus ? model.positionStatus.value : "—"),
+            "OrderStatus " + (model.orderStatus ? model.orderStatus.value : "—")
+        ].join("；");
+        root.setAttribute(
+            "aria-label",
+            model.found
+                ? "当前槽位 " + model.priceText + "；" + model.summary + "；" + stateLabel
+                : model.summary
+        );
+        renderGridStatusGroup("gridSlotStatus", model.slotStatus);
+        renderGridStatusGroup("gridPositionStatus", model.positionStatus);
+        renderGridStatusGroup("gridOrderStatus", model.orderStatus);
     }
 
-    function renderGridStatusGroup(pillsId, titleId, title, items, total) {
-        const titleNode = $(titleId);
-        if (titleNode) setText(titleNode, title + " · " + safeCount(total));
-        const nodes = (items && items.length ? items : [{ value: "等待槽位", count: null, tone: "empty" }]).map((item) => {
-            const chip = element("span", "grid-chip" + (item.tone ? " is-" + item.tone : ""));
-            chip.append(element("span", "", item.value));
-            if (item.count != null) chip.append(element("b", "", String(item.count)));
-            return chip;
-        });
+    function renderGridStatusGroup(pillsId, item) {
+        const value = item || { value: "—", tone: "empty" };
+        const chip = element("span", "grid-chip" + (value.tone ? " is-" + value.tone : ""), value.value);
         const pills = $(pillsId);
-        if (pills) replaceChildren(pills, nodes);
+        if (pills) replaceChildren(pills, [chip]);
     }
 
     function buildKlineGridModel(kline, pos, includeOutside) {

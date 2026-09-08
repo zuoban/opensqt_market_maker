@@ -1165,6 +1165,44 @@ main { display: block; }
     background: var(--line);
 }
 
+.grid-current-slot {
+    display: flex;
+    min-width: 0;
+    min-height: 54px;
+    grid-column: 1 / -1;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    padding: 9px 14px 10px;
+    background:
+        linear-gradient(100deg, rgba(46, 230, 166, 0.09), transparent 54%),
+        rgba(8, 11, 13, 0.96);
+}
+
+.grid-current-slot-copy {
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+}
+
+.grid-current-slot strong {
+    overflow: hidden;
+    color: var(--ink-strong);
+    font-family: var(--font-mono);
+    font-size: 17px;
+    font-variant-numeric: tabular-nums slashed-zero;
+    font-weight: 720;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.grid-status.is-waiting .grid-current-slot strong,
+.grid-status.is-waiting .grid-current-slot-copy {
+    color: var(--muted-soft);
+}
+
 .grid-status-group {
     min-width: 0;
     padding: 10px 14px 11px;
@@ -1208,8 +1246,8 @@ main { display: block; }
     color: var(--muted);
     background: rgba(5, 8, 9, 0.46);
     font-family: var(--font-mono);
-    font-size: 10px;
-    font-weight: 650;
+    font-size: 11px;
+    font-weight: 700;
     letter-spacing: 0.03em;
 }
 
@@ -2415,7 +2453,12 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .chart-feed { min-height: 28px; padding-inline: 8px; }
     .chart-stats,
     .fill-hourly-stats { grid-template-columns: 1fr 1fr; }
-    .grid-status { grid-template-columns: 1fr; }
+    .grid-status { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-current-slot { gap: 10px; padding-inline: 12px; }
+    .grid-current-slot strong { font-size: 15px; }
+    .grid-status-group { padding-inline: 10px; }
+    .grid-status-title { font-size: 12px; }
+    .grid-chip { max-width: 100%; padding-inline: 6px; font-size: 10px; }
     .chart-stat { padding: 9px 12px 8px; }
     .chart-stat strong { white-space: normal; }
     .fill-hourly-legend { padding-inline: 12px; }

@@ -149,26 +149,33 @@
                             <strong id="klineExecution">等待行情</strong>
                         </div>
                     </div>
-                    <section class="grid-status" id="gridStatus" aria-label="当前网格状态">
+                    <section class="grid-status is-waiting" id="gridStatus" aria-label="当前槽位状态" aria-live="polite">
+                        <div class="grid-current-slot">
+                            <div>
+                                <span class="grid-status-kicker">CURRENT SLOT / 当前槽位</span>
+                                <div class="grid-current-slot-copy" id="gridCurrentSlotCopy">等待网格定位</div>
+                            </div>
+                            <strong id="gridCurrentSlotPrice">—</strong>
+                        </div>
                         <div class="grid-status-group">
                             <span class="grid-status-kicker">SlotStatus</span>
                             <div class="grid-status-title" id="gridSlotStatusLabel">槽位锁定</div>
                             <div class="grid-status-pills" id="gridSlotStatus">
-                                <span class="grid-chip is-empty">等待槽位</span>
+                                <span class="grid-chip is-empty">—</span>
                             </div>
                         </div>
                         <div class="grid-status-group">
                             <span class="grid-status-kicker">PositionStatus</span>
                             <div class="grid-status-title" id="gridPositionStatusLabel">持仓状态</div>
                             <div class="grid-status-pills" id="gridPositionStatus">
-                                <span class="grid-chip is-empty">等待槽位</span>
+                                <span class="grid-chip is-empty">—</span>
                             </div>
                         </div>
                         <div class="grid-status-group">
                             <span class="grid-status-kicker">OrderStatus</span>
                             <div class="grid-status-title" id="gridOrderStatusLabel">订单状态</div>
                             <div class="grid-status-pills" id="gridOrderStatus">
-                                <span class="grid-chip is-empty">等待槽位</span>
+                                <span class="grid-chip is-empty">—</span>
                             </div>
                         </div>
                     </section>

@@ -845,40 +845,37 @@ test("edge grid slots fold into overflow while nearest orders stay labeled", () 
     assert.ok(model.railLabels.some((item) => item.hasSell));
 });
 
-test("grid status model counts SlotStatus, PositionStatus and OrderStatus", () => {
+test("grid status model exposes only the current slot state", () => {
     const model = buildGridStatusModel([
-        { slotStatus: "LOCKED", positionStatus: "FILLED", orderStatus: "PLACED" },
-        { slotStatus: "LOCKED", positionStatus: "EMPTY", orderStatus: "CONFIRMED" },
-        { slotStatus: "FREE", positionStatus: "EMPTY", orderStatus: "NOT_PLACED" },
-        { slotStatus: "PENDING", positionStatus: "EMPTY", orderStatus: "NOT_PLACED" },
-        { slotStatus: "LOCKED", positionStatus: "EMPTY", orderStatus: "CANCEL_REQUESTED" },
-        { slotStatus: "", positionStatus: "  ", orderStatus: null }
-    ]);
+        { price: 99, slotStatus: "FREE", positionStatus: "EMPTY", orderStatus: "NOT_PLACED" },
+        {
+            price: 100,
+            priceText: "100.00",
+            slotStatus: "LOCKED",
+            positionStatus: "FILLED",
+            orderStatus: "CONFIRMED"
+        },
+        { price: 101, slotStatus: "PENDING", positionStatus: "EMPTY", orderStatus: "NOT_PLACED" }
+    ], 100, 2);
 
-    assert.equal(model.total, 6);
-    assert.deepEqual(model.slotStatus.map((item) => [item.value, item.count, item.tone]), [
-        ["FREE", 1, ""],
-        ["PENDING", 1, "warn"],
-        ["LOCKED", 3, "live"]
-    ]);
-    assert.deepEqual(model.positionStatus.map((item) => [item.value, item.count, item.tone]), [
-        ["EMPTY", 4, ""],
-        ["FILLED", 1, "pos"]
-    ]);
-    assert.deepEqual(model.orderStatus.map((item) => [item.value, item.count, item.tone]), [
-        ["NOT_PLACED", 2, ""],
-        ["PLACED", 1, "live"],
-        ["CONFIRMED", 1, "live"],
-        ["CANCEL_REQUESTED", 1, "warn"]
-    ]);
+    assert.equal(model.found, true);
+    assert.equal(model.price, 100);
+    assert.equal(model.priceText, "100.00");
+    assert.equal(model.summary, "活动订单");
+    assert.deepEqual(model.slotStatus, { value: "LOCKED", tone: "live" });
+    assert.deepEqual(model.positionStatus, { value: "FILLED", tone: "pos" });
+    assert.deepEqual(model.orderStatus, { value: "CONFIRMED", tone: "live" });
 
-    const empty = buildGridStatusModel([]);
-    assert.equal(empty.total, 0);
-    assert.deepEqual(empty.slotStatus, []);
+    const missing = buildGridStatusModel([], 102, 2);
+    assert.equal(missing.found, false);
+    assert.equal(missing.priceText, "102.00");
+    assert.equal(missing.summary, "槽位尚未建立");
+    assert.equal(missing.slotStatus, null);
 
-    const unknown = buildGridStatusModel([{ slotStatus: "OCCUPIED", positionStatus: "FILLED", orderStatus: "OPEN" }]);
-    assert.equal(unknown.slotStatus[0].value, "OCCUPIED");
-    assert.equal(unknown.orderStatus[0].value, "OPEN");
+    const waiting = buildGridStatusModel([], 0, 2);
+    assert.equal(waiting.found, false);
+    assert.equal(waiting.priceText, "");
+    assert.equal(waiting.summary, "等待网格定位");
 });
 
 test("estimated profit per trade is interval times order quantity at mark", () => {
@@ -895,7 +892,7 @@ test("estimated profit per trade is interval times order quantity at mark", () =
     assert.equal(waiting.perTrade, null);
 });
 
-test("dashboard markup exposes grid status and moved profit metrics", () => {
+test("dashboard markup exposes current slot status and moved profit metrics", () => {
     const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
     const js = fs.readFileSync(__dirname + "/static/app.js", "utf8");
     const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
@@ -903,7 +900,10 @@ test("dashboard markup exposes grid status and moved profit metrics", () => {
     assert.match(html, /PositionStatus/);
     assert.match(html, /OrderStatus/);
     assert.match(html, /id="gridStatus"/);
+    assert.match(html, /CURRENT SLOT \/ 当前槽位/);
+    assert.match(html, /id="gridCurrentSlotPrice"/);
     assert.match(cssBlock(css, ".grid-status"), /grid-template-columns:\s*repeat\(3/);
+    assert.doesNotMatch(js, /title \+ " · " \+ safeCount\(total\)/);
     const primaryBlock = js.slice(js.indexOf("const primaryItems"), js.indexOf("const strategyItems"));
     const strategyBlock = js.slice(js.indexOf("const strategyItems"), js.indexOf("updateSection(\"primary-kpis\""));
     assert.match(primaryBlock, /活动买 \/ 卖[\s\S]*预计盈利[\s\S]*预计每笔盈利/);
