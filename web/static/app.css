@@ -2054,14 +2054,16 @@ tbody tr { transition: background-color 140ms ease-out; }
 tbody tr:last-child td { border-bottom: 0; }
 td { overflow-wrap: anywhere; color: var(--ink); }
 .filled-orders-table {
-    min-width: 580px;
+	min-width: 960px;
     table-layout: fixed;
 }
 
-.filled-orders-table th:nth-child(1) { width: 24%; }
-.filled-orders-table th:nth-child(2) { width: 32%; }
-.filled-orders-table th:nth-child(3) { width: 30%; }
-.filled-orders-table th:nth-child(4) { width: 14%; }
+.filled-orders-table th:nth-child(1) { width: 17%; }
+.filled-orders-table th:nth-child(2) { width: 18%; }
+.filled-orders-table th:nth-child(3) { width: 22%; }
+.filled-orders-table th:nth-child(4) { width: 16%; }
+.filled-orders-table th:nth-child(5) { width: 18%; }
+.filled-orders-table th:nth-child(6) { width: 9%; }
 
 .fill-when { white-space: nowrap; }
 
@@ -2106,6 +2108,31 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     margin-left: 10px;
     color: var(--muted);
     font-size: 11px;
+}
+
+.fill-route { white-space: nowrap; }
+
+.fill-route-line {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+}
+
+.fill-slot-price {
+	color: var(--ink-strong);
+	font-weight: 650;
+}
+
+.fill-target-price,
+.fill-entry-price,
+.fill-route-empty {
+	color: var(--muted);
+	font-size: 11px;
+}
+
+.fill-entry-price {
+	display: block;
+	margin-top: 3px;
 }
 
 .fill-pnl { font-weight: 650; white-space: nowrap; }
@@ -2580,8 +2607,20 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .trade-side { margin-left: 6px; }
     .fill-execution { text-align: right; }
     .fill-quantity { display: block; margin: 3px 0 0; }
+	.fill-route {
+		grid-column: 1 / -1;
+		padding: 8px 10px;
+		border: 1px solid var(--line);
+		border-radius: 7px;
+		background: rgba(154, 186, 176, 0.04);
+	}
+	.fill-route-line { justify-content: space-between; }
+	.filled-orders-table .fill-grid-pnl::before,
+	.filled-orders-table .fill-exchange-pnl::before {
+		display: block;
+	}
     .filled-orders-table .fill-pnl { align-self: center; }
-    .order-action { align-self: center; text-align: right; }
+	.order-action { grid-column: 1 / -1; align-self: center; text-align: right; }
     .copy-id { min-height: 44px; min-width: 72px; }
 
     .desk-footer {

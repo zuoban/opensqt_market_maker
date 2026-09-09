@@ -168,24 +168,35 @@ func visualFilledOrders() ([]interface{}, []interface{}) {
 			"buyQty":  float64(buy) * 0.0071,
 			"sellQty": float64(sell) * 0.0068,
 			"pnl":     float64(sell) * 0.12,
+			"gridPnl": float64(sell) * 0.0408,
 		})
 		for n := 0; n < buy; n++ {
+			price := 4210.0 + float64(i)
 			orders = append(orders, map[string]interface{}{
 				"filledAt":    hour.Add(time.Duration(6+n*5) * time.Minute),
 				"side":        "BUY",
-				"price":       4210.0 + float64(i),
+				"price":       price,
 				"quantity":    0.0071,
+				"slotPrice":   price,
+				"targetPrice": price + 6,
+				"entryPrice":  price,
+				"gridPnl":     0,
 				"realizedPnl": 0,
 				"orderId":     seq,
 			})
 			seq++
 		}
 		for n := 0; n < sell; n++ {
+			price := 4230.0 + float64(i)
 			orders = append(orders, map[string]interface{}{
 				"filledAt":    hour.Add(time.Duration(18+n*4) * time.Minute),
 				"side":        "SELL",
-				"price":       4230.0 + float64(i),
+				"price":       price,
 				"quantity":    0.0068,
+				"slotPrice":   price - 6,
+				"targetPrice": price,
+				"entryPrice":  price - 6,
+				"gridPnl":     0.0408,
 				"realizedPnl": 0.12 + float64(n)*0.03,
 				"orderId":     seq,
 			})

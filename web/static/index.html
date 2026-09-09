@@ -279,8 +279,8 @@
                             <span>峰值小时</span>
                             <strong id="fillPeak">—</strong>
                         </div>
-                        <div class="chart-stat">
-                            <span>已实现盈亏</span>
+                        <div class="chart-stat" title="槽位毛收益按每个槽位的真实成本计算；交易所盈亏采用 Binance 整仓均价口径">
+                            <span>槽位毛收益 / 交易所</span>
                             <strong id="fillPnl">—</strong>
                         </div>
                         <div class="chart-stat">
@@ -316,7 +316,7 @@
                         <table class="filled-orders-table">
                             <caption class="sr-only">最近 20 笔成交订单</caption>
                             <thead>
-                                <tr><th scope="col">时间 / 方向</th><th scope="col">成交</th><th scope="col">已实现盈亏</th><th scope="col"><span class="sr-only">订单操作</span></th></tr>
+								<tr><th scope="col">时间 / 方向</th><th scope="col">成交</th><th scope="col">槽位 / 目标</th><th scope="col">槽位毛收益</th><th scope="col">交易所盈亏</th><th scope="col"><span class="sr-only">订单操作</span></th></tr>
                             </thead>
                             <tbody id="filledBody"></tbody>
                         </table>

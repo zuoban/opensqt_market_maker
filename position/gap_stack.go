@@ -283,6 +283,12 @@ func (spm *SuperPositionManager) splitGapStackedSlot(parentPrice float64, stackC
 		parent.gapStackCount = 1
 		return
 	}
+	parentUnitCost := parent.Price
+	if parent.PositionCost > 0 && !math.IsNaN(parent.PositionCost) && !math.IsInf(parent.PositionCost, 0) {
+		parentUnitCost = parent.PositionCost / parent.PositionQty
+	} else {
+		parent.PositionCost = parent.PositionQty * parentUnitCost
+	}
 	interval := 0.0
 	if spm.config != nil {
 		interval = spm.config.Trading.PriceInterval
@@ -308,11 +314,16 @@ func (spm *SuperPositionManager) splitGapStackedSlot(parentPrice float64, stackC
 			child.OrderStatus != OrderStatusCancelRequested
 		if accept {
 			child.PositionQty = share
+			child.PositionCost = share * parentUnitCost
 			child.PositionStatus = PositionStatusFilled
 			child.SlotStatus = SlotStatusFree
 			child.stackedParentPrice = 0
 			child.gapStackCount = 1
 			parent.PositionQty = roundPrice(parent.PositionQty-share, spm.quantityDecimals)
+			parent.PositionCost -= child.PositionCost
+			if parent.PositionCost < fillQtyTolerance {
+				parent.PositionCost = 0
+			}
 			if parent.PositionQty < fillQtyTolerance {
 				parent.PositionQty = 0
 			}
@@ -331,6 +342,7 @@ func (spm *SuperPositionManager) splitGapStackedSlot(parentPrice float64, stackC
 	if parent.PositionQty <= fillQtyTolerance {
 		parent.PositionStatus = PositionStatusEmpty
 		parent.PositionQty = 0
+		parent.PositionCost = 0
 	}
 	parent.gapStackCount = 1
 	for _, childPrice := range children {

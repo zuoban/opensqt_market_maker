@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const {
     buildKlineGridModel,
     buildHourlyFillModel,
+	buildFilledOrderModel,
     buildMarginUsageModel,
     buildSnapshotHealthModel,
     buildSnapshotAcceptanceModel,
@@ -123,6 +124,35 @@ test("fill timestamps are formatted relative to now", () => {
     assert.equal(formatRelativeTime(new Date(now.getTime() - 3 * 3_600_000), now), "3 小时前");
     assert.equal(formatRelativeTime(new Date(now.getTime() + 2 * 86_400_000), now), "2 天后");
     assert.equal(formatRelativeTime("not-a-date", now), "—");
+});
+
+test("filled order model separates slot route from exchange execution and PNL", () => {
+	const sell = buildFilledOrderModel({
+		side: "SELL",
+		price: 102.55,
+		quantity: 1.95,
+		slotPrice: 102.45,
+		targetPrice: 102.55,
+		entryPrice: 103.5683,
+		gridPnl: -1.985685,
+		realizedPnl: -1.985683
+	});
+	assert.deepEqual(sell, {
+		side: "SELL",
+		price: 102.55,
+		quantity: 1.95,
+		slotPrice: 102.45,
+		targetPrice: 102.55,
+		entryPrice: 103.5683,
+		gridPnl: -1.985685,
+		exchangePnl: -1.985683
+	});
+
+	const legacy = buildFilledOrderModel({ side: "BUY", price: 102.55, quantity: 1.95 });
+	assert.equal(legacy.slotPrice, null);
+	assert.equal(legacy.targetPrice, null);
+	assert.equal(legacy.gridPnl, null);
+	assert.equal(legacy.exchangePnl, null);
 });
 
 test("snapshot health detects an open but silent websocket at the dynamic threshold", () => {
@@ -933,7 +963,7 @@ test("hourly fill model groups buy and sell counts and stats", () => {
     const model = buildHourlyFillModel([
         { side: "BUY", filledAt: new Date(2026, 7, 19, 13, 10, 0), quantity: 0.01, realizedPnl: 0 },
         { side: "BUY", filledAt: new Date(2026, 7, 19, 13, 40, 0), quantity: 0.02, realizedPnl: 0 },
-        { side: "SELL", filledAt: new Date(2026, 7, 19, 14, 5, 0), quantity: 0.01, realizedPnl: 0.12 },
+		{ side: "SELL", filledAt: new Date(2026, 7, 19, 14, 5, 0), quantity: 0.01, realizedPnl: 0.12, gridPnl: 0.08 },
         { side: "SKIP", filledAt: new Date(2026, 7, 19, 14, 20, 0), quantity: 1, realizedPnl: 9 },
         { side: "BUY", filledAt: "not-a-date", quantity: 1, realizedPnl: 0 }
     ], now);
@@ -954,6 +984,7 @@ test("hourly fill model groups buy and sell counts and stats", () => {
     assert.equal(model.stats.peakHour, "13:00");
     assert.ok(Math.abs(model.stats.buyQty - 0.03) < 1e-12);
     assert.ok(Math.abs(model.stats.realizedPnl - 0.12) < 1e-12);
+	assert.ok(Math.abs(model.stats.gridPnl - 0.08) < 1e-12);
     assert.equal(model.maxCount, 2);
     assert.equal(thirteen.label, "13:00");
 });
@@ -991,8 +1022,8 @@ test("hourly fill model prefers snapshot 24h buckets over recent order list", ()
         { side: "BUY", filledAt: new Date(2026, 7, 20, 10, 5, 0), quantity: 0.01 }
     ], now, {
         buckets: [
-            { hour: new Date(2026, 7, 19, 12, 0, 0), buy: 4, sell: 1, buyQty: 0.04, sellQty: 0.01, pnl: 0.2 },
-            { hour: new Date(2026, 7, 20, 9, 0, 0), buy: 0, sell: 3, buyQty: 0, sellQty: 0.03, pnl: 0.5 }
+			{ hour: new Date(2026, 7, 19, 12, 0, 0), buy: 4, sell: 1, buyQty: 0.04, sellQty: 0.01, pnl: 0.2, gridPnl: 0.1 },
+			{ hour: new Date(2026, 7, 20, 9, 0, 0), buy: 0, sell: 3, buyQty: 0, sellQty: 0.03, pnl: 0.5, gridPnl: 0.3 }
         ]
     });
 
@@ -1003,4 +1034,5 @@ test("hourly fill model prefers snapshot 24h buckets over recent order list", ()
     assert.equal(hourBucket(model, new Date(2026, 7, 19, 12, 0, 0)).buy, 4);
     assert.equal(hourBucket(model, new Date(2026, 7, 20, 9, 0, 0)).sell, 3);
     assert.equal(hourBucket(model, new Date(2026, 7, 20, 10, 0, 0)).buy, 0);
+	assert.ok(Math.abs(model.stats.gridPnl - 0.4) < 1e-12);
 });

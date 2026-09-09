@@ -8,6 +8,7 @@
         module.exports = {
             buildKlineGridModel,
             buildHourlyFillModel,
+			buildFilledOrderModel,
             buildMarginUsageModel,
             buildSnapshotHealthModel,
             buildSnapshotAcceptanceModel,
@@ -2135,6 +2136,27 @@
         return Number.isNaN(date.getTime()) ? null : date;
     }
 
+	function optionalFiniteNumber(value) {
+		if (value === undefined || value === null || value === "") return null;
+		const number = Number(value);
+		return Number.isFinite(number) ? number : null;
+	}
+
+	function buildFilledOrderModel(order) {
+		const source = order || {};
+		const side = source.side === "BUY" ? "BUY" : (source.side === "SELL" ? "SELL" : "");
+		return {
+			side,
+			price: optionalFiniteNumber(source.price),
+			quantity: optionalFiniteNumber(source.quantity),
+			slotPrice: optionalFiniteNumber(source.slotPrice),
+			targetPrice: optionalFiniteNumber(source.targetPrice),
+			entryPrice: optionalFiniteNumber(source.entryPrice),
+			gridPnl: optionalFiniteNumber(source.gridPnl),
+			exchangePnl: optionalFiniteNumber(source.realizedPnl)
+		};
+	}
+
     function startOfHour(date) {
         return new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours(), 0, 0, 0);
     }
@@ -2152,7 +2174,8 @@
                 filledAt,
                 side,
                 quantity: Number(order.quantity) || 0,
-                realizedPnl: Number(order.realizedPnl) || 0
+				realizedPnl: Number(order.realizedPnl) || 0,
+				gridPnl: Number(order.gridPnl) || 0
             });
         });
 
@@ -2164,6 +2187,7 @@
             buyQty: 0,
             sellQty: 0,
             realizedPnl: 0,
+			gridPnl: 0,
             peakHour: "",
             peakCount: 0,
             hours: 0,
@@ -2187,7 +2211,8 @@
                 sell: 0,
                 buyQty: 0,
                 sellQty: 0,
-                pnl: 0
+				pnl: 0,
+				gridPnl: 0
             };
             index.set(bucket.key, bucket);
             buckets.push(bucket);
@@ -2203,6 +2228,7 @@
                 bucket.buyQty += Number(item.buyQty) || 0;
                 bucket.sellQty += Number(item.sellQty) || 0;
                 bucket.pnl += Number(item.pnl) || 0;
+				bucket.gridPnl += Number(item.gridPnl) || 0;
             });
         } else {
             parsed.forEach((item) => {
@@ -2215,6 +2241,7 @@
                     bucket.sell += 1;
                     bucket.sellQty += item.quantity;
                     bucket.pnl += item.realizedPnl;
+					bucket.gridPnl += item.gridPnl;
                 }
             });
         }
@@ -2231,6 +2258,7 @@
             stats.buyQty += bucket.buyQty;
             stats.sellQty += bucket.sellQty;
             stats.realizedPnl += bucket.pnl;
+			stats.gridPnl += bucket.gridPnl;
             if (count > 0) stats.activeHours += 1;
             if (bucket.buy > maxCount) maxCount = bucket.buy;
             if (bucket.sell > maxCount) maxCount = bucket.sell;
@@ -2265,22 +2293,33 @@
         renderHourlyFills(filledOrders, pos, quote);
         const filledRows = recentOrders.map((order) => {
             const row = document.createElement("tr");
-            const side = order.side === "BUY" ? "BUY" : (order.side === "SELL" ? "SELL" : "—");
-            const pnl = Number(order.realizedPnl || 0);
+			const model = buildFilledOrderModel(order);
+			const side = model.side || "—";
             row.appendChild(filledTimeCell(order.filledAt, side));
             row.appendChild(filledExecutionCell(order, pos));
+			row.appendChild(filledRouteCell(model, pos));
             appendCell(
                 row,
-                "已实现盈亏",
-                side === "SELL" ? fmtSigned(pnl, 6) + " " + quote : "—",
-                "fill-pnl" + (side === "SELL" ? (pnl >= 0 ? " pos" : " neg") : "")
+				"槽位毛收益",
+				side === "SELL" && model.gridPnl !== null ? fmtSigned(model.gridPnl, 6) + " " + quote : "—",
+				"fill-pnl fill-grid-pnl" + (
+					side === "SELL" && model.gridPnl !== null ? (model.gridPnl >= 0 ? " pos" : " neg") : ""
+				)
+			);
+			appendCell(
+				row,
+				"交易所盈亏",
+				side === "SELL" && model.exchangePnl !== null ? fmtSigned(model.exchangePnl, 6) + " " + quote : "—",
+				"fill-pnl fill-exchange-pnl" + (
+					side === "SELL" && model.exchangePnl !== null ? (model.exchangePnl >= 0 ? " pos" : " neg") : ""
+				)
             );
             row.appendChild(orderIDCell(String(order.orderId || order.clientOrderId || "—")));
             return row;
         });
         replaceChildren(
             $("filledBody"),
-            filledRows.length ? filledRows : [emptyRow("程序启动后暂无成交订单", 4)]
+			filledRows.length ? filledRows : [emptyRow("程序启动后暂无成交订单", 6)]
         );
     }
 
@@ -2299,10 +2338,15 @@
         setText($("fillPeak"), stats.peakCount
             ? stats.peakHour + " · " + stats.peakCount + " 笔"
             : "—");
-        setText(pnlNode, stats.windowTotal ? fmtSigned(stats.realizedPnl, 6) + " " + quote : "—");
+		setText(
+			pnlNode,
+			stats.windowTotal
+				? fmtSigned(stats.gridPnl, 6) + " / " + fmtSigned(stats.realizedPnl, 6) + " " + quote
+				: "—"
+		);
         pnlNode.classList.remove("pos", "neg");
-        if (stats.windowTotal && stats.realizedPnl > 0) pnlNode.classList.add("pos");
-        if (stats.windowTotal && stats.realizedPnl < 0) pnlNode.classList.add("neg");
+		if (stats.windowTotal && stats.gridPnl > 0) pnlNode.classList.add("pos");
+		if (stats.windowTotal && stats.gridPnl < 0) pnlNode.classList.add("neg");
         setText($("fillAvg"), stats.hours
             ? fmt(stats.avgPerHour, 1) + " 笔/时"
             : "—");
@@ -2362,7 +2406,8 @@
         return bucket.label +
             "  买 " + bucket.buy + " 笔 / 卖 " + bucket.sell + " 笔" +
             "  · 量 " + fmt(bucket.buyQty, qtyDecimals) + " / " + fmt(bucket.sellQty, qtyDecimals) +
-            "  · 盈亏 " + fmtSigned(bucket.pnl, 6) + " " + quote;
+			"  · 槽位毛收益 " + fmtSigned(bucket.gridPnl, 6) +
+			" / 交易所 " + fmtSigned(bucket.pnl, 6) + " " + quote;
     }
 
     function centeredScrollLeft(viewportWidth, itemLeft, itemWidth, contentWidth) {
@@ -2475,6 +2520,25 @@
         );
         return cell;
     }
+
+	function filledRouteCell(model, pos) {
+		const cell = element("td", "fill-route");
+		cell.dataset.label = "槽位 / 目标";
+		if (!model || model.slotPrice === null) {
+			cell.appendChild(element("span", "fill-route-empty", "—"));
+			return cell;
+		}
+		const route = element("div", "fill-route-line");
+		route.appendChild(element("strong", "fill-slot-price", fmt(model.slotPrice, pos.priceDecimals)));
+		if (model.targetPrice !== null) {
+			route.appendChild(element("span", "fill-target-price", "→ " + fmt(model.targetPrice, pos.priceDecimals)));
+		}
+		cell.appendChild(route);
+		if (model.side === "SELL" && model.entryPrice !== null && model.entryPrice > 0) {
+			cell.appendChild(element("span", "fill-entry-price", "成本 " + fmt(model.entryPrice, pos.priceDecimals)));
+		}
+		return cell;
+	}
 
     function orderIDCell(id) {
         const cell = element("td", "order-action");

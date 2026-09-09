@@ -137,6 +137,11 @@ func TestGapStackFillSplitsAndPlacesSellsAtSkippedGrids(t *testing.T) {
 	if parent.PositionQty != unit {
 		t.Fatalf("parent remaining qty=%v, want %v", parent.PositionQty, unit)
 	}
+	wantCost := unit * buy.Price
+	if mathAbs(child.PositionCost-wantCost) > 1e-12 || mathAbs(parent.PositionCost-wantCost) > 1e-12 {
+		t.Fatalf("split costs = child:%v parent:%v, want %v each",
+			child.PositionCost, parent.PositionCost, wantCost)
+	}
 	if child.stackedParentPrice != 0 {
 		t.Fatalf("child still reserved by parent %v", child.stackedParentPrice)
 	}

@@ -55,6 +55,9 @@ var ErrAcceptedOrderPreconditionInvalid = errors.New("交易所已接受订单�
 
 type terminalOrderProgress struct {
 	ExecutedQty float64
+	// ExecutedQuote 是该订单已成交部分的累计报价金额，用于终态迟到修正时
+	// 继续按真实成交均价维护槽位成本，而不是退回逻辑槽位价估算。
+	ExecutedQuote float64
 	// ReportedPNL 是交易所最后一次被接受的订单累计盈亏。
 	ReportedPNL float64
 	// AccountedPNL 是本地已经实际计入总盈亏的金额，可能来自成交价差回退。
@@ -72,8 +75,13 @@ type FilledOrderRecord struct {
 	Side          string    `json:"side"`
 	Price         float64   `json:"price"`
 	Quantity      float64   `json:"quantity"`
+	SlotPrice     float64   `json:"slotPrice"`
+	TargetPrice   float64   `json:"targetPrice"`
+	EntryPrice    float64   `json:"entryPrice"`
+	GridPNL       float64   `json:"gridPnl"`
 	FilledAt      time.Time `json:"filledAt"`
-	RealizedPNL   float64   `json:"realizedPnl"`
+	// RealizedPNL 保留 Binance rp 的整仓均价口径，供账户会计与旧客户端兼容。
+	RealizedPNL float64 `json:"realizedPnl"`
 }
 
 // HourlyFillBucket 本地时区下一小时的成交汇总，供订单汇总图使用。
@@ -84,6 +92,7 @@ type HourlyFillBucket struct {
 	BuyQty  float64   `json:"buyQty"`
 	SellQty float64   `json:"sellQty"`
 	Pnl     float64   `json:"pnl"`
+	GridPnl float64   `json:"gridPnl"`
 }
 
 type hourlyFillAcc struct {
@@ -92,6 +101,7 @@ type hourlyFillAcc struct {
 	buyQty  float64
 	sellQty float64
 	pnl     float64
+	gridPnl float64
 }
 
 // OrderExecutorInterface 订单执行器接口（避免循环导入）
@@ -207,6 +217,9 @@ type InventorySlot struct {
 	// 持仓信息
 	PositionStatus string  // 持仓状态：空仓/有仓
 	PositionQty    float64 // 持仓数量（支持小数点后3位）
+	// PositionCost 是槽位当前库存的真实报价货币成本。正常成交使用成交均价，
+	// 程序重启恢复持仓时使用 Binance 返回的整仓开仓均价。
+	PositionCost float64
 
 	// 订单信息 (买卖互斥)
 	OrderID        int64     // 订单ID
@@ -241,6 +254,11 @@ type InventorySlot struct {
 	orderReportedPNL float64
 	// 当前订单从部分成交到完全成交累计的已实现盈亏（用于成交历史）。
 	orderAccumulatedPNL float64
+	// 当前订单累计成交金额、SELL 已释放的槽位成本和槽位毛收益。
+	// 三者都按累计成交均价换算，确保多次部分成交时不会重复计算。
+	orderFilledQuote        float64
+	orderReleasedCost       float64
+	orderAccumulatedGridPNL float64
 
 	// gapStackCount>1 表示本槽买单合并了上方被跳过的空格。
 	// 成交后按格拆到 stackedParentPrice 指向本槽的子槽，分别挂卖。
@@ -252,8 +270,9 @@ type InventorySlot struct {
 
 // PositionInfo 持仓信息（简化版，避免循环导入）
 type PositionInfo struct {
-	Symbol string
-	Size   float64
+	Symbol     string
+	Size       float64
+	EntryPrice float64
 }
 
 // IExchange 交易所接口（避免循环导入）
@@ -597,6 +616,9 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 	slot.OrderCreatedAt = time.Now()
 	slot.orderReportedPNL = 0
 	slot.orderAccumulatedPNL = 0
+	slot.orderFilledQuote = 0
+	slot.orderReleasedCost = 0
+	slot.orderAccumulatedGridPNL = 0
 	slot.gapStackCount = 1
 	if req.GapStack > 1 {
 		slot.gapStackCount = req.GapStack
@@ -771,6 +793,9 @@ func (spm *SuperPositionManager) clearReservationLocked(slot *InventorySlot) {
 	slot.OrderCreatedAt = time.Time{}
 	slot.orderReportedPNL = 0
 	slot.orderAccumulatedPNL = 0
+	slot.orderFilledQuote = 0
+	slot.orderReleasedCost = 0
+	slot.orderAccumulatedGridPNL = 0
 	slot.placementRetryNotBefore = time.Time{}
 	slot.pendingLookupMisses = 0
 	slot.pendingLastLookup = time.Time{}
@@ -893,10 +918,11 @@ func (spm *SuperPositionManager) postOnlyRetryDelay(consecutive int) time.Durati
 func (spm *SuperPositionManager) placeInitialBuyOrders() error {
 	// 🔥 修改：只恢复持仓槽位，不再主动下单
 	// 所有下单操作由 AdjustOrders 统一处理，避免时序问题
-	existingPosition := spm.getExistingPosition()
+	existingPosition, existingEntryPrice := spm.getExistingPosition()
 	if existingPosition > 0 {
-		logger.Info("🔄 [持仓恢复] 检测到现有持仓: %.4f，开始初始化卖单槽位", existingPosition)
-		spm.initializeSellSlotsFromPosition(existingPosition)
+		logger.Info("🔄 [持仓恢复] 检测到现有持仓: %.4f，开仓均价: %s，开始初始化卖单槽位",
+			existingPosition, formatPrice(existingEntryPrice, spm.priceDecimals))
+		spm.initializeSellSlotsFromPosition(existingPosition, existingEntryPrice)
 	}
 
 	logger.Info("✅ [初始化] 槽位已创建，订单下达将由 AdjustOrders 统一处理")
@@ -2038,12 +2064,21 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		if update.Status == OrderStatusFilled {
 			adjustmentNeeded = true
 			realizedPNL := 0.0
+			gridPNL := 0.0
+			entryPrice := 0.0
 			if side == "SELL" {
 				realizedPNL = slot.orderAccumulatedPNL
+				gridPNL = slot.orderAccumulatedGridPNL
+				if update.ExecutedQty > fillQtyTolerance {
+					entryPrice = slot.orderReleasedCost / update.ExecutedQty
+				}
 			}
-			spm.recordFilledOrder(update, side, orderPrice, price, realizedPNL)
+			spm.recordFilledOrder(update, side, orderPrice, price, entryPrice, gridPNL, realizedPNL)
 			slot.orderReportedPNL = 0
 			slot.orderAccumulatedPNL = 0
+			slot.orderFilledQuote = 0
+			slot.orderReleasedCost = 0
+			slot.orderAccumulatedGridPNL = 0
 		}
 
 	case "CANCELED", "EXPIRED", "REJECTED":
@@ -2110,6 +2145,7 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		spm.rememberTerminalOrderProgress(
 			update,
 			slot.OrderFilledQty,
+			slot.orderFilledQuote,
 			slot.orderReportedPNL,
 			slot.orderAccumulatedPNL,
 		)
@@ -2122,6 +2158,9 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		slot.OrderFilledQty = 0
 		slot.orderReportedPNL = 0
 		slot.orderAccumulatedPNL = 0
+		slot.orderFilledQuote = 0
+		slot.orderReleasedCost = 0
+		slot.orderAccumulatedGridPNL = 0
 		// 保留 OrderSide 用于日志调试
 	}
 }
@@ -2149,17 +2188,34 @@ func (spm *SuperPositionManager) applyOrderExecutionDelta(slot *InventorySlot, u
 		return 0, true
 	}
 
-	deltaQty := update.ExecutedQty - slot.OrderFilledQty
+	previousFilledQty := slot.OrderFilledQty
+	deltaQty := update.ExecutedQty - previousFilledQty
 	if deltaQty < fillQtyTolerance {
 		deltaQty = 0
 	}
-	if update.ExecutedQty > slot.OrderFilledQty {
+
+	deltaQuote := 0.0
+	if deltaQty > 0 {
+		cumulativeQuote, ok := cumulativeExecutionQuote(update, slot.OrderPrice, slotPrice)
+		if !ok || cumulativeQuote+fillQtyTolerance < slot.orderFilledQuote {
+			logger.Warn("⚠️ [忽略非法累计成交额] 槽位 %s: 已成交额 %.12f, 推送 %.12f, 状态 %s",
+				formatPrice(slotPrice, spm.priceDecimals), slot.orderFilledQuote, cumulativeQuote, update.Status)
+			return 0, true
+		}
+		deltaQuote = cumulativeQuote - slot.orderFilledQuote
+		if deltaQuote <= 0 || math.IsNaN(deltaQuote) || math.IsInf(deltaQuote, 0) {
+			logger.Warn("⚠️ [忽略非法成交额增量] 槽位 %s: 数量增量 %.12f, 金额增量 %.12f",
+				formatPrice(slotPrice, spm.priceDecimals), deltaQty, deltaQuote)
+			return 0, true
+		}
 		slot.OrderFilledQty = update.ExecutedQty
+		slot.orderFilledQuote = cumulativeQuote
 	}
 
 	if side == "BUY" {
 		if deltaQty > 0 {
 			slot.PositionQty += deltaQty
+			slot.PositionCost += deltaQuote
 			oldTotal := spm.totalBuyQty.Load().(float64)
 			spm.totalBuyQty.Store(oldTotal + deltaQty)
 		}
@@ -2167,15 +2223,67 @@ func (spm *SuperPositionManager) applyOrderExecutionDelta(slot *InventorySlot, u
 	}
 
 	if deltaQty > 0 {
+		releasedCost := releasePositionCostLocked(slot, deltaQty)
+		slot.orderReleasedCost += releasedCost
+		slot.orderAccumulatedGridPNL += deltaQuote - releasedCost
 		slot.PositionQty -= deltaQty
 		if slot.PositionQty < 0 {
 			slot.PositionQty = 0
+		}
+		if slot.PositionQty <= fillQtyTolerance {
+			slot.PositionCost = 0
 		}
 		oldTotal := spm.totalSellQty.Load().(float64)
 		spm.totalSellQty.Store(oldTotal + deltaQty)
 	}
 	spm.applySellRealizedPNL(slot, update, deltaQty)
 	return deltaQty, false
+}
+
+// cumulativeExecutionQuote 把交易所的累计成交数量与累计成交均价转换成
+// 累计成交金额。orderPrice 和 slotPrice 只用于兼容缺少均价的本地测试/回读。
+func cumulativeExecutionQuote(update OrderUpdate, orderPrice, slotPrice float64) (float64, bool) {
+	if update.ExecutedQty <= 0 {
+		return 0, true
+	}
+	price := update.AvgPrice
+	if price <= 0 {
+		price = update.Price
+	}
+	if price <= 0 {
+		price = orderPrice
+	}
+	if price <= 0 {
+		price = slotPrice
+	}
+	quote := update.ExecutedQty * price
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) ||
+		quote <= 0 || math.IsNaN(quote) || math.IsInf(quote, 0) {
+		return 0, false
+	}
+	return quote, true
+}
+
+// releasePositionCostLocked 按槽位当前平均成本释放卖出数量对应的成本。
+// 历史/测试槽位若没有成本字段，则以逻辑槽位价初始化，保证升级兼容。
+func releasePositionCostLocked(slot *InventorySlot, quantity float64) float64 {
+	if slot == nil || quantity <= 0 || slot.PositionQty <= 0 {
+		return 0
+	}
+	positionQty := slot.PositionQty
+	positionCost := slot.PositionCost
+	if positionCost <= 0 || math.IsNaN(positionCost) || math.IsInf(positionCost, 0) {
+		positionCost = positionQty * slot.Price
+	}
+	unitCost := positionCost / positionQty
+	releasedQty := math.Min(quantity, positionQty)
+	releasedCost := releasedQty * unitCost
+	remainingCost := positionCost - releasedCost
+	if remainingCost < fillQtyTolerance {
+		remainingCost = 0
+	}
+	slot.PositionCost = remainingCost
+	return releasedCost
 }
 
 func (spm *SuperPositionManager) getTerminalOrderProgress(update OrderUpdate) (terminalOrderProgress, bool) {
@@ -2189,12 +2297,16 @@ func (spm *SuperPositionManager) getTerminalOrderProgress(update OrderUpdate) (t
 	return progress, exists
 }
 
-func (spm *SuperPositionManager) rememberTerminalOrderProgress(update OrderUpdate, executedQty, reportedPNL, accountedPNL float64) {
+func (spm *SuperPositionManager) rememberTerminalOrderProgress(
+	update OrderUpdate,
+	executedQty, executedQuote, reportedPNL, accountedPNL float64,
+) {
 	spm.storeTerminalOrderProgress(update, terminalOrderProgress{
-		ExecutedQty:  executedQty,
-		ReportedPNL:  reportedPNL,
-		AccountedPNL: accountedPNL,
-		UpdateTime:   update.UpdateTime,
+		ExecutedQty:   executedQty,
+		ExecutedQuote: executedQuote,
+		ReportedPNL:   reportedPNL,
+		AccountedPNL:  accountedPNL,
+		UpdateTime:    update.UpdateTime,
 	})
 }
 
@@ -2241,6 +2353,23 @@ func (spm *SuperPositionManager) applyTerminalOrderCorrection(
 	if deltaQty < fillQtyTolerance {
 		deltaQty = 0
 	}
+	deltaQuote := 0.0
+	nextExecutedQuote := progress.ExecutedQuote
+	if deltaQty > 0 {
+		cumulativeQuote, ok := cumulativeExecutionQuote(update, 0, slotPrice)
+		if !ok || cumulativeQuote+fillQtyTolerance < progress.ExecutedQuote {
+			logger.Warn("⚠️ [忽略非法终态成交额] 槽位 %s: 已成交额 %.12f, 推送 %.12f",
+				formatPrice(slotPrice, spm.priceDecimals), progress.ExecutedQuote, cumulativeQuote)
+			return false
+		}
+		deltaQuote = cumulativeQuote - progress.ExecutedQuote
+		if deltaQuote <= 0 || math.IsNaN(deltaQuote) || math.IsInf(deltaQuote, 0) {
+			logger.Warn("⚠️ [忽略非法终态成交额增量] 槽位 %s: 数量增量 %.12f, 金额增量 %.12f",
+				formatPrice(slotPrice, spm.priceDecimals), deltaQty, deltaQuote)
+			return false
+		}
+		nextExecutedQuote = cumulativeQuote
+	}
 
 	// 数量不变时，只接受有严格事件版本的累计 PNL 修正。UpdateTime 缺失或
 	// 乱序时无法证明新旧关系，因此宁可忽略，也不能让累计盈亏来回回退。
@@ -2257,15 +2386,20 @@ func (spm *SuperPositionManager) applyTerminalOrderCorrection(
 	if side == "BUY" {
 		if deltaQty > 0 {
 			slot.PositionQty += deltaQty
+			slot.PositionCost += deltaQuote
 			oldTotal := spm.totalBuyQty.Load().(float64)
 			spm.totalBuyQty.Store(oldTotal + deltaQty)
 			slot.PositionStatus = PositionStatusFilled
 		}
 	} else {
 		if deltaQty > 0 {
+			releasePositionCostLocked(slot, deltaQty)
 			slot.PositionQty -= deltaQty
 			if slot.PositionQty < 0 {
 				slot.PositionQty = 0
+			}
+			if slot.PositionQty <= fillQtyTolerance {
+				slot.PositionCost = 0
 			}
 			oldTotal := spm.totalSellQty.Load().(float64)
 			spm.totalSellQty.Store(oldTotal + deltaQty)
@@ -2314,6 +2448,7 @@ func (spm *SuperPositionManager) applyTerminalOrderCorrection(
 
 	if update.ExecutedQty > progress.ExecutedQty {
 		progress.ExecutedQty = update.ExecutedQty
+		progress.ExecutedQuote = nextExecutedQuote
 	}
 	if update.UpdateTime > progress.UpdateTime {
 		progress.UpdateTime = update.UpdateTime
@@ -2343,7 +2478,11 @@ func (spm *SuperPositionManager) wasFilledOrderRecorded(update OrderUpdate) bool
 	return exists
 }
 
-func (spm *SuperPositionManager) recordFilledOrder(update OrderUpdate, side string, orderPrice, slotPrice, realizedPNL float64) {
+func (spm *SuperPositionManager) recordFilledOrder(
+	update OrderUpdate,
+	side string,
+	orderPrice, slotPrice, entryPrice, gridPNL, realizedPNL float64,
+) {
 	key := filledOrderKey(update)
 	if key == "" {
 		return
@@ -2358,6 +2497,13 @@ func (spm *SuperPositionManager) recordFilledOrder(update OrderUpdate, side stri
 	}
 	if price <= 0 {
 		price = slotPrice
+	}
+	if side == "BUY" && entryPrice <= 0 {
+		entryPrice = price
+	}
+	targetPrice := 0.0
+	if slotPrice > 0 && spm.config != nil && spm.config.Trading.PriceInterval > 0 {
+		targetPrice = roundPrice(slotPrice+spm.config.Trading.PriceInterval, spm.priceDecimals)
 	}
 
 	symbol := update.Symbol
@@ -2376,6 +2522,10 @@ func (spm *SuperPositionManager) recordFilledOrder(update OrderUpdate, side stri
 		Side:          side,
 		Price:         price,
 		Quantity:      update.ExecutedQty,
+		SlotPrice:     slotPrice,
+		TargetPrice:   targetPrice,
+		EntryPrice:    entryPrice,
+		GridPNL:       gridPNL,
 		FilledAt:      filledAt,
 		RealizedPNL:   realizedPNL,
 	}
@@ -2420,6 +2570,7 @@ func (spm *SuperPositionManager) addHourlyFillLocked(record FilledOrderRecord, n
 		acc.sell++
 		acc.sellQty += record.Quantity
 		acc.pnl += record.RealizedPNL
+		acc.gridPnl += record.GridPNL
 	} else {
 		acc.buy++
 		acc.buyQty += record.Quantity
@@ -2448,6 +2599,7 @@ func (spm *SuperPositionManager) hourlyFillSnapshotLocked(now time.Time) []Hourl
 			bucket.BuyQty = acc.buyQty
 			bucket.SellQty = acc.sellQty
 			bucket.Pnl = acc.pnl
+			bucket.GridPnl = acc.gridPnl
 		}
 		buckets = append(buckets, bucket)
 	}
@@ -2757,35 +2909,35 @@ func (spm *SuperPositionManager) CancelAllOrders() {
 	}
 }
 
-// getExistingPosition 获取当前持仓数量（容错处理）
-func (spm *SuperPositionManager) getExistingPosition() float64 {
+// getExistingPosition 获取当前持仓数量与交易所整仓开仓均价（容错处理）。
+func (spm *SuperPositionManager) getExistingPosition() (float64, float64) {
 	ctx := context.Background()
 	positionsInterface, err := spm.exchange.GetPositions(ctx, spm.config.Trading.Symbol)
 	if err != nil || positionsInterface == nil {
 		logger.Debug("🔍 [持仓恢复] 无法获取持仓信息: %v", err)
-		return 0
+		return 0, 0
 	}
 
 	switch positions := positionsInterface.(type) {
 	case []*exchange.Position:
 		for _, pos := range positions {
 			if pos != nil && pos.Symbol == spm.config.Trading.Symbol {
-				logger.Debug("🔍 [持仓恢复] 找到持仓: %.4f", pos.Size)
-				return pos.Size
+				logger.Debug("🔍 [持仓恢复] 找到持仓: %.4f，开仓均价: %.8f", pos.Size, pos.EntryPrice)
+				return pos.Size, pos.EntryPrice
 			}
 		}
 	case []exchange.Position:
 		for _, pos := range positions {
 			if pos.Symbol == spm.config.Trading.Symbol {
-				logger.Debug("🔍 [持仓恢复] 找到持仓: %.4f", pos.Size)
-				return pos.Size
+				logger.Debug("🔍 [持仓恢复] 找到持仓: %.4f，开仓均价: %.8f", pos.Size, pos.EntryPrice)
+				return pos.Size, pos.EntryPrice
 			}
 		}
 	case []*PositionInfo:
 		for _, pos := range positions {
 			if pos != nil && pos.Symbol == spm.config.Trading.Symbol {
 				logger.Debug("🔍 [持仓恢复] 找到持仓 (PositionInfo): %.4f", pos.Size)
-				return pos.Size
+				return pos.Size, pos.EntryPrice
 			}
 		}
 	case []interface{}:
@@ -2795,15 +2947,16 @@ func (spm *SuperPositionManager) getExistingPosition() float64 {
 			if posInfo, ok := pos.(*PositionInfo); ok {
 				if posInfo.Symbol == spm.config.Trading.Symbol {
 					logger.Debug("🔍 [持仓恢复] 找到持仓 (interface->PositionInfo): %.4f", posInfo.Size)
-					return posInfo.Size
+					return posInfo.Size, posInfo.EntryPrice
 				}
 			}
 			// 尝试解析为 map
 			if posMap, ok := pos.(map[string]interface{}); ok {
 				if symbol, ok := posMap["Symbol"].(string); ok && symbol == spm.config.Trading.Symbol {
 					if size, ok := posMap["Size"].(float64); ok {
+						entryPrice, _ := posMap["EntryPrice"].(float64)
 						logger.Debug("🔍 [持仓恢复] 找到持仓 (map): %.4f", size)
-						return size
+						return size, entryPrice
 					}
 				}
 			}
@@ -2813,17 +2966,22 @@ func (spm *SuperPositionManager) getExistingPosition() float64 {
 		logger.Debug("🔍 [持仓恢复] 持仓类型: %T，尝试使用反射提取", positionsInterface)
 		// 尝试使用反射处理未知类型
 		// 注意：实际上 exchange 返回的是 []*exchange.Position，但因为接口返回 interface{}，所以需要特殊处理
-		return 0
+		return 0, 0
 	}
 
 	logger.Debug("🔍 [持仓恢复] 未找到匹配的持仓")
-	return 0
+	return 0, 0
 }
 
 // initializeSellSlotsFromPosition 从现有持仓初始化卖单槽位（用于程序重启后恢复状态）
-func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition float64) {
+func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, entryPrice float64) {
 	if totalPosition <= 0 {
 		return
+	}
+	if entryPrice <= 0 || math.IsNaN(entryPrice) || math.IsInf(entryPrice, 0) {
+		entryPrice = spm.anchorPrice
+		logger.Warn("⚠️ [持仓恢复] 交易所未返回有效开仓均价，槽位成本暂按锚点 %s 记录",
+			formatPrice(entryPrice, spm.priceDecimals))
 	}
 
 	// 1. 计算每单的理论数量（基于当前价格）
@@ -2899,6 +3057,7 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition f
 		// 设置为有仓状态
 		slot.PositionStatus = PositionStatusFilled
 		slot.PositionQty = slotQty
+		slot.PositionCost = slotQty * entryPrice
 
 		// 清空订单信息，但设置方向为SELL（因为这是恢复的持仓，将来要挂卖单）
 		slot.OrderID = 0
