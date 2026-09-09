@@ -38,16 +38,17 @@ type OrderUpdate struct {
 }
 
 const (
-	maxRecentFilledOrders   = 20
-	hourlyFillHours         = 24
-	fillQtyTolerance        = 1e-12
-	maxTerminalOrders       = 4096
-	placementRetryCooldown  = time.Second
-	pendingLookupMinAge     = 5 * time.Second
-	pendingLookupInterval   = 500 * time.Millisecond
-	pendingLookupPassBudget = 2 * time.Second
-	pendingLookupMissLimit  = 3
-	pendingLateUpdateGrace  = time.Second
+	maxRecentFilledOrders    = 20
+	hourlyFillHours          = 24
+	fillQtyTolerance         = 1e-12
+	buyWindowHysteresisSlots = 1
+	maxTerminalOrders        = 4096
+	placementRetryCooldown   = time.Second
+	pendingLookupMinAge      = 5 * time.Second
+	pendingLookupInterval    = 500 * time.Millisecond
+	pendingLookupPassBudget  = 2 * time.Second
+	pendingLookupMissLimit   = 3
+	pendingLateUpdateGrace   = time.Second
 )
 
 var ErrAcceptedOrderPreconditionInvalid = errors.New("交易所已接受订单但槽位下单前提已失效")
@@ -1004,9 +1005,19 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		DistanceToMid   float64
 	}
 	var sellCandidates []sellCandidate
-	buyWindowPrices := make(map[float64]struct{}, len(slotPrices))
+	// 活跃买单在目标窗口下沿多保留一格滞回带。行情在相邻网格的中点附近
+	// 来回抖动时，最远端低价买单不会被反复撤销、重挂；只有越过第二格才撤销。
+	// 上沿不保留，避免旧买单高于当前窗口时干扰跳格合并与追价逻辑。
+	retainedBuyWindowPrices := make(map[float64]struct{}, len(slotPrices)+buyWindowHysteresisSlots)
 	for _, price := range slotPrices {
-		buyWindowPrices[price] = struct{}{}
+		retainedBuyWindowPrices[price] = struct{}{}
+	}
+	if len(slotPrices) > 0 {
+		for i := 1; i <= buyWindowHysteresisSlots; i++ {
+			offset := float64(i) * priceInterval
+			lowerPrice := roundPrice(slotPrices[len(slotPrices)-1]-offset, spm.priceDecimals)
+			retainedBuyWindowPrices[lowerPrice] = struct{}{}
+		}
 	}
 	var outOfWindowBuys []outOfWindowBuy
 
@@ -1041,7 +1052,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		var staleBuy outOfWindowBuy
 		staleBuyFound := false
 		if cancelableLiveBuyLocked(slot) {
-			if _, inWindow := buyWindowPrices[slotPrice]; !inWindow {
+			if _, retained := retainedBuyWindowPrices[slotPrice]; !retained {
 				staleBuy = outOfWindowBuy{
 					price:     slotPrice,
 					orderID:   slot.OrderID,
@@ -3249,19 +3260,9 @@ func gridIntervalTickCount(priceInterval, tickSize float64) (int64, bool) {
 	return int64(nearest), true
 }
 
-func sellPriceTickConflicts(priceTick, intervalTicks int64, occupied map[int64]struct{}) bool {
-	for occupiedTick := range occupied {
-		var distance int64
-		if occupiedTick >= priceTick {
-			distance = occupiedTick - priceTick
-		} else {
-			distance = priceTick - occupiedTick
-		}
-		if distance < intervalTicks {
-			return true
-		}
-	}
-	return false
+func sellPriceTickConflicts(priceTick int64, occupied map[int64]struct{}) bool {
+	_, exists := occupied[priceTick]
+	return exists
 }
 
 // ValidateGridPriceInterval 确保配置的网格步长能被交易所真实 tickSize 精确表示。
@@ -3274,6 +3275,8 @@ func ValidateGridPriceInterval(priceInterval, tickSize float64) error {
 		priceInterval, tickSize)
 }
 
+// alignedMakerFloorPrice 只用于同网格行情跳过指纹：在没有实时盘口版本的
+// 兼容路径里，以整格边界判断是否需要重新规划。成交/撤单通知仍会强制调整。
 func (spm *SuperPositionManager) alignedMakerFloorPrice(currentPrice, priceInterval float64) (float64, bool) {
 	if spm == nil {
 		return 0, false
@@ -3316,6 +3319,33 @@ func (spm *SuperPositionManager) alignedMakerFloorPrice(currentPrice, priceInter
 	return roundPrice(float64(priceTick)*tickSize, spm.priceDecimals), true
 }
 
+func (spm *SuperPositionManager) fallbackMakerSellFloorPrice(currentPrice, priceInterval float64) (float64, bool) {
+	if spm == nil {
+		return 0, false
+	}
+	tickSize := spm.priceTickSize
+	intervalTicks, ok := gridIntervalTickCount(priceInterval, tickSize)
+	if !ok {
+		return 0, false
+	}
+	currentTick, ok := priceTickIndexUp(currentPrice, tickSize)
+	if !ok {
+		return 0, false
+	}
+	safetyTicks := intervalTicks / 10
+	if intervalTicks%10 != 0 {
+		safetyTicks++
+	}
+	if safetyTicks < 1 {
+		safetyTicks = 1
+	}
+	if currentTick > math.MaxInt64-safetyTicks {
+		return 0, false
+	}
+	priceTick := currentTick + safetyTicks
+	return roundPrice(float64(priceTick)*tickSize, spm.priceDecimals), true
+}
+
 func (spm *SuperPositionManager) makerGuardPrice() float64 {
 	ticks := 2
 	if spm != nil && spm.config != nil && spm.config.Execution.MakerGuardTicks > 0 {
@@ -3347,12 +3377,7 @@ func (spm *SuperPositionManager) allocateMakerSafeSellPriceFromFloor(
 	occupied map[int64]struct{},
 ) (float64, int64, bool) {
 	tickSize := spm.priceTickSize
-	intervalTicks, ok := gridIntervalTickCount(priceInterval, tickSize)
-	if !ok {
-		return 0, 0, false
-	}
-	anchorTick, ok := priceTickIndexNearest(spm.anchorPrice, tickSize)
-	if !ok {
+	if _, ok := gridIntervalTickCount(priceInterval, tickSize); !ok {
 		return 0, 0, false
 	}
 	targetTick, ok := priceTickIndexUp(targetPrice, tickSize)
@@ -3368,59 +3393,31 @@ func (spm *SuperPositionManager) allocateMakerSafeSellPriceFromFloor(
 		lowerBoundTick = targetTick
 	}
 	priceTick := lowerBoundTick
-	remainder := (lowerBoundTick - anchorTick) % intervalTicks
-	if remainder < 0 {
-		remainder += intervalTicks
-	}
-	if remainder != 0 {
-		advance := intervalTicks - remainder
-		if priceTick > math.MaxInt64-advance {
-			return 0, 0, false
-		}
-		priceTick += advance
-	}
 	for {
-		if !sellPriceTickConflicts(priceTick, intervalTicks, occupied) {
+		if !sellPriceTickConflicts(priceTick, occupied) {
 			price := roundPrice(float64(priceTick)*tickSize, spm.priceDecimals)
 			if price+fillQtyTolerance >= makerFloor && price+fillQtyTolerance >= targetPrice {
 				return price, priceTick, true
 			}
 		}
-		if priceTick > math.MaxInt64-intervalTicks {
+		if priceTick >= math.MaxInt64-1 {
 			return 0, 0, false
 		}
-		priceTick += intervalTicks
+		priceTick++
 	}
 }
 
-// allocateMakerSafeSellPrice 保留原网格盈利目标和 Maker 安全价作为下限，
-// 再沿启动锚点定义的 priceInterval 网格向上寻找未被现有订单或本批
-// reservation 占用的价位。交易所 tickSize 只用于合法价格表示，不能替代
-// 用户配置的网格步长，否则 0.02 网格会退化成 0.01 的卖价序列。
+// allocateMakerSafeSellPrice 保留原网格盈利目标和 Maker 安全价作为下限。
+// 目标已被行情穿过时，从 Maker 下限开始按交易所 tickSize 向上寻找最近的
+// 未占用价格，避免为了保持网格相位而把止盈单额外抬高一整个 priceInterval。
 func (spm *SuperPositionManager) allocateMakerSafeSellPrice(
 	targetPrice, currentPrice, priceInterval float64,
 	occupied map[int64]struct{},
 ) (float64, int64, bool) {
-	tickSize := spm.priceTickSize
-	intervalTicks, ok := gridIntervalTickCount(priceInterval, tickSize)
+	makerFloor, ok := spm.fallbackMakerSellFloorPrice(currentPrice, priceInterval)
 	if !ok {
 		return 0, 0, false
 	}
-	currentTick, ok := priceTickIndexUp(currentPrice, tickSize)
-	if !ok {
-		return 0, 0, false
-	}
-	safetyTicks := intervalTicks / 10
-	if intervalTicks%10 != 0 {
-		safetyTicks++
-	}
-	if safetyTicks < 1 {
-		safetyTicks = 1
-	}
-	if currentTick > math.MaxInt64-safetyTicks {
-		return 0, 0, false
-	}
-	makerFloor := roundPrice(float64(currentTick+safetyTicks)*tickSize, spm.priceDecimals)
 	return spm.allocateMakerSafeSellPriceFromFloor(targetPrice, makerFloor, priceInterval, occupied)
 }
 

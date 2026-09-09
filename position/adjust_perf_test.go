@@ -129,7 +129,33 @@ func TestRecycleIdleSlotsOutsideBuyWindow(t *testing.T) {
 	}
 }
 
-func TestAdjustOrdersCancelsBuysThatLeftTheWindow(t *testing.T) {
+func TestAdjustOrdersRetainsBuyInOneGridLowerHysteresisBand(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.SellWindowSize = 1
+	executor := &recordingExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3)
+	spm.anchorPrice = 100
+
+	retained := spm.getOrCreateSlot(98) // 目标窗口 [100, 99] 下方第一格
+	retained.OrderSide = "BUY"
+	retained.OrderStatus = OrderStatusConfirmed
+	retained.OrderID = 8
+	retained.ClientOID = "hysteresis-buy"
+	retained.SlotStatus = SlotStatusLocked
+
+	if err := spm.AdjustOrders(100); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	if len(executor.cancelIDs) != 0 {
+		t.Fatalf("cancelIDs = %v, want none inside lower one-grid hysteresis band", executor.cancelIDs)
+	}
+	if retained.OrderStatus != OrderStatusConfirmed || retained.SlotStatus != SlotStatusLocked {
+		t.Fatalf("hysteresis buy was mutated: status=%s slot=%s", retained.OrderStatus, retained.SlotStatus)
+	}
+}
+
+func TestAdjustOrdersCancelsBuysBeyondWindowHysteresis(t *testing.T) {
 	cfg := testConfig()
 	cfg.Trading.BuyWindowSize = 2
 	cfg.Trading.SellWindowSize = 1
