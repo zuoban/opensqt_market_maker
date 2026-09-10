@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -83,18 +82,7 @@ func Create(path string, scope Scope, initialState []byte) (*Store, error) {
 	if err := validateState(initialState); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return nil, err
-	}
-	if err := file.Close(); err != nil {
-		return nil, err
-	}
-	db, err := openDB(path, true, false)
-	if err != nil {
-		return nil, err
-	}
-	err = db.Update(func(tx *bolt.Tx) error {
+	db, err := createLedgerDB(path, func(tx *bolt.Tx) error {
 		meta, err := tx.CreateBucket(metaBucket)
 		if err != nil {
 			return err
@@ -107,14 +95,8 @@ func Create(path string, scope Scope, initialState []byte) (*Store, error) {
 		}
 		return putSealed(meta, checkpointKey, Snapshot{State: initialState})
 	})
-	if err == nil {
-		// Sync the containing directory too: a synced file alone does not make
-		// its newly created directory entry durable on Unix filesystems.
-		err = syncDirectory(filepath.Dir(path))
-	}
 	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("%w: initialize: %w", ErrUncertain, err)
+		return nil, err
 	}
 	return &Store{db: db}, nil
 }
@@ -125,25 +107,8 @@ func Open(path string, scope Scope) (*Store, error) {
 	if err := scope.validate(); err != nil {
 		return nil, err
 	}
-	// Validate in read-only mode first. A writable bbolt open loads free pages
-	// immediately; truncated files must be rejected before that happens.
-	probe, err := openDB(path, false, true)
+	db, err := openLedgerDB(path, func(db *bolt.DB) error { return validateDB(db, path, scope) })
 	if err != nil {
-		return nil, err
-	}
-	err = validateDB(probe, path, scope)
-	err = errors.Join(err, probe.Close())
-	if err != nil {
-		return nil, err
-	}
-	db, err := openDB(path, false, false)
-	if err != nil {
-		return nil, err
-	}
-	// Recheck under the exclusive writer lock, including any legitimate
-	// transaction committed between the read-only probe and writer acquisition.
-	if err := validateDB(db, path, scope); err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
@@ -151,22 +116,8 @@ func Open(path string, scope Scope) (*Store, error) {
 
 func validateDB(db *bolt.DB, path string, scope Scope) error {
 	return db.View(func(tx *bolt.Tx) error {
-		info, err := os.Stat(path)
-		if err != nil {
+		if err := checkDatabasePages(tx, path); err != nil {
 			return err
-		}
-		if tx.Size() > info.Size() {
-			return fmt.Errorf("%w: truncated database", ErrCorrupt)
-		}
-		// Drain the channel even after a failure so the checker goroutine exits.
-		var checkErr error
-		for err := range tx.Check() {
-			if checkErr == nil {
-				checkErr = err
-			}
-		}
-		if checkErr != nil {
-			return fmt.Errorf("%w: database pages: %w", ErrCorrupt, checkErr)
 		}
 		meta, completed := tx.Bucket(metaBucket), tx.Bucket(completedBucket)
 		if meta == nil || completed == nil {
