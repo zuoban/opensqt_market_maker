@@ -35,20 +35,21 @@ type Options struct {
 
 // Server 本地只读监控 HTTP/WS 服务
 type Server struct {
-	cfg        *config.Config
-	version    string
-	listen     string
-	listenFunc func(network, address string) (net.Listener, error)
-	assembler  *assembler
-	account    *AccountCache
-	position   *PositionCache
-	hub        *hub
-	httpServer *http.Server
-	cancel     context.CancelFunc
-	addr       string
-	started    time.Time
-	stopping   bool
-	runtimeMu  sync.RWMutex
+	cfg          *config.Config
+	version      string
+	listen       string
+	listenFunc   func(network, address string) (net.Listener, error)
+	assembler    *assembler
+	account      *AccountCache
+	exchangeRate *ExchangeRateCache
+	position     *PositionCache
+	hub          *hub
+	httpServer   *http.Server
+	cancel       context.CancelFunc
+	addr         string
+	started      time.Time
+	stopping     bool
+	runtimeMu    sync.RWMutex
 }
 
 type wsEnvelope struct {
@@ -104,29 +105,32 @@ func New(opt Options) *Server {
 		symbol = opt.Cfg.Trading.Symbol
 	}
 	cache := newAccountCache(src, symbol, interval)
+	exchangeRate := newExchangeRateCache(nil, "", 0, 0)
 	var positionCache *PositionCache
 	if opt.Position != nil {
 		positionCache = newPositionCache(opt.Position, positionInterval)
 	}
 	return &Server{
-		cfg:        opt.Cfg,
-		version:    opt.Version,
-		listen:     listen,
-		listenFunc: net.Listen,
-		account:    cache,
-		position:   positionCache,
-		hub:        newHub(),
-		started:    started,
+		cfg:          opt.Cfg,
+		version:      opt.Version,
+		listen:       listen,
+		listenFunc:   net.Listen,
+		account:      cache,
+		exchangeRate: exchangeRate,
+		position:     positionCache,
+		hub:          newHub(),
+		started:      started,
 		assembler: &assembler{
-			cfg:      opt.Cfg,
-			version:  opt.Version,
-			started:  started,
-			price:    opt.Price,
-			position: positionCache,
-			pos:      opt.Position,
-			risk:     opt.Risk,
-			margin:   opt.Margin,
-			account:  cache,
+			cfg:          opt.Cfg,
+			version:      opt.Version,
+			started:      started,
+			price:        opt.Price,
+			position:     positionCache,
+			pos:          opt.Position,
+			risk:         opt.Risk,
+			margin:       opt.Margin,
+			account:      cache,
+			exchangeRate: exchangeRate,
 		},
 	}
 }
@@ -191,6 +195,9 @@ func (s *Server) Start() error {
 	s.runtimeMu.Unlock()
 
 	go s.account.Run(ctx)
+	if s.exchangeRate != nil {
+		go s.exchangeRate.Run(ctx)
+	}
 	if s.position != nil {
 		go s.position.Run(ctx)
 	}

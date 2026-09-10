@@ -99,6 +99,31 @@ func TestSnapshotJSONIncludesMakerExecutionAndQuote(t *testing.T) {
 	}
 }
 
+func TestSnapshotIncludesCachedExchangeRate(t *testing.T) {
+	cache := newExchangeRateCache(nil, "", time.Hour, time.Minute)
+	cache.view = ExchangeRateView{
+		Ready:     true,
+		CNYPerUSD: 6.7078,
+		Source:    "Frankfurter",
+		RateDate:  "2026-09-09",
+		UpdatedAt: time.Now(),
+	}
+
+	snapshot := (&assembler{exchangeRate: cache}).Build()
+	if !snapshot.ExchangeRate.Ready || snapshot.ExchangeRate.CNYPerUSD != 6.7078 {
+		t.Fatalf("exchange rate = %+v", snapshot.ExchangeRate)
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"exchangeRate"`, `"cnyPerUsd":6.7078`, `"source":"Frankfurter"`} {
+		if !strings.Contains(string(raw), field) {
+			t.Fatalf("snapshot JSON missing %s: %s", field, raw)
+		}
+	}
+}
+
 func TestSnapshotIncludesMarginGuard(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Trading.MaxMarginUsagePercent = 40

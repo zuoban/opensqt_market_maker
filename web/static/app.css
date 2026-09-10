@@ -566,6 +566,22 @@ main { display: block; }
     line-height: 1.4;
 }
 
+#marginBalanceCny {
+    display: block;
+    margin-top: 4px;
+    color: var(--primary);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.25;
+}
+
+.is-waiting #marginBalanceCny,
+.is-stale #marginBalanceCny,
+#marginBalanceCny.is-stale { color: var(--warn); }
+
+.is-triggered #marginBalanceCny { color: var(--danger); }
+
 .loading-card i,
 .loading-card b {
     display: block;

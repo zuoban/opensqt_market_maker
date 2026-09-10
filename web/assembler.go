@@ -29,6 +29,7 @@ type Snapshot struct {
 	Risk              safety.RiskSnapshot       `json:"risk"`
 	Margin            safety.MarginSnapshot     `json:"margin"`
 	Account           AccountView               `json:"account"`
+	ExchangeRate      ExchangeRateView          `json:"exchangeRate"`
 	Logs              []logger.LogEntry         `json:"logs"`
 }
 
@@ -65,16 +66,17 @@ type CandleView struct {
 }
 
 type assembler struct {
-	cfg      *config.Config
-	version  string
-	started  time.Time
-	sequence atomic.Uint64
-	price    *monitor.PriceMonitor
-	position *PositionCache
-	pos      *position.SuperPositionManager
-	risk     *safety.RiskMonitor
-	margin   *safety.MarginMonitor
-	account  *AccountCache
+	cfg          *config.Config
+	version      string
+	started      time.Time
+	sequence     atomic.Uint64
+	price        *monitor.PriceMonitor
+	position     *PositionCache
+	pos          *position.SuperPositionManager
+	risk         *safety.RiskMonitor
+	margin       *safety.MarginMonitor
+	account      *AccountCache
+	exchangeRate *ExchangeRateCache
 }
 
 func (a *assembler) Build() *Snapshot {
@@ -95,6 +97,9 @@ func (a *assembler) Build() *Snapshot {
 	}
 	if a.account != nil {
 		snap.Account = a.account.View()
+	}
+	if a.exchangeRate != nil {
+		snap.ExchangeRate = a.exchangeRate.View()
 	}
 	if a.position != nil {
 		snap.Position, snap.PositionUpdatedAt, snap.PositionReady = a.position.View()

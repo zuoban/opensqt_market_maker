@@ -140,6 +140,10 @@ func visualFixtureSnapshot() map[string]interface{} {
 			"quoteAsset": "USDT", "available": 1164.22, "margin": 2018.47, "initialMarginReady": true,
 			"initialMargin": 2000.0, "marginChange": 18.47, "marginChangePct": 0.92, "unrealizedPnl": 11.65,
 		},
+		"exchangeRate": map[string]interface{}{
+			"ready": true, "cnyPerUsd": 6.7078, "source": "Frankfurter",
+			"rateDate": "2026-09-09", "updatedAt": time.Now(), "stale": false,
+		},
 		"logs": []map[string]interface{}{
 			{"time": time.Now().Add(-18 * time.Minute), "level": "INFO", "message": "账户缓存已同步 · 可用 1,864.22 USDT"},
 			{"time": time.Now().Add(-9 * time.Minute), "level": "INFO", "message": "K 线与网格执行图已连接实时行情"},

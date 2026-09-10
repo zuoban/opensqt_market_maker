@@ -38,6 +38,9 @@ func testDashCfg(listen, token string) *config.Config {
 func startServer(t *testing.T, token string) *Server {
 	t.Helper()
 	s := New(Options{Cfg: testDashCfg("127.0.0.1:0", token), Version: "test-ver"})
+	// 单元测试不访问公网；汇率缓存由 exchange_rate_cache_test.go 独立覆盖。
+	s.exchangeRate = nil
+	s.assembler.exchangeRate = nil
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.Start() }()
 	deadline := time.Now().Add(2 * time.Second)
@@ -70,6 +73,9 @@ func TestNewWiresPositionCacheToDashboardPushInterval(t *testing.T) {
 	}
 	if s.assembler.position != s.position || s.assembler.pos != manager {
 		t.Fatal("assembler was not wired to the position cache with manager fallback")
+	}
+	if s.exchangeRate == nil || s.assembler.exchangeRate != s.exchangeRate {
+		t.Fatal("assembler was not wired to the exchange-rate cache")
 	}
 }
 

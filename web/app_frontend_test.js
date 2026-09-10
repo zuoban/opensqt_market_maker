@@ -7,6 +7,7 @@ const {
     buildHourlyFillModel,
 	buildFilledOrderModel,
     buildMarginUsageModel,
+    buildCnyEstimateModel,
     buildSnapshotHealthModel,
     buildSnapshotAcceptanceModel,
     buildFreshnessModel,
@@ -460,9 +461,39 @@ test("margin capacity surface exposes status, exact amounts and an accessible ga
     assert.match(html, /id="marginTrack"[^>]*role="progressbar"/);
     assert.match(html, /id="marginUsedAmount"/);
     assert.match(html, /id="marginBalanceAmount"/);
+    assert.match(html, /id="marginBalanceCny"/);
     assert.match(html, /id="marginAvailableAmount"/);
     assert.match(cssBlock(css, ".margin-fill"), /transform:\s*scaleX\(var\(--margin-fill-scale\)\)/);
     assert.match(cssBlock(css, ".margin-facts"), /grid-template-columns:\s*repeat\(3,/);
+});
+
+test("margin balance adds a clearly approximate CNY value for USD stablecoins", () => {
+    const usdt = buildCnyEstimateModel(2018.47, "USDT", {
+        ready: true,
+        cnyPerUsd: 6.7078,
+        source: "Frankfurter",
+        rateDate: "2026-09-09"
+    });
+    assert.equal(usdt.available, true);
+    assert.equal(usdt.amount, 13539.493065999999);
+    assert.equal(usdt.rate, 6.7078);
+    assert.equal(usdt.text, "约 ¥13,539.49 CNY");
+    assert.equal(usdt.rateText, "1 USDT ≈ ¥6.7078");
+    assert.equal(usdt.source, "Frankfurter");
+
+    const usdc = buildCnyEstimateModel(100, "usdc", { ready: true, cnyPerUsd: 6.7, stale: true });
+    assert.equal(usdc.available, true);
+    assert.equal(usdc.amount, 670);
+    assert.equal(usdc.rateText, "1 USDC ≈ ¥6.7000");
+    assert.match(usdc.displayText, /缓存汇率/);
+
+    const waiting = buildCnyEstimateModel(100, "USDT", {});
+    assert.equal(waiting.available, false);
+    assert.equal(waiting.statusText, "人民币汇率同步中");
+
+    const unsupported = buildCnyEstimateModel(100, "BTC", { ready: true, cnyPerUsd: 6.7 });
+    assert.equal(unsupported.available, false);
+    assert.equal(unsupported.text, "—");
 });
 
 test("margin usage model keeps backend trigger state authoritative", () => {
@@ -936,8 +967,11 @@ test("dashboard markup exposes current slot status and moved profit metrics", ()
     assert.doesNotMatch(js, /title \+ " · " \+ safeCount\(total\)/);
     const primaryBlock = js.slice(js.indexOf("const primaryItems"), js.indexOf("const strategyItems"));
     const strategyBlock = js.slice(js.indexOf("const strategyItems"), js.indexOf("updateSection(\"primary-kpis\""));
+    const balanceHintBlock = js.slice(js.indexOf("const marginChangeHint"), js.indexOf("const primaryItems"));
     assert.match(primaryBlock, /活动买 \/ 卖[\s\S]*预计盈利[\s\S]*预计每笔盈利/);
     assert.equal(strategyBlock.includes("预计盈利"), false);
+    assert.match(balanceHintBlock, /fmtSigned\(marginChange\)[\s\S]*marginChangePct/);
+    assert.doesNotMatch(balanceHintBlock, /启动 |变化 |等待启动余额/);
 });
 
 test("visible candle count is capped for real-time canvas performance", () => {

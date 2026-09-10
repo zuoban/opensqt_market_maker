@@ -10,6 +10,7 @@
             buildHourlyFillModel,
 			buildFilledOrderModel,
             buildMarginUsageModel,
+            buildCnyEstimateModel,
             buildSnapshotHealthModel,
             buildSnapshotAcceptanceModel,
             buildFreshnessModel,
@@ -603,6 +604,7 @@
         const risk = snapshot.risk || {};
         const acc = snapshot.account || {};
         const margin = snapshot.margin || {};
+        const exchangeRate = snapshot.exchangeRate || {};
         const price = snapshot.price || {};
         const dec = pos.priceDecimals ?? 2;
         const quote = margin.quoteAsset || acc.quoteAsset || "USDT";
@@ -652,12 +654,20 @@
             ? "warn"
             : (marginChange > 0 ? "pos" : (marginChange < 0 ? "neg" : ""));
         const marginChangeHint = initialMarginReady
-            ? "启动 " + fmt(acc.initialMargin) + " · 变化 " + fmtSigned(marginChange) +
+            ? fmtSigned(marginChange) +
                 (Number(acc.initialMargin) !== 0 ? " (" + fmtSigned(acc.marginChangePct) + "%)" : "")
-            : "等待启动余额";
+            : "";
+        const marginBalanceCny = buildCnyEstimateModel(acc.margin, quote, exchangeRate);
+        const marginBalanceHint = [
+            marginBalanceCny.available ? marginBalanceCny.displayText : marginBalanceCny.statusText,
+            marginChangeHint
+        ].filter(Boolean).join(" · ");
+        const marginBalanceHintClass = acc.stale || marginBalanceCny.stale || !marginBalanceCny.available
+            ? "warn"
+            : marginChangeClass;
         const primaryItems = [
             metric("可用余额", fmt(acc.available) + " " + quote, acc.stale ? "warn" : ""),
-            metric("当前保证金余额", fmt(acc.margin) + " " + quote, acc.stale ? "warn" : "", marginChangeHint, marginChangeClass),
+            metric("当前保证金余额", fmt(acc.margin) + " " + quote, acc.stale ? "warn" : "", marginBalanceHint, marginBalanceHintClass),
             metric("未实现盈亏", fmt(acc.unrealizedPnl) + " " + quote, (acc.unrealizedPnl || 0) >= 0 ? "pos" : "neg"),
             metric("已实现盈亏", fmt(realized) + " " + quote, realized >= 0 ? "pos" : "neg"),
             metric(
@@ -738,7 +748,7 @@
                 retryRemainingSec: slot.retryRemainingSec
             }))
         }, () => renderGridStatus(buildGridStatusModel(pos.slots, pos.gridPrice, pos.priceDecimals), quote));
-        updateSection("margin-usage", { margin, quote }, () => renderMarginUsage(marginModel));
+        updateSection("margin-usage", { margin, quote, exchangeRate }, () => renderMarginUsage(marginModel, exchangeRate));
         updateSection("strategy-kpis", strategyItems, () => renderMetrics($("strategyKpis"), strategyItems));
 		updateSection("maker-execution", { makerModel, dec }, () => renderMakerExecution(makerModel, dec));
         $("strategySummary").textContent =
@@ -778,6 +788,37 @@
     function safeCount(value) {
         const number = Number(value);
         return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+    }
+
+    function buildCnyEstimateModel(value, quoteAsset, exchangeRate) {
+        const amount = finiteOrNull(value);
+        const asset = String(quoteAsset || "").trim().toUpperCase();
+        const supported = asset === "USDT" || asset === "USDC" || asset === "USD";
+        const source = exchangeRate && typeof exchangeRate === "object" ? exchangeRate : {};
+        const appliedRate = finiteOrNull(source.cnyPerUsd);
+        const rateReady = Boolean(source.ready) && appliedRate != null && appliedRate > 0;
+        const available = supported && amount != null && amount >= 0 && rateReady;
+        const cnyAmount = available ? amount * appliedRate : null;
+        const stale = Boolean(source.stale);
+        const error = source.error == null ? "" : String(source.error).trim();
+        const statusText = supported
+            ? (error ? "人民币汇率暂不可用" : "人民币汇率同步中")
+            : "不支持人民币换算";
+        const text = available ? "约 ¥" + fmt(cnyAmount, 2) + " CNY" : "—";
+
+        return {
+            available,
+            amount: cnyAmount,
+            rate: appliedRate,
+            quoteAsset: asset,
+            text,
+            displayText: available ? text + (stale ? " · 缓存汇率" : "") : statusText,
+            rateText: available ? "1 " + asset + " ≈ ¥" + fmt(appliedRate, 4) : "",
+            rateDate: source.rateDate || "",
+            source: source.source || "",
+            stale,
+            statusText
+        };
     }
 
     function clamp(value, min, max) {
@@ -853,7 +894,7 @@
         };
     }
 
-    function renderMarginUsage(model) {
+    function renderMarginUsage(model, exchangeRate) {
         const root = $("marginCapacity");
         if (!root) return;
 
@@ -869,6 +910,10 @@
         setText($("marginUsedAmount"), marginAmountText(model.usedMargin, model.quoteAsset, model.showAmounts));
         setText($("marginBalanceAmount"), marginAmountText(model.marginBalance, model.quoteAsset, model.showAmounts));
         setText($("marginAvailableAmount"), marginAmountText(model.availableBalance, model.quoteAsset, model.showAmounts));
+        const cnyEstimate = buildCnyEstimateModel(model.marginBalance, model.quoteAsset, exchangeRate);
+        const cnyNode = $("marginBalanceCny");
+        setText(cnyNode, model.showAmounts ? cnyEstimate.displayText : "—");
+        cnyNode.classList.toggle("is-stale", cnyEstimate.stale || model.showAmounts && !cnyEstimate.available);
 
         const limit = $("marginLimit");
         limit.hidden = model.limitPosition == null;
@@ -895,6 +940,14 @@
         if (model.updatedAt) {
             const updated = formatTime(model.updatedAt);
             if (updated !== "—") note += " · 更新 " + updated;
+        }
+        if (model.showAmounts && cnyEstimate.available) {
+            note += " · 人民币按 " + cnyEstimate.rateText + " 估算";
+            if (cnyEstimate.source) note += " · " + cnyEstimate.source;
+            if (cnyEstimate.rateDate) note += " " + cnyEstimate.rateDate;
+            if (cnyEstimate.stale) note += "（缓存读数）";
+        } else if (model.showAmounts && cnyEstimate.statusText) {
+            note += " · " + cnyEstimate.statusText;
         }
         setText($("marginCapacityNote"), note);
     }
