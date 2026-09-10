@@ -313,6 +313,8 @@ func (spm *SuperPositionManager) splitGapStackedSlot(parentPrice float64, stackC
 			child.OrderStatus != OrderStatusPartiallyFilled &&
 			child.OrderStatus != OrderStatusCancelRequested
 		if accept {
+			child.oppositeFillAt = parent.oppositeFillAt
+			child.oppositeSubmitSide = parent.oppositeSubmitSide
 			child.PositionQty = share
 			child.PositionCost = share * parentUnitCost
 			child.PositionStatus = PositionStatusFilled

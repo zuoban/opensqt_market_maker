@@ -12,6 +12,7 @@ import (
 
 	"opensqt/exchange"
 	"opensqt/logger"
+	"opensqt/telemetry"
 
 	"github.com/adshao/go-binance/v2/common"
 	"golang.org/x/time/rate"
@@ -54,6 +55,8 @@ type OrderRequest struct {
 	// 返回后释放。实现会在 lease 期间持有槽位锁，因此不得从 PlaceOrder 同步
 	// 重入同一槽位的订单更新回调；真实订单流应通过异步边界投递。
 	AcquireSubmissionLease func() (release func(), ok bool)
+	// OnSubmissionStarted 在所有本地门禁通过后、持有 lease 时记录首次实际提交。
+	OnSubmissionStarted func()
 	// OnSubmissionUnknown 在请求已进入交易所边界、但结果无法确认时调用。
 	OnSubmissionUnknown func()
 	// OnDefiniteRejection 将逐笔明确拒绝原因回传到槽位层。回调只记录状态，
@@ -79,6 +82,7 @@ type Order struct {
 
 // ExchangeOrderExecutor 基于 exchange.IExchange 的订单执行器
 type ExchangeOrderExecutor struct {
+	performance atomic.Pointer[telemetry.Recorder]
 	exchange    exchange.IExchange
 	symbol      string
 	rateLimiter contextWaiter
@@ -529,7 +533,7 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 			return nil, ErrNewOrdersStopped
 		}
 		// 每次实际尝试都重新限流，重试不能绕过订单预算。
-		if err := oe.rateLimiter.Wait(placeCtx); err != nil {
+		if err := oe.waitForRateLimit(placeCtx); err != nil {
 			return nil, oe.placementContextError("速率限制等待失败", err)
 		}
 
@@ -591,10 +595,16 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 		// lease 必须覆盖实际交易所调用，但在返回后立即释放，以免占用后续
 		// 重试等待。订单流是异步边界，会在此处短暂等待同一槽位锁。
 		requestCtx, cancel := oe.requestContext(placeCtx)
+		performance := oe.performance.Load()
+		started := performance.Start()
 		exchangeOrder, err := func() (*exchange.Order, error) {
 			defer release()
+			if req.OnSubmissionStarted != nil {
+				req.OnSubmissionStarted()
+			}
 			return oe.exchange.PlaceOrder(requestCtx, exchangeReq)
 		}()
+		performance.ObserveSince(telemetry.PlaceRequest, started, err != nil || exchangeOrder == nil)
 		cancel()
 		order, submittedErr := oe.interpretSubmittedResult(req, exchangeOrder, err)
 		if submittedErr == nil {
@@ -759,7 +769,7 @@ func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk 
 		return stop
 	}
 	for range chunk {
-		if waitErr := oe.rateLimiter.Wait(placeCtx); waitErr != nil {
+		if waitErr := oe.waitForRateLimit(placeCtx); waitErr != nil {
 			waitErr = oe.placementContextError("速率限制等待失败", waitErr)
 			stop := false
 			for _, req := range chunk {
@@ -874,10 +884,22 @@ func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk 
 		exchangeReqs[i] = item.exchangeReq
 	}
 	requestCtx, cancel := oe.requestContext(placeCtx)
+	performance := oe.performance.Load()
+	started := performance.Start()
 	items, batchErr := func() ([]exchange.PlaceOrderBatchItem, error) {
 		defer releaseSubmitted()
+		for _, item := range submitted {
+			if item.req.OnSubmissionStarted != nil {
+				item.req.OnSubmissionStarted()
+			}
+		}
 		return batcher.PlaceOrderBatch(requestCtx, exchangeReqs)
 	}()
+	failed := batchErr != nil || len(items) != len(submitted)
+	for _, item := range items {
+		failed = failed || item.Err != nil || item.Order == nil
+	}
+	performance.ObserveSince(telemetry.PlaceRequest, started, failed)
 	cancel()
 
 	stop := false
@@ -920,12 +942,15 @@ func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk 
 // CancelOrder 取消订单
 func (oe *ExchangeOrderExecutor) CancelOrder(orderID int64) error {
 	// 限流
-	if err := oe.rateLimiter.Wait(oe.rootCtx); err != nil {
+	if err := oe.waitForRateLimit(oe.rootCtx); err != nil {
 		return fmt.Errorf("速率限制等待失败: %w", err)
 	}
 
 	requestCtx, cancel := oe.requestContext(oe.rootCtx)
+	performance := oe.performance.Load()
+	started := performance.Start()
 	err := oe.exchange.CancelOrder(requestCtx, oe.symbol, orderID)
+	performance.ObserveSince(telemetry.CancelRequest, started, err != nil)
 	cancel()
 	if err != nil {
 		// 如果是"Unknown order"错误，说明订单已经不存在（可能已成交或已取消），不算错误
@@ -947,13 +972,16 @@ func (oe *ExchangeOrderExecutor) BatchCancelOrders(orderIDs []int64) error {
 		return nil
 	}
 
-	if err := oe.rateLimiter.Wait(oe.rootCtx); err != nil {
+	if err := oe.waitForRateLimit(oe.rootCtx); err != nil {
 		return fmt.Errorf("批量撤单限流等待失败: %w", err)
 	}
 
 	// 使用交易所的批量撤单接口
 	requestCtx, cancel := oe.requestContext(oe.rootCtx)
+	performance := oe.performance.Load()
+	started := performance.Start()
 	err := oe.exchange.BatchCancelOrders(requestCtx, oe.symbol, orderIDs)
+	performance.ObserveSince(telemetry.CancelRequest, started, err != nil)
 	cancel()
 	if err != nil {
 		logger.Warn("⚠️ [%s] 批量撤单失败: %v，尝试单个撤单", oe.exchange.GetName(), err)

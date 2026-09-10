@@ -10,10 +10,12 @@ import (
 	"opensqt/monitor"
 	"opensqt/position"
 	"opensqt/safety"
+	"opensqt/telemetry"
 )
 
 // Snapshot 面板完整读数
 type Snapshot struct {
+	Performance       *telemetry.Snapshot       `json:"performance,omitempty"`
 	Time              time.Time                 `json:"time"`
 	Sequence          uint64                    `json:"sequence"`
 	Version           string                    `json:"version"`
@@ -66,6 +68,7 @@ type CandleView struct {
 }
 
 type assembler struct {
+	performance  *telemetry.Recorder
 	cfg          *config.Config
 	version      string
 	started      time.Time
@@ -94,6 +97,10 @@ func (a *assembler) Build() *Snapshot {
 		App:       safeAppView(a.cfg),
 		Kline:     KlineView{Candles: make([]CandleView, 0)},
 		Logs:      logger.RecentLogs(80),
+	}
+	if a.performance != nil {
+		performance := a.performance.Snapshot()
+		snap.Performance = &performance
 	}
 	if a.account != nil {
 		snap.Account = a.account.View()

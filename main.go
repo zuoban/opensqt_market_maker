@@ -18,6 +18,7 @@ import (
 	"opensqt/order"
 	"opensqt/position"
 	"opensqt/safety"
+	"opensqt/telemetry"
 	"opensqt/web"
 )
 
@@ -159,12 +160,14 @@ func main() {
 	logger.Info("✅ 持仓安全性检查通过，开始初始化交易组件...")
 
 	// 8. 创建核心组件
+	performance := telemetry.New(programStartedAt)
 	exchangeExecutor := order.NewExchangeOrderExecutor(
 		ex,
 		cfg.Trading.Symbol,
 		cfg.Timing.RateLimitRetryDelay,
 		cfg.Timing.OrderRetryDelay,
 	)
+	exchangeExecutor.SetTelemetry(performance)
 	exchangeExecutor.SetMakerGuard(
 		priceMonitor.GetMarketSnapshot,
 		priceTickSize,
@@ -186,6 +189,8 @@ func main() {
 		priceTickSize,
 	)
 	superPositionManager.SetMarketSnapshotProvider(priceMonitor.GetMarketSnapshot)
+	superPositionManager.SetTelemetry(performance)
+	performance.SetStateProvider(superPositionManager.TelemetryStateCounts)
 
 	// === 新增：初始化风控监视器 ===
 	riskMonitor := safety.NewRiskMonitor(cfg, ex)
@@ -200,6 +205,7 @@ func main() {
 	// 9. 启动组件
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go performance.Run(ctx)
 
 	// 🔥 关键修复：先启动订单流，再下单（避免错过成交推送）
 	// 启动订单流（通过交易所接口）
@@ -304,14 +310,15 @@ func main() {
 
 		if cfg.DashboardEnabled() {
 			dash = web.New(web.Options{
-				Cfg:       cfg,
-				Version:   Version,
-				StartedAt: programStartedAt,
-				Price:     priceMonitor,
-				Position:  superPositionManager,
-				Risk:      riskMonitor,
-				Margin:    marginMonitor,
-				Exchange:  ex,
+				Performance: performance,
+				Cfg:         cfg,
+				Version:     Version,
+				StartedAt:   programStartedAt,
+				Price:       priceMonitor,
+				Position:    superPositionManager,
+				Risk:        riskMonitor,
+				Margin:      marginMonitor,
+				Exchange:    ex,
 			})
 			go func() {
 				if err := dash.Start(); err != nil {
@@ -329,6 +336,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					logPerformance(performance.Snapshot())
 					// 风控触发时不打印状态
 					if !riskMonitor.IsTriggered() {
 						superPositionManager.PrintPositions()
@@ -602,6 +610,7 @@ func (a *exchangeExecutorAdapter) PlaceOrder(req *position.OrderRequest) (*posit
 		ClientOrderID:          req.ClientOrderID, // 传递 ClientOrderID
 		NearTouch:              req.NearTouch,
 		AcquireSubmissionLease: req.AcquireSubmissionLease,
+		OnSubmissionStarted:    req.OnSubmissionStarted,
 		OnSubmissionUnknown:    req.MarkSubmissionUncertain,
 		OnDefiniteRejection: func(kind order.OrderRejectionKind) {
 			req.MarkDefiniteRejection(string(kind))
@@ -641,6 +650,7 @@ func (a *exchangeExecutorAdapter) BatchPlaceOrders(orders []*position.OrderReque
 			ClientOrderID:          req.ClientOrderID, // 传递 ClientOrderID
 			NearTouch:              req.NearTouch,
 			AcquireSubmissionLease: req.AcquireSubmissionLease,
+			OnSubmissionStarted:    req.OnSubmissionStarted,
 			OnSubmissionUnknown:    req.MarkSubmissionUncertain,
 			OnDefiniteRejection: func(kind order.OrderRejectionKind) {
 				req.MarkDefiniteRejection(string(kind))

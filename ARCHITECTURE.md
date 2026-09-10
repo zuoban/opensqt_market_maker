@@ -131,6 +131,10 @@ opensqt_platform/
 │   ├── reconciler.go          # 持仓对账
 │   └── order_cleaner.go       # 订单清理
 │
+├── telemetry/                 # 固定容量性能采样与后台只读快照
+│   ├── recorder.go            # 最近样本百分位、状态计数
+│   └── runtime.go             # Go 堆、GC、协程读数
+│
 └── utils/                     # 工具函数
     └── orderid.go             # 自定义订单ID生成
 ```
@@ -415,6 +419,14 @@ CancelAllBuyOrders()
 - 仓位管理器返回独占快照切片，缓存直接接管。面板内部只读组装共享缓存视图，外部 `View()` 仍返回副本；后续刷新不会修改已经发布的视图。
 - 一轮 WebSocket 广播在写协程中按需编码一次，多个连接共享 `PreparedMessage`；各连接仍独立执行写入、超时和单槽最新消息队列。
 - 基准、验证方法及仍保留的安全边界见 [PERFORMANCE.md](PERFORMANCE.md)。
+
+#### 只读性能观测
+
+- 主程序为仓位管理器与订单执行器注入同一个 `telemetry.Recorder`，随主上下文启动、停止独立的每秒汇总协程。关闭面板时仍然采样并按状态打印间隔记录日志。
+- 每项延迟保留最近 1,024 个样本；热点路径只尝试获取统计锁，竞争时跳过样本并累计 `droppedSamples`。排序、Go 运行时采样与状态计数都在后台执行，不增加行情或交易请求。
+- 记录规划、调整串行锁等待、限流、下单/撤单调用、订单回调与槽位锁等待。成交到反向提交使用本机回调入口时间，重复成交不重置；仅在所有门禁通过、持有原 submission lease 的真实提交边界结束计时。
+- `GET /api/performance` 复用面板鉴权，只读缓存；首次采样前返回 503 和 `ready:false`，其它方法返回 405。完整 HTTP/WS 快照增加 `performance` 字段，现有日志展示 P95 与样本数。
+- 堆、GC 与去重表计数用于观察增长趋势；不会回收成交去重键、改变槽位生命周期或缩短 submission lease。各指标的范围和解读限制见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 **典型操作流程**:
 ```go

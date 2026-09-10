@@ -15,6 +15,7 @@ import (
 	"opensqt/exchange"
 	"opensqt/logger"
 	"opensqt/safety"
+	"opensqt/telemetry"
 	"opensqt/utils"
 )
 
@@ -132,6 +133,9 @@ type OrderRequest struct {
 	// release 会一直持有对应槽位锁，调用方必须在该次接口调用返回后立即释放。
 	// 限流和重试等待期间不得持有 lease；同步重入同一槽位的订单回调也不受支持。
 	AcquireSubmissionLease func() (release func(), ok bool)
+	// OnSubmissionStarted 仅在所有门禁通过、持有 submission lease 时调用。
+	// 只记录性能样本；本地拒绝不消耗成交后的首次提交标记。
+	OnSubmissionStarted func()
 
 	// submissionUncertain 表示至少一次交易所请求已经发出，但最终结果无法确认。
 	// 这种 reservation 不能按普通失败释放，否则下一轮会换 ClientOrderID 重下。
@@ -265,6 +269,10 @@ type InventorySlot struct {
 	gapStackCount      int
 	stackedParentPrice float64
 
+	// 只读性能关联数据，受 mu 保护，不参与下单决策或槽位回收判断。
+	oppositeFillAt     time.Time
+	oppositeSubmitSide string
+
 	mu sync.RWMutex // 槽位级别的锁（细粒度锁）
 }
 
@@ -289,9 +297,10 @@ type IExchange interface {
 
 // SuperPositionManager 超级仓位管理器
 type SuperPositionManager struct {
-	config   *config.Config
-	executor OrderExecutorInterface
-	exchange IExchange
+	performance atomic.Pointer[telemetry.Recorder]
+	config      *config.Config
+	executor    OrderExecutorInterface
+	exchange    IExchange
 
 	// adjustmentNotifier 将订单流状态变化和失败 reservation 的重试期限
 	// 非阻塞地交给外部串行协调器。回调不得直接重入 SuperPositionManager；
@@ -650,6 +659,21 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 		}
 		return slot.mu.Unlock, true
 	}
+	if spm.performance.Load() != nil && !slot.oppositeFillAt.IsZero() && slot.oppositeSubmitSide == req.Side {
+		req.OnSubmissionStarted = func() {
+			// 执行器已经持有此槽位的 lease，不能在这里重复加锁。
+			if slot.oppositeSubmitSide != req.Side || slot.oppositeFillAt.IsZero() {
+				return
+			}
+			metric := telemetry.BuyFillToSellSubmit
+			if req.Side == "BUY" {
+				metric = telemetry.SellFillToBuySubmit
+			}
+			spm.performance.Load().ObserveSince(metric, slot.oppositeFillAt, false)
+			slot.oppositeFillAt = time.Time{}
+			slot.oppositeSubmitSide = ""
+		}
+	}
 }
 
 func (spm *SuperPositionManager) matchesReservationLocked(slot *InventorySlot, req *OrderRequest) bool {
@@ -938,11 +962,15 @@ func (spm *SuperPositionManager) placeInitialBuyOrders() error {
 }
 
 // AdjustOrders 调整订单（交易入口）
-func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
+func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr error) {
+	performance := spm.performance.Load()
+	started := performance.Start()
+	defer func() { performance.ObserveSince(telemetry.AdjustTotal, started, retErr != nil) }()
 	// 🔥 移除初始化检查：现在完全由 AdjustOrders 控制所有下单
 	// 初始化只负责恢复持仓状态，不再下单
 
 	spm.adjustMu.Lock()
+	performance.ObserveSince(telemetry.AdjustLockWait, started, false)
 	var adjustmentDeadlines []time.Time
 	defer func() {
 		spm.adjustMu.Unlock()
@@ -977,12 +1005,15 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 	// 更新最后市场价格（用于打印状态）
 	spm.lastMarketPrice.Store(currentPrice)
 
+	planningStarted := performance.Start()
+	performance.ObserveSince(telemetry.QuoteToPlanning, market.QuoteReceivedAt, false)
 	spm.mu.Lock()
 	planningLocked := true
 	unlockPlanning := func() {
 		if planningLocked {
 			spm.mu.Unlock()
 			planningLocked = false
+			performance.ObserveSince(telemetry.Planning, planningStarted, false)
 		}
 	}
 	defer unlockPlanning()
@@ -1911,6 +1942,9 @@ func (spm *SuperPositionManager) deleteSlotIfCurrentAndRecyclable(price float64,
 
 // OnOrderUpdate 订单更新回调（异步订单同步流）
 func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
+	performance := spm.performance.Load()
+	receivedAt := performance.Start()
+	defer performance.ObserveSince(telemetry.OrderUpdateTotal, receivedAt, false)
 	spm.orderUpdatesActive.Add(1)
 	spm.orderUpdateVersion.Add(1)
 	defer func() {
@@ -1931,7 +1965,9 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		return
 	}
 
+	lockStarted := performance.Start()
 	slot := spm.lockMappedSlot(price)
+	performance.ObserveSince(telemetry.OrderUpdateLockWait, lockStarted, false)
 	adjustmentNeeded := false
 	var adjustmentNotBefore time.Time
 	var releaseStackParent float64
@@ -2089,6 +2125,15 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		}
 
 		if update.Status == OrderStatusFilled {
+			if performance != nil && update.ExecutedQty > fillQtyTolerance {
+				slot.oppositeFillAt = time.Time{}
+				slot.oppositeSubmitSide = ""
+				if side == "BUY" && slot.PositionQty > fillQtyTolerance {
+					slot.oppositeFillAt, slot.oppositeSubmitSide = receivedAt, "SELL"
+				} else if side == "SELL" && slot.PositionQty <= fillQtyTolerance {
+					slot.oppositeFillAt, slot.oppositeSubmitSide = receivedAt, "BUY"
+				}
+			}
 			adjustmentNeeded = true
 			realizedPNL := 0.0
 			gridPNL := 0.0

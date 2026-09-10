@@ -19,18 +19,20 @@ import (
 	"opensqt/monitor"
 	"opensqt/position"
 	"opensqt/safety"
+	"opensqt/telemetry"
 )
 
 // Options 监控面板依赖（全部只读）
 type Options struct {
-	Cfg       *config.Config
-	Version   string
-	StartedAt time.Time
-	Price     *monitor.PriceMonitor
-	Position  *position.SuperPositionManager
-	Risk      *safety.RiskMonitor
-	Margin    *safety.MarginMonitor
-	Exchange  exchange.IExchange
+	Cfg         *config.Config
+	Version     string
+	StartedAt   time.Time
+	Price       *monitor.PriceMonitor
+	Position    *position.SuperPositionManager
+	Risk        *safety.RiskMonitor
+	Margin      *safety.MarginMonitor
+	Exchange    exchange.IExchange
+	Performance *telemetry.Recorder
 }
 
 // Server 本地只读监控 HTTP/WS 服务
@@ -121,6 +123,7 @@ func New(opt Options) *Server {
 		hub:          newHub(),
 		started:      started,
 		assembler: &assembler{
+			performance:  opt.Performance,
 			cfg:          opt.Cfg,
 			version:      opt.Version,
 			started:      started,
@@ -171,6 +174,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/snapshot", s.requireToken(s.handleSnapshot))
+	mux.HandleFunc("/api/performance", s.requireToken(s.handlePerformance))
 	mux.HandleFunc("/ws", s.requireToken(s.handleWS))
 
 	listenFunc := s.listenFunc
@@ -297,6 +301,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.assembler.Build())
+}
+
+func (s *Server) handlePerformance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	snapshot := s.assembler.performance.Snapshot()
+	status := http.StatusOK
+	if !snapshot.Ready {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, snapshot)
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
