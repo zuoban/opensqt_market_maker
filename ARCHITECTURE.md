@@ -428,6 +428,10 @@ CancelAllBuyOrders()
 - `GET /api/performance` 复用面板鉴权，只读缓存；首次采样前返回 503 和 `ready:false`，其它方法返回 405。完整 HTTP/WS 快照增加 `performance` 字段，现有日志展示 P95 与样本数。
 - 堆、GC 与去重表计数用于观察增长趋势；不会回收成交去重键、改变槽位生命周期或缩短 submission lease。各指标的范围和解读限制见 [PERFORMANCE.md](PERFORMANCE.md)。
 
+#### 成交持久化设计（尚未接入生产）
+
+`internal/fillledger/` 提供“精确成交身份与对应状态同事务提交”的独立 bbolt 原型，覆盖重启、重复消息、写入结果不确定、损坏与进程突然退出测试。当前交易仍使用原内存去重表；生产接入需要完整槽位恢复、存储健康门禁、历史补齐与迁移。设计、测试边界和验收条件见 [FILL_LEDGER_DESIGN.md](FILL_LEDGER_DESIGN.md)。
+
 **典型操作流程**:
 ```go
 // 下单前：

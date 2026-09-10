@@ -107,3 +107,5 @@ go test ./telemetry -run '^$' -bench '^(BenchmarkObserve|BenchmarkObserveSince|B
 `state` 只读取容器长度，不遍历槽位或执行对账，各计数分别一致但不是同一交易事务快照。`filledDedupKeys` 是成交去重表键数，当前按 ClientOrderID 优先、缺失时按订单 ID 生成一个键；`filledOrders` 是累计完成订单数。`terminalOrderKeys`、`pendingAbsenceKeys` 是对应缓存的当前条目数。
 
 建议先在正常运行中收集多个状态周期，优先确认下单调用、限流、回调锁等待和规划耗时的相对占比，再决定后续改动。成交去重键的长期增长问题仍需单独设计精确持久化方案。
+
+成交去重持久化的设计与故障验证现见 [FILL_LEDGER_DESIGN.md](FILL_LEDGER_DESIGN.md)。独立存储原型已验证去重标记与模型状态的原子提交，尚未替换生产内存表；后续仍须验证真实槽位恢复和磁盘同步开销。
