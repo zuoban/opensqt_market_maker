@@ -12,7 +12,11 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+
   build-and-push:
+    needs: checks
     runs-on: ubuntu-latest
     permissions:
       contents: read

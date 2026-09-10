@@ -292,12 +292,12 @@ TARGET_OS=MacOS TARGET_ARCH=arm64 ./scripts/package_release.sh
 
 本软件仅供学习和研究使用。加密货币交易具有极高风险，可能导致资金损失。
 - 使用本软件产生的任何盈亏由用户自行承担。
-- 请务必在实盘前使用测试网 (Testnet) 进行充分测试。
+- 当前发行版尚无 Testnet 切换配置，使用 Binance 生产环境；仅更换为测试网 Key 不会切换连接地址。离线测试可按仓库说明运行。
 - 开发者不对因软件错误、网络延迟或交易所故障导致的损失负责。
 
 This software is for educational and research purposes only. Cryptocurrency trading involves high risk.
 - Users are solely responsible for any profits or losses.
-- Always test thoroughly on Testnet before using real funds.
+- This release uses Binance production endpoints and does not provide a Testnet switch. Replacing API keys does not change the environment; use the repository test commands for offline validation.
 - The developers are not liable for losses due to software bugs, network latency, or exchange failures.
 
 ## 🤝 贡献 (Contributing)

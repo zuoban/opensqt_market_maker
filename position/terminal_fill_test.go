@@ -301,17 +301,17 @@ func TestTerminalCorrectionDoesNotMutateNewOrderBinding(t *testing.T) {
 	}
 }
 
-func TestTerminalOrderLedgerIsBounded(t *testing.T) {
+func TestTerminalOrderProgressRetainsCompleteHistory(t *testing.T) {
 	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
-	for i := 1; i <= maxTerminalOrders+1; i++ {
+	const count = formerTerminalHistoryLimit + 1
+	for i := 1; i <= count; i++ {
 		spm.storeTerminalOrderProgress(OrderUpdate{OrderID: int64(i)}, terminalOrderProgress{ExecutedQty: 1})
 	}
-	if len(spm.terminalOrders) != maxTerminalOrders || len(spm.terminalOrderKeys) != maxTerminalOrders {
-		t.Fatalf("terminal ledger size = map:%d keys:%d, want %d",
-			len(spm.terminalOrders), len(spm.terminalOrderKeys), maxTerminalOrders)
+	if len(spm.terminalOrders) != count {
+		t.Fatalf("terminal ledger size = %d, want %d", len(spm.terminalOrders), count)
 	}
-	if _, exists := spm.terminalOrders["order:1"]; exists {
-		t.Fatal("oldest terminal order was not evicted")
+	if got, exists := spm.getTerminalOrderProgress(OrderUpdate{OrderID: 1}); !exists || got.ExecutedQty != 1 {
+		t.Fatal("oldest terminal progress was lost")
 	}
 }
 

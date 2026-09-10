@@ -43,7 +43,7 @@ const (
 	hourlyFillHours          = 24
 	fillQtyTolerance         = 1e-12
 	buyWindowHysteresisSlots = 1
-	maxTerminalOrders        = 4096
+	maxRestoredPositionSlots = 100000
 	placementRetryCooldown   = time.Second
 	pendingLookupMinAge      = 5 * time.Second
 	pendingLookupInterval    = 500 * time.Millisecond
@@ -374,10 +374,10 @@ type SuperPositionManager struct {
 	filledOrderCount int64
 
 	// 终态订单的最后累计成交进度。槽位清空后，交易所仍可能重放终态或乱序成交推送；
-	// 按订单保留单调进度，避免同一成交被再次计入持仓、统计和盈亏。
-	terminalOrdersMu  sync.RWMutex
-	terminalOrders    map[string]terminalOrderProgress
-	terminalOrderKeys []string
+	// 本次运行保留完整单调进度，不按数量或时间淘汰；否则迟到重放会重复记账。
+	// 与全成交去重表一样，长期内存增长仍需后续持久化接入解决。
+	terminalOrdersMu sync.RWMutex
+	terminalOrders   map[string]terminalOrderProgress
 	// resolvedAbsentOrders 为连续权威“不存在”的 ClientOID 保留短暂缓冲。
 	// 撤买流程会等缓冲结束再宣布成功；迟到订单流事件会先移除此记录并接管槽位。
 	resolvedAbsentOrdersMu sync.Mutex
@@ -954,7 +954,9 @@ func (spm *SuperPositionManager) placeInitialBuyOrders() error {
 	if existingPosition > 0 {
 		logger.Info("🔄 [持仓恢复] 检测到现有持仓: %.4f，开仓均价: %s，开始初始化卖单槽位",
 			existingPosition, formatPrice(existingEntryPrice, spm.priceDecimals))
-		spm.initializeSellSlotsFromPosition(existingPosition, existingEntryPrice)
+		if err := spm.initializeSellSlotsFromPosition(existingPosition, existingEntryPrice); err != nil {
+			return fmt.Errorf("恢复持仓槽位失败: %w", err)
+		}
 	}
 
 	logger.Info("✅ [初始化] 槽位已创建，订单下达将由 AdjustOrders 统一处理")
@@ -2018,16 +2020,7 @@ func (spm *SuperPositionManager) storeTerminalOrderProgress(update OrderUpdate, 
 		return
 	}
 	spm.terminalOrdersMu.Lock()
-	_, exists := spm.terminalOrders[key]
 	spm.terminalOrders[key] = next
-	if !exists {
-		spm.terminalOrderKeys = append(spm.terminalOrderKeys, key)
-		if len(spm.terminalOrderKeys) > maxTerminalOrders {
-			oldest := spm.terminalOrderKeys[0]
-			spm.terminalOrderKeys = spm.terminalOrderKeys[1:]
-			delete(spm.terminalOrders, oldest)
-		}
-	}
 	spm.terminalOrdersMu.Unlock()
 }
 
@@ -2463,9 +2456,18 @@ func (spm *SuperPositionManager) getExistingPosition() (float64, float64) {
 }
 
 // initializeSellSlotsFromPosition 从现有持仓初始化卖单槽位（用于程序重启后恢复状态）
-func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, entryPrice float64) {
-	if totalPosition <= 0 {
-		return
+func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, entryPrice float64) error {
+	if totalPosition < 0 || math.IsNaN(totalPosition) || math.IsInf(totalPosition, 0) {
+		return fmt.Errorf("恢复持仓数量无效: %v", totalPosition)
+	}
+	if totalPosition == 0 {
+		return nil
+	}
+	if spm.anchorPrice <= 0 || math.IsNaN(spm.anchorPrice) || math.IsInf(spm.anchorPrice, 0) {
+		return fmt.Errorf("恢复持仓锚点无效: %v", spm.anchorPrice)
+	}
+	if err := ValidateGridPriceInterval(spm.config.Trading.PriceInterval, spm.priceTickSize); err != nil {
+		return err
 	}
 	if entryPrice <= 0 || math.IsNaN(entryPrice) || math.IsInf(entryPrice, 0) {
 		entryPrice = spm.anchorPrice
@@ -2473,15 +2475,21 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 			formatPrice(entryPrice, spm.priceDecimals))
 	}
 
-	// 1. 计算每单的理论数量（基于当前价格）
-	// 使用锚点价格作为参考价格，使用从交易所获取的数量精度
+	// 与正常买单使用相同的数量量化，防止小额网格四舍五入为零。
+	theoryQtyPerSlot := spm.gridBuyQuantity(spm.anchorPrice)
+	if theoryQtyPerSlot <= 0 {
+		return fmt.Errorf("无法按当前每格金额和数量精度恢复持仓")
+	}
 
-	// 每单的理论数量 = 目标金额 / 锚点价格
-	theoryQtyPerSlot := spm.config.Trading.OrderQuantity / spm.anchorPrice
-	theoryQtyPerSlot = roundPrice(theoryQtyPerSlot, spm.quantityDecimals)
-
-	// 2. 计算需要创建的总槽位数
-	totalSlotsNeeded := int(math.Ceil(totalPosition / theoryQtyPerSlot))
+	// 转整数和分配内存之前校验规模，异常读数必须拒绝启动而不能导致 OOM。
+	slotCount := math.Ceil(totalPosition / theoryQtyPerSlot)
+	if math.IsNaN(slotCount) || math.IsInf(slotCount, 0) || slotCount < 1 || slotCount > maxRestoredPositionSlots {
+		return fmt.Errorf("恢复槽位数 %v 超出范围 [1,%d]，请检查持仓和每格金额", slotCount, maxRestoredPositionSlots)
+	}
+	totalSlotsNeeded := int(slotCount)
+	if math.IsInf(totalPosition*entryPrice, 0) {
+		return fmt.Errorf("恢复持仓成本溢出")
+	}
 	logger.Info("🔄 [持仓恢复] 总持仓: %.4f，每单理论数量: %.4f，需要创建 %d 个槽位",
 		totalPosition, theoryQtyPerSlot, totalSlotsNeeded)
 
@@ -2503,10 +2511,18 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 	var totalTheoryQty float64
 	theoryQtys := make([]float64, len(sellPrices))
 	for i, price := range sellPrices {
-		theoryQty := spm.config.Trading.OrderQuantity / price
-		theoryQty = roundPrice(theoryQty, spm.quantityDecimals)
+		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) || (i > 0 && price <= sellPrices[i-1]) {
+			return fmt.Errorf("恢复槽位价格无效: %v", price)
+		}
+		theoryQty := spm.gridBuyQuantity(price)
+		if theoryQty <= 0 {
+			return fmt.Errorf("恢复槽位 %v 无法计算有效数量", price)
+		}
 		theoryQtys[i] = theoryQty
 		totalTheoryQty += theoryQty
+	}
+	if totalTheoryQty <= 0 || math.IsNaN(totalTheoryQty) || math.IsInf(totalTheoryQty, 0) {
+		return fmt.Errorf("恢复槽位理论总数量无效: %v", totalTheoryQty)
 	}
 
 	logger.Debug("🔍 [持仓恢复] 理论总数量: %.4f, 实际持仓: %.4f, 比例: %.4f",
@@ -2523,7 +2539,7 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 			slotQty = totalPosition - allocatedQty
 		} else {
 			// 按比例分配：实际数量 = 理论数量 × (总持仓 / 理论总数量)
-			slotQty = theoryQtys[i] * (totalPosition / totalTheoryQty)
+			slotQty = (theoryQtys[i] / totalTheoryQty) * totalPosition
 			slotQty = roundPrice(slotQty, spm.quantityDecimals)
 
 			// 确保不超过剩余持仓
@@ -2580,6 +2596,7 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 	// 8. 提示用户后续会自动下卖单
 	logger.Info("💡 [持仓恢复] 前 %d 个槽位的卖单将在价格调整时自动创建", sellWindowSize)
 	logger.Info("💡 [持仓恢复] 其余 %d 个槽位保持有仓状态，价格接近时自动挂单", totalSlotsNeeded-sellWindowSize)
+	return nil
 }
 
 // ===== 状态打印功能 =====
@@ -2604,7 +2621,7 @@ func (spm *SuperPositionManager) PrintPositions() {
 
 	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
-		if slot.PositionStatus == PositionStatusFilled && slot.PositionQty > 0.001 {
+		if hasVisiblePosition(slot.PositionQty) {
 			positions = append(positions, positionInfo{
 				Price:       price,
 				Qty:         slot.PositionQty,

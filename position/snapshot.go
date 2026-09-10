@@ -1,6 +1,7 @@
 package position
 
 import (
+	"math"
 	"slices"
 	"strconv"
 	"time"
@@ -125,6 +126,11 @@ func slotWaitStateLocked(slot *InventorySlot, now time.Time) string {
 	return SlotWaitStateEmpty
 }
 
+// 持仓展示与对账一样统计全部有效正数量，包含部分成交及一个最小数量步长。
+func hasVisiblePosition(quantity float64) bool {
+	return quantity > 0 && !math.IsNaN(quantity) && !math.IsInf(quantity, 0)
+}
+
 func snapshotSlotVisible(item SlotSnapshot, gridPriceText string) bool {
 	if item.InBuyWindow || item.InSellWindow {
 		return true
@@ -132,7 +138,7 @@ func snapshotSlotVisible(item SlotSnapshot, gridPriceText string) bool {
 	if gridPriceText != "" && item.PriceText == gridPriceText {
 		return true
 	}
-	if item.PositionStatus == PositionStatusFilled && item.PositionQty > 0.001 {
+	if hasVisiblePosition(item.PositionQty) {
 		return true
 	}
 	if isActiveOrderStatus(item.OrderStatus) || item.OrderStatus == OrderStatusCancelRequested {
@@ -286,7 +292,7 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		item.PositionQtyText = strconv.FormatFloat(item.PositionQty, 'f', snap.QuantityDecimals, 64)
 		item.InBuyWindow = buyWindow[item.PriceText]
 		item.InSellWindow = sellWindow[item.PriceText]
-		if item.PositionStatus == PositionStatusFilled && item.PositionQty > 0.001 {
+		if hasVisiblePosition(item.PositionQty) {
 			snap.FilledSlotCount++
 			snap.PositionQty += item.PositionQty
 		}

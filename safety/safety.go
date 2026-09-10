@@ -58,11 +58,9 @@ func CheckAccountSafety(ex exchange.IExchange, symbol string, currentPrice, orde
 		logger.Info("ℹ️ 从账户信息中获取杠杆倍数: %dx", leverage)
 	}
 
-	// 🔥 如果当前账户有持仓，跳过安全检查（认为用户知道风险）
+	// 重启仍会新增买单；已有持仓不能豁免杠杆、资金容量或手续费检查。
 	if positionAmt != 0 {
-		logger.Info("⚠️ 检测到当前持仓: %.4f，跳过安全性检查", positionAmt)
-		logger.Info("🔒 ===== 持仓安全性检查完成（已跳过） =====")
-		return nil
+		logger.Info("ℹ️ 检测到当前持仓: %.4f，继续验证新增订单安全条件", positionAmt)
 	}
 	accountBalance := account.AvailableBalance
 	if accountBalance <= 0 {

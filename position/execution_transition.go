@@ -42,13 +42,13 @@ func reduceOrderExecution(before orderSlotState, update OrderUpdate, side string
 			return next, effect, deltaQty, executionOK
 		}
 		effect.RealizedPNL = update.RealizedPNL
-		effect.PNLFromExchange = effect.RealizedPNL != 0
+		effect.PNLFromExchange = true
 	} else if hasCumulativePNL {
 		effect.RealizedPNL = update.RealizedPNL - next.OrderAccumulatedPNL
 		next.OrderReportedPNL = update.RealizedPNL
 		effect.PNLFromExchange = true
 	}
-	if effect.RealizedPNL == 0 && deltaQty > 0 && !hasCumulativePNL {
+	if !update.RealizedPNLIncremental && deltaQty > 0 && !hasCumulativePNL {
 		effect.RealizedPNL = fallbackRealizedPNL(update, deltaQty, next.Price)
 	}
 	next.OrderAccumulatedPNL += effect.RealizedPNL
@@ -91,13 +91,13 @@ func reduceTerminalCorrection(before orderSlotState, update OrderUpdate, side st
 		}
 		if update.RealizedPNLIncremental {
 			effect.RealizedPNL = update.RealizedPNL
-			effect.PNLFromExchange = effect.RealizedPNL != 0
+			effect.PNLFromExchange = true
 		} else if update.RealizedPNL != 0 {
 			effect.RealizedPNL = update.RealizedPNL - progress.AccountedPNL
 			progress.ReportedPNL = update.RealizedPNL
 			effect.PNLFromExchange = true
 		}
-		if effect.RealizedPNL == 0 && deltaQty > 0 && !hasCumulativePNL {
+		if !update.RealizedPNLIncremental && deltaQty > 0 && !hasCumulativePNL {
 			effect.RealizedPNL = fallbackRealizedPNL(update, deltaQty, slotPrice)
 		}
 		progress.AccountedPNL += effect.RealizedPNL

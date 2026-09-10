@@ -12,11 +12,14 @@
 
 1. 修改 [main.go](main.go#L21) 中的版本号。
 2. 如有必要，同步更新 [ARCHITECTURE.md](ARCHITECTURE.md) 中的版本说明。
-3. 验证模块和编译：
+3. 验证模块、编译和回归测试：
 
 ```bash
 go mod verify
 go build ./...
+go vet ./...
+go test -race ./... -count=1
+node --test web/app_frontend_test.js
 ```
 
 4. 提交代码并推送到主分支。
@@ -30,6 +33,7 @@ git push origin v3.4.3
 
 6. 推送标签后，GitHub Actions 会自动：
 
+- Release 与 Docker 工作流先通过共用的 Checks（依赖校验、静态检查、并发回归、前端测试），失败时不发布
 - 校验 [main.go](main.go#L21) 的版本号和 tag 一致
 - 构建 Linux amd64、Windows amd64、MacOS arm64 三个平台附件
 - 自动创建或更新 GitHub Release
