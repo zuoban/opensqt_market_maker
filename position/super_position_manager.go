@@ -317,10 +317,15 @@ type SuperPositionManager struct {
 	slotIndex slotPriceIndex
 
 	// 最近一次完成规划的网格价与现价。同格抖动可 skip；现价越过买单安全垫或 maker 下界时不能 skip。
-	lastAdjustedGridPrice    atomic.Value // float64
-	lastAdjustedPrice        atomic.Value // float64
-	lastAdjustedQuoteVersion atomic.Uint64
-	lastAdjustedStreamEpoch  atomic.Uint64
+	lastAdjustedGridPrice atomic.Value // float64
+	lastAdjustedPrice     atomic.Value // float64
+	lastAdjustedMarket    atomic.Pointer[exchange.MarketSnapshot]
+	quoteRetryPending     atomic.Bool
+
+	// 规划期之外只有订单更新会新增/改写远端卖价。版本和在途计数让同一轮
+	// 规划复用占价扫描；回调正在修改或已经修改时仍执行完整复查。
+	orderUpdateVersion atomic.Uint64
+	orderUpdatesActive atomic.Int64
 
 	makerAttempts    atomic.Uint64
 	makerAccepted    atomic.Uint64
@@ -866,6 +871,9 @@ func (spm *SuperPositionManager) releaseFailedReservation(req *OrderRequest) tim
 		default:
 			slot.makerRetryQuoteVersion = 0
 		}
+		if slot.makerRetryQuoteVersion != 0 {
+			spm.quoteRetryPending.Store(true)
+		}
 		retryAt = time.Now().Add(retryDelay)
 		slot.placementRetryNotBefore = retryAt
 		logger.Debug("🔓 [释放槽位] 明确未提交，释放槽位 %s 的 reservation (ClientOID: %s)",
@@ -1046,9 +1054,12 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		}
 	}
 	var outOfWindowBuys []outOfWindowBuy
+	occupiedVersion := spm.orderUpdateVersion.Load()
+	quoteRetryPending := false
 
 	spm.forEachSlot(func(slotPrice float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
+		quoteRetryPending = quoteRetryPending || slot.makerRetryQuoteVersion != 0
 		if orderMayExistLocked(slot) {
 			currentOrderCount++
 			if slot.OrderSide == "BUY" {
@@ -1096,6 +1107,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		}
 		return true
 	})
+	spm.quoteRetryPending.Store(quoteRetryPending)
 	if spm.afterSellCandidateScan != nil {
 		spm.afterSellCandidateScan()
 	}
@@ -1152,7 +1164,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 			candidate := sellCandidates[i]
 			// 订单流不受 spm.mu 阻塞，候选收集后可能又绑定新的
 			// 远端 SELL。每次分配前合并最新占价，将快照窗口压缩到最小。
-			spm.collectOccupiedSellPriceTicks(occupiedSellPriceTicks)
+			spm.refreshOccupiedSellPriceTicks(occupiedSellPriceTicks, &occupiedVersion)
 			var sellPrice float64
 			var sellPriceTick int64
 			var ok bool
@@ -1404,7 +1416,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) error {
 		adjustmentDeadlines = append(adjustmentDeadlines, time.Time{})
 		logger.Warn("⚠️ [窗口撤买] 仍有离开买单窗口的挂单未能提交撤销，清除同格跳过指纹")
 	} else {
-		spm.storeAdjustFingerprint(currentGridPrice, currentPrice)
+		spm.storeAdjustMarketFingerprint(currentGridPrice, currentPrice, market)
 	}
 	unlockPlanning()
 
@@ -1668,9 +1680,16 @@ func (spm *SuperPositionManager) ShouldSkipUnchangedGrid(currentPrice float64) b
 		return false
 	}
 	market := spm.marketSnapshot(currentPrice)
-	if market.Ready && (market.StreamEpoch != spm.lastAdjustedStreamEpoch.Load() ||
-		market.QuoteVersion != spm.lastAdjustedQuoteVersion.Load()) {
-		return false
+	if lastMarket := spm.lastAdjustedMarket.Load(); lastMarket != nil {
+		if market.Ready != lastMarket.Ready || market.StreamEpoch != lastMarket.StreamEpoch ||
+			market.BestBid != lastMarket.BestBid || market.BestAsk != lastMarket.BestAsk {
+			return false
+		}
+		// 数量变化也会推进交易所的 QuoteVersion，但不会改变 Maker 价格边界。
+		// 只有仍有等待新 quote 的拒单时才为相同 bid/ask 重新规划。
+		if market.QuoteVersion != lastMarket.QuoteVersion && spm.quoteRetryPending.Load() {
+			return false
+		}
 	}
 	currentPrice = roundPrice(currentPrice, spm.priceDecimals)
 	if spm.findNearestGridPrice(currentPrice) != lastGrid {
@@ -1684,18 +1703,19 @@ func (spm *SuperPositionManager) ShouldSkipUnchangedGrid(currentPrice float64) b
 }
 
 func (spm *SuperPositionManager) storeAdjustFingerprint(gridPrice, currentPrice float64) {
+	spm.storeAdjustMarketFingerprint(gridPrice, currentPrice, spm.marketSnapshot(currentPrice))
+}
+
+func (spm *SuperPositionManager) storeAdjustMarketFingerprint(gridPrice, currentPrice float64, market exchange.MarketSnapshot) {
 	spm.lastAdjustedGridPrice.Store(gridPrice)
 	spm.lastAdjustedPrice.Store(currentPrice)
-	market := spm.marketSnapshot(currentPrice)
-	spm.lastAdjustedStreamEpoch.Store(market.StreamEpoch)
-	spm.lastAdjustedQuoteVersion.Store(market.QuoteVersion)
+	spm.lastAdjustedMarket.Store(&market)
 }
 
 func (spm *SuperPositionManager) clearAdjustFingerprint() {
 	spm.lastAdjustedGridPrice.Store(0.0)
 	spm.lastAdjustedPrice.Store(0.0)
-	spm.lastAdjustedStreamEpoch.Store(0)
-	spm.lastAdjustedQuoteVersion.Store(0)
+	spm.lastAdjustedMarket.Store(nil)
 }
 
 func (spm *SuperPositionManager) sameGridPlacementBoundsUnchanged(lastPrice, currentPrice float64) bool {
@@ -1891,6 +1911,13 @@ func (spm *SuperPositionManager) deleteSlotIfCurrentAndRecyclable(price float64,
 
 // OnOrderUpdate 订单更新回调（异步订单同步流）
 func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
+	spm.orderUpdatesActive.Add(1)
+	spm.orderUpdateVersion.Add(1)
+	defer func() {
+		// 先发布版本、再结束在途状态，避免规划漏掉已写入的槽位变化。
+		spm.orderUpdateVersion.Add(1)
+		spm.orderUpdatesActive.Add(-1)
+	}()
 	// 🔥 重构：完全依赖 ClientOrderID 解析
 	// 订单流和 REST 回包对返佣前缀的保留方式可能不同。进入任何去重、终态
 	// 进度或槽位身份判断前统一成程序自己的 ClientOrderID，避免同一订单被当成
@@ -3295,8 +3322,20 @@ func orderMayExistLocked(slot *InventorySlot) bool {
 		(slot.OrderID != 0 || slot.ClientOID != "")
 }
 
-// collectOccupiedSellPriceTicks 把当前所有可能仍在远端的 SELL 价格
-// 合并到 occupied。不删除已有键：本轮刚创建的 reservation 也必须保留。
+// refreshOccupiedSellPriceTicks 在本轮规划观察到并发订单更新时复查占价。
+func (spm *SuperPositionManager) refreshOccupiedSellPriceTicks(occupied map[int64]struct{}, version *uint64) {
+	current := spm.orderUpdateVersion.Load()
+	if spm.orderUpdatesActive.Load() == 0 && current == *version &&
+		spm.orderUpdateVersion.Load() == current {
+		return
+	}
+	// 记录扫描前的版本；扫描期间有新事件完成时，下一候选仍会重新扫描。
+	*version = current
+	spm.collectOccupiedSellPriceTicks(occupied)
+}
+
+// collectOccupiedSellPriceTicks 只合并、不删除已有键：本轮新建的 reservation
+// 以及 CANCEL_REQUESTED/UNKNOWN 仍必须保留占价。
 func (spm *SuperPositionManager) collectOccupiedSellPriceTicks(occupied map[int64]struct{}) {
 	if spm == nil || occupied == nil {
 		return

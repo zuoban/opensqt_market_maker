@@ -41,6 +41,30 @@ func testConfig() *config.Config {
 	return cfg
 }
 
+func TestSnapshotPreservesDisplayPrecisionAndDescendingPrices(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
+	spm.anchorPrice = 100
+	spm.lastMarketPrice.Store(100.0)
+	prices := []float64{1.005, 100.125, 0.01, 99.995}
+	for i, price := range prices {
+		slot := spm.getOrCreateSlot(price)
+		slot.OrderID = int64(i + 1) // Keep every slot visible, including zero quantity.
+		slot.PositionQty = float64(i) * 0.0015
+	}
+	snap := spm.Snapshot()
+	if len(snap.Slots) != len(prices) {
+		t.Fatalf("snapshot slots = %d, want %d", len(snap.Slots), len(prices))
+	}
+	for i, slot := range snap.Slots {
+		if slot.PriceText != formatPrice(slot.Price, 2) || slot.PositionQtyText != formatPrice(slot.PositionQty, 3) {
+			t.Fatalf("snapshot changed numeric display precision: %+v", slot)
+		}
+		if i > 0 && slot.Price >= snap.Slots[i-1].Price {
+			t.Fatal("snapshot slots are not in descending price order")
+		}
+	}
+}
+
 func TestSnapshotCountsAndProfit(t *testing.T) {
 	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
 	spm.anchorPrice = 100

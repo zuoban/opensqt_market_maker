@@ -82,7 +82,12 @@ func (c *PositionCache) refresh() {
 	if c == nil || c.src == nil {
 		return
 	}
-	snapshot := clonePositionSnapshot(c.src.Snapshot())
+	snapshot := c.src.Snapshot()
+	if _, owned := c.src.(*position.SuperPositionManager); !owned {
+		// SuperPositionManager.Snapshot 已经返回独占切片；其它来源可能复用
+		// 自己的缓冲区，仍复制以维持缓存的不可变约定。
+		snapshot = clonePositionSnapshot(snapshot)
+	}
 	c.latest.Store(&positionCacheEntry{
 		snapshot:  snapshot,
 		updatedAt: time.Now(),
@@ -91,6 +96,13 @@ func (c *PositionCache) refresh() {
 
 // View 返回不会与缓存共享可变切片的仓位快照副本。
 func (c *PositionCache) View() (position.PositionSnapshot, time.Time, bool) {
+	snapshot, updatedAt, ready := c.viewReadOnly()
+	return clonePositionSnapshot(snapshot), updatedAt, ready
+}
+
+// viewReadOnly 仅供本包的快照组装/序列化读取。缓存每次刷新发布新切片，
+// 因此旧视图在异步写出期间仍然有效；调用方不得修改任何切片元素。
+func (c *PositionCache) viewReadOnly() (position.PositionSnapshot, time.Time, bool) {
 	if c == nil {
 		return position.PositionSnapshot{}, time.Time{}, false
 	}
@@ -98,7 +110,7 @@ func (c *PositionCache) View() (position.PositionSnapshot, time.Time, bool) {
 	if entry == nil {
 		return position.PositionSnapshot{}, time.Time{}, false
 	}
-	return clonePositionSnapshot(entry.snapshot), entry.updatedAt, true
+	return entry.snapshot, entry.updatedAt, true
 }
 
 func clonePositionSnapshot(src position.PositionSnapshot) position.PositionSnapshot {

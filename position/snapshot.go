@@ -1,7 +1,8 @@
 package position
 
 import (
-	"sort"
+	"slices"
+	"strconv"
 	"time"
 )
 
@@ -124,11 +125,11 @@ func slotWaitStateLocked(slot *InventorySlot, now time.Time) string {
 	return SlotWaitStateEmpty
 }
 
-func snapshotSlotVisible(item SlotSnapshot, gridPrice float64, priceDecimals int) bool {
+func snapshotSlotVisible(item SlotSnapshot, gridPriceText string) bool {
 	if item.InBuyWindow || item.InSellWindow {
 		return true
 	}
-	if gridPrice > 0 && item.PriceText == formatPrice(gridPrice, priceDecimals) {
+	if gridPriceText != "" && item.PriceText == gridPriceText {
 		return true
 	}
 	if item.PositionStatus == PositionStatusFilled && item.PositionQty > 0.001 {
@@ -242,16 +243,19 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		}
 	}
 
-	slots := make([]SlotSnapshot, 0, 32)
+	gridPriceText := ""
+	if snap.GridPrice > 0 {
+		gridPriceText = strconv.FormatFloat(snap.GridPrice, 'f', snap.PriceDecimals, 64)
+	}
+	// 价格索引本来就是升序；一次预分配后逆序即可，无需增长切片再排序。
+	slots := make([]SlotSnapshot, 0, len(spm.slotIndex.snapshot()))
 	spm.forEachSlot(func(price float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
 		waitState := slotWaitStateLocked(slot, now)
 		item := SlotSnapshot{
 			Price:                      price,
-			PriceText:                  formatPrice(price, snap.PriceDecimals),
 			PositionStatus:             slot.PositionStatus,
 			PositionQty:                slot.PositionQty,
-			PositionQtyText:            formatPrice(slot.PositionQty, snap.QuantityDecimals),
 			OrderID:                    slot.OrderID,
 			ClientOID:                  slot.ClientOID,
 			OrderSide:                  slot.OrderSide,
@@ -277,6 +281,9 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		}
 		slot.mu.RUnlock()
 
+		// 展示格式化放在槽位锁外，避免阻塞订单回调。
+		item.PriceText = strconv.FormatFloat(price, 'f', snap.PriceDecimals, 64)
+		item.PositionQtyText = strconv.FormatFloat(item.PositionQty, 'f', snap.QuantityDecimals, 64)
 		item.InBuyWindow = buyWindow[item.PriceText]
 		item.InSellWindow = sellWindow[item.PriceText]
 		if item.PositionStatus == PositionStatusFilled && item.PositionQty > 0.001 {
@@ -304,15 +311,13 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		case SlotWaitStateLockedInconsistent:
 			snap.InconsistentSlotCount++
 		}
-		if snapshotSlotVisible(item, snap.GridPrice, snap.PriceDecimals) {
+		if snapshotSlotVisible(item, gridPriceText) {
 			slots = append(slots, item)
 		}
 		return true
 	})
 
-	sort.Slice(slots, func(i, j int) bool {
-		return slots[i].Price > slots[j].Price
-	})
+	slices.Reverse(slots)
 	snap.Slots = slots
 	snap.OrderCapacityRemaining = snap.OrderCapacityLimit - snap.OrderCapacityUsed
 	if snap.OrderCapacityRemaining < 0 {

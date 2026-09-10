@@ -102,7 +102,7 @@ func (a *assembler) Build() *Snapshot {
 		snap.ExchangeRate = a.exchangeRate.View()
 	}
 	if a.position != nil {
-		snap.Position, snap.PositionUpdatedAt, snap.PositionReady = a.position.View()
+		snap.Position, snap.PositionUpdatedAt, snap.PositionReady = a.position.viewReadOnly()
 		if snap.PositionReady {
 			snap.PositionAgeMs = now.Sub(snap.PositionUpdatedAt).Milliseconds()
 			if snap.PositionAgeMs < 0 {

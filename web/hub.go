@@ -1,12 +1,34 @@
 package web
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"opensqt/logger"
 )
+
+// 同一轮广播只编码一次；PreparedMessage 可被多个连接并发写出。
+// 编码留在 writer 中按需执行，广播方不承担慢连接或大快照的写出工作。
+type sharedWSMessage struct {
+	value    interface{}
+	once     sync.Once
+	prepared *websocket.PreparedMessage
+	err      error
+}
+
+func (m *sharedWSMessage) prepare() (*websocket.PreparedMessage, error) {
+	m.once.Do(func() {
+		payload, err := json.Marshal(m.value)
+		if err != nil {
+			m.err = err
+			return
+		}
+		m.prepared, m.err = websocket.NewPreparedMessage(websocket.TextMessage, payload)
+	})
+	return m.prepared, m.err
+}
 
 const (
 	dashboardWSWriteWait  = 2 * time.Second
@@ -126,6 +148,19 @@ func (c *wsClient) writeJSON(v interface{}) error {
 	if err := c.conn.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
+	if shared, ok := v.(*sharedWSMessage); ok {
+		if writer, ok := c.conn.(interface {
+			WritePreparedMessage(*websocket.PreparedMessage) error
+		}); ok {
+			prepared, err := shared.prepare()
+			if err != nil {
+				return err
+			}
+			return writer.WritePreparedMessage(prepared)
+		}
+		// 保留最小连接接口，测试和兼容连接仍可直接写 JSON。
+		v = shared.value
+	}
 	return c.conn.WriteJSON(v)
 }
 
@@ -227,8 +262,9 @@ func (h *hub) broadcast(msg interface{}) {
 		clients = append(clients, c)
 	}
 	h.mu.RUnlock()
+	shared := &sharedWSMessage{value: msg}
 	for _, c := range clients {
-		c.enqueue(msg)
+		c.enqueue(shared)
 	}
 }
 
