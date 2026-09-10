@@ -233,10 +233,10 @@ main.go 回调函数
 position.OrderUpdate
     ↓
 SuperPositionManager.OnOrderUpdate()
-    ├── 匹配槽位（严格通过 ClientOrderID）
-    ├── 更新槽位状态
-    ├── FILLED → 释放槽位，下一次 AdjustOrders 创建对向单
-    └── CANCELED → 重置槽位
+    ├── 规范化 ClientOrderID，在映射槽位锁内读取状态与去重进度
+    ├── reduceOrderUpdate → 计算新状态、统计增量与通知意图
+    ├── 同一槽位锁内发布到内存；全成交和终态进度仍在内存去重
+    └── 解锁后通知调整：FILLED 创建对向单，撤销/拒绝按剩余持仓重挂
 ```
 
 ### 交易逻辑流
@@ -402,6 +402,14 @@ CancelAllBuyOrders()
 1. **全局锁**: `mu sync.RWMutex`（保护 slots Map）
 2. **槽位锁**: `slot.mu sync.RWMutex`（保护单个槽位）
 3. **槽位状态**: `SlotStatus` 防止重复操作
+4. **累计统计**: `pnlMu sync.Mutex` 串行累加买入量、卖出量和已实现盈亏；读取仍使用原子值，避免不同槽位的增量相互覆盖。
+
+#### 订单更新的计算与发布
+
+- `order_transition.go` 的 `reduceOrderUpdate` 接收槽位值副本、订单更新、已完成/终态进度、配置和时间，返回新槽位状态、会计增量、成交记录及补单/跳格释放意图。计算过程不访问管理器、锁、时钟或外部回调。
+- `execution_transition.go` 统一部分成交、全成交及迟到终态的累计数量/金额、真实成本与盈亏补差计算。旧终态修正只更新库存和旧订单进度，保留当前绑定的新订单身份与记账字段；已接受的 REST 订单撤销路径复用同一成交算术。
+- `order_transition_apply.go` 在读取时持有的同一映射槽位锁内发布结果，累计统计按增量合并。槽位解锁后才释放跳格子槽并通知协调器，保留原 submission lease 和订单身份复检约束。
+- 值副本只包含本次回调需要的字段，不复制 `InventorySlot` 的锁，也不覆盖其它 Maker、创建时间或跳格父槽元数据。它不是完整持久化模式；当前仍直接发布到内存，去重表持续增长问题尚未解决。
 
 #### 卖价唯一性
 

@@ -363,7 +363,7 @@ type SuperPositionManager struct {
 	realizedPNL       atomic.Value // float64 - 卖单成交累计已实现盈亏
 	reconcileCount    atomic.Int64 // 对账次数
 	lastReconcileTime atomic.Value // time.Time - 最后对账时间
-	pnlMu             sync.Mutex   // 保护 realizedPNL 累加
+	pnlMu             sync.Mutex   // 保护累计买入量、卖出量和 realizedPNL 的增量发布
 
 	// 本次运行期间的成交订单：列表面板只保留最近 maxRecentFilledOrders 笔，
 	// 小时汇总单独累计近 hourlyFillHours 小时，避免列表截断影响图表。
@@ -1952,289 +1952,44 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 		spm.orderUpdateVersion.Add(1)
 		spm.orderUpdatesActive.Add(-1)
 	}()
-	// 🔥 重构：完全依赖 ClientOrderID 解析
-	// 订单流和 REST 回包对返佣前缀的保留方式可能不同。进入任何去重、终态
-	// 进度或槽位身份判断前统一成程序自己的 ClientOrderID，避免同一订单被当成
-	// 两个身份，也让 UNKNOWN reservation 能被订单流权威收敛。
+	// 订单流与 REST 回包的经纪商前缀可能不同；去重和槽位匹配前统一身份。
 	update.ClientOrderID = spm.canonicalClientOrderID(update.ClientOrderID)
 	spm.forgetResolvedAbsentOrder(update.ClientOrderID)
 	price, side, valid := spm.parseClientOrderID(update.ClientOrderID)
-
 	if !valid {
 		logger.Debug("⏳ [忽略] 无法识别的订单更新: ID=%d, ClientOID=%s", update.OrderID, update.ClientOrderID)
 		return
 	}
-
 	lockStarted := performance.Start()
 	slot := spm.lockMappedSlot(price)
 	performance.ObserveSince(telemetry.OrderUpdateLockWait, lockStarted, false)
-	adjustmentNeeded := false
-	var adjustmentNotBefore time.Time
-	var releaseStackParent float64
-	var releaseStackCount int
+	var transition orderTransition
 	defer func() {
-		// 通知必须发生在槽位解锁之后；协调器收到通知后可能立即调用
-		// AdjustOrders，并再次获取当前槽位锁。
+		// 协调器可能立即重入 AdjustOrders；释放槽位锁后才能通知补单。
 		slot.mu.Unlock()
-		if releaseStackCount > 1 {
-			spm.releaseGapStackChildren(releaseStackParent, releaseStackCount)
+		if transition.ReleaseStackCount > 1 {
+			spm.releaseGapStackChildren(price, transition.ReleaseStackCount)
 		}
-		if adjustmentNeeded {
+		if transition.Adjust {
 			delay := time.Duration(0)
-			if !adjustmentNotBefore.IsZero() {
-				delay = time.Until(adjustmentNotBefore)
+			if !transition.AdjustmentNotBefore.IsZero() {
+				delay = time.Until(transition.AdjustmentNotBefore)
 			}
 			spm.notifyAdjustment(delay)
 		}
 	}()
 
-	// 完成成交后槽位会清空订单字段；该订单的任何后续重放都必须忽略，
-	// 否则迟到的 PARTIALLY_FILLED/终态推送会重新绑定槽位并重复累计。
-	if spm.wasFilledOrderRecorded(update) {
-		logger.Debug("⏭️ [已完成订单更新被忽略] ID=%d, ClientOID=%s, Status=%s",
-			update.OrderID, update.ClientOrderID, update.Status)
-		return
+	in := spm.orderUpdateFacts(update, side, price, time.Now())
+	in.CanonicalSlotClientOID = spm.canonicalClientOrderID(slot.ClientOID)
+	in.AlreadyFilled = spm.wasFilledOrderRecorded(update)
+	if !in.AlreadyFilled {
+		in.Terminal, in.TerminalSeen = spm.getTerminalOrderProgress(update)
 	}
-
-	terminalStatus := isTerminalOrderStatus(update.Status)
-	terminalProgress, terminalSeen := spm.getTerminalOrderProgress(update)
-	if terminalSeen {
-		if !terminalStatus {
-			logger.Debug("⏭️ [忽略终态后的乱序推送] ID=%d, ClientOID=%s, Status=%s",
-				update.OrderID, update.ClientOrderID, update.Status)
-			return
-		}
-		adjustmentNeeded = spm.applyTerminalOrderCorrection(slot, update, side, price, terminalProgress)
-		if adjustmentNeeded {
-			// 首次 REJECTED 可能已经给同方向重试设置冷却。若权威修正
-			// 证明下一单方向已经反转，不能让旧冷却阻塞止盈卖单或新买单。
-			if (side == "BUY" && slot.PositionQty > 0) ||
-				(side == "SELL" && slot.PositionQty <= 0) {
-				slot.placementRetryNotBefore = time.Time{}
-			}
-		}
-		return
-	}
-
-	// 校验：确保这个更新属于当前的订单 (防止旧订单的延迟推送干扰新订单)
-	// 已记录终态的旧订单在上方走独立修正路径，不会重新绑定或清理当前订单。
-	// 优先使用 ClientOrderID 匹配，避免延迟推送里的旧 OrderID 干扰当前订单。
-	if slot.ClientOID != "" &&
-		spm.canonicalClientOrderID(slot.ClientOID) != update.ClientOrderID {
-		// ClientOrderID 不匹配，忽略此更新
-		logger.Info("⚠️ [订单更新被忽略] 槽位 %.2f: ClientOID不匹配 (槽位: %s, 推送: %s, OrderID: %d)",
-			price, slot.ClientOID, update.ClientOrderID, update.OrderID)
-		return
-	}
-	// 匹配的订单流事件本身就是权威存在证据；清除此前的“不存在”读数。
-	slot.pendingLookupMisses = 0
-	slot.pendingLastLookup = time.Time{}
-
-	// 更新订单ID (如果是首个推送)
-	if slot.OrderID == 0 {
-		logger.Debug("📝 [首次设置OrderID] 槽位 %.2f: OrderID=%d, ClientOID=%s", price, update.OrderID, update.ClientOrderID)
-		slot.OrderID = update.OrderID
-		slot.ClientOID = update.ClientOrderID
-		slot.OrderSide = side
-	} else if slot.OrderID != update.OrderID {
-		// OrderID 不一致但 ClientOrderID 匹配时，以订单流返回的 OrderID 为准。
-		logger.Debug("📝 [更新OrderID] 槽位 %.2f: %d -> %d (ClientOID: %s)", price, slot.OrderID, update.OrderID, update.ClientOrderID)
-		slot.OrderID = update.OrderID
-	}
-	// 订单流可能在 REST 回包或本地对账前首先看到远端订单。
-	// 此时也要补齐身份、价格和数量，否则占价扫描无法识别它。
-	if slot.ClientOID == "" {
-		slot.ClientOID = update.ClientOrderID
-	}
-	if slot.OrderSide == "" {
-		slot.OrderSide = side
-	}
-	if update.Price > 0 && !math.IsNaN(update.Price) && !math.IsInf(update.Price, 0) {
-		slot.OrderPrice = update.Price
-	}
-	if update.Quantity > 0 && !math.IsNaN(update.Quantity) && !math.IsInf(update.Quantity, 0) {
-		slot.OrderQuantity = update.Quantity
-	}
-	// REST 回包未知或订单流先到时，匹配的交易所事件就是 reservation 已被接受的
-	// 权威证据。即使本地 reservation 还没有建立，非终态远端订单也必须
-	// 立即锁定槽位，避免下一轮新 reservation 覆盖它。
-	if spm.canonicalClientOrderID(slot.ClientOID) == spm.canonicalClientOrderID(update.ClientOrderID) &&
-		slot.OrderSide == side &&
-		!isTerminalOrderStatus(update.Status) && update.Status != OrderStatusFilled {
-		slot.SlotStatus = SlotStatusLocked
-	}
-
-	// 处理状态转换
-	switch update.Status {
-	case "NEW":
-		if slot.OrderStatus != OrderStatusCancelRequested {
-			slot.OrderStatus = OrderStatusConfirmed
-		}
-
-	case "PARTIALLY_FILLED", "FILLED":
-		orderPrice := slot.OrderPrice
-		_, stale := spm.applyOrderExecutionDelta(slot, update, side, price)
-		if stale {
-			return
-		}
-
-		if side == "BUY" {
-			if update.Status == "FILLED" {
-				slot.OrderStatus = OrderStatusNotPlaced // 重置订单状态
-				slot.OrderID = 0
-				slot.ClientOID = ""
-				slot.OrderSide = "" // 🔥 清除订单方向，避免误判
-				slot.OrderQuantity = 0
-				slot.OrderFilledQty = 0
-
-				slot.PositionStatus = PositionStatusFilled // 标记为有仓
-				// 🔥 释放槽位锁：买单成交，允许后续挂卖单
-				slot.SlotStatus = SlotStatusFree
-				// 买单成交，重置撤销/拒绝诊断计数
-				slot.PostOnlyFailCount = 0
-				logger.Info("✅ [买单成交] 价格: %s, 持仓: %.4f, 槽位状态: %s -> %s, 订单状态: %s -> %s, SlotStatus: FREE",
-					formatPrice(price, spm.priceDecimals), slot.PositionQty,
-					PositionStatusEmpty, PositionStatusFilled,
-					"FILLED", OrderStatusNotPlaced)
-				logger.Debug("🔍 [买单成交后] 等待下次AdjustOrders调用时挂出卖单...")
-			} else {
-				slot.OrderStatus = OrderStatusPartiallyFilled
-			}
-
-		} else { // SELL
-			if update.Status == "FILLED" {
-				slot.OrderStatus = OrderStatusNotPlaced // 重置订单状态
-				slot.OrderID = 0
-				slot.ClientOID = ""
-				slot.OrderSide = "" // 🔥 清除订单方向，避免误判
-				slot.OrderQuantity = 0
-				slot.OrderFilledQty = 0
-
-				if slot.PositionQty < 0.000001 {
-					slot.PositionStatus = PositionStatusEmpty // 标记为空仓
-				}
-				// 🔥 释放槽位锁：卖单成交，允许后续挂买单
-				slot.SlotStatus = SlotStatusFree
-				// 卖单成交，重置撤销/拒绝诊断计数
-				slot.PostOnlyFailCount = 0
-				logger.Info("✅ [卖单成交] 价格: %s, 剩余持仓: %.4f, 槽位状态: %s, 订单状态: %s, SlotStatus: FREE",
-					formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.PositionStatus, slot.OrderStatus)
-			} else {
-				slot.OrderStatus = OrderStatusPartiallyFilled
-			}
-		}
-
-		if update.Status == OrderStatusFilled {
-			if performance != nil && update.ExecutedQty > fillQtyTolerance {
-				slot.oppositeFillAt = time.Time{}
-				slot.oppositeSubmitSide = ""
-				if side == "BUY" && slot.PositionQty > fillQtyTolerance {
-					slot.oppositeFillAt, slot.oppositeSubmitSide = receivedAt, "SELL"
-				} else if side == "SELL" && slot.PositionQty <= fillQtyTolerance {
-					slot.oppositeFillAt, slot.oppositeSubmitSide = receivedAt, "BUY"
-				}
-			}
-			adjustmentNeeded = true
-			realizedPNL := 0.0
-			gridPNL := 0.0
-			entryPrice := 0.0
-			if side == "SELL" {
-				realizedPNL = slot.orderAccumulatedPNL
-				gridPNL = slot.orderAccumulatedGridPNL
-				if update.ExecutedQty > fillQtyTolerance {
-					entryPrice = slot.orderReleasedCost / update.ExecutedQty
-				}
-			}
-			spm.recordFilledOrder(update, side, orderPrice, price, entryPrice, gridPNL, realizedPNL)
-			slot.orderReportedPNL = 0
-			slot.orderAccumulatedPNL = 0
-			slot.orderFilledQuote = 0
-			slot.orderReleasedCost = 0
-			slot.orderAccumulatedGridPNL = 0
-		}
-
-	case "CANCELED", "EXPIRED", "REJECTED":
-		_, _ = spm.applyOrderExecutionDelta(slot, update, side, price)
-		logger.Info("⚠️ [订单%s] 价格: %s, 方向: %s, 原因: %s, 已成交: %.4f",
-			update.Status, formatPrice(price, spm.priceDecimals), side, update.Status, slot.OrderFilledQty)
-
-		// 🔥 核心修复：根据订单方向和成交情况处理槽位状态
-		if side == "BUY" {
-			// 买单被取消/拒绝
-			if slot.PositionQty > 0 || slot.OrderFilledQty > 0 {
-				// 部分成交后被取消：保留持仓，允许后续挂卖单
-				logger.Info("💡 [买单部分成交后取消] 价格: %s, 持仓: %.4f, 转为有仓状态",
-					formatPrice(price, spm.priceDecimals), slot.PositionQty)
-				slot.PositionStatus = PositionStatusFilled
-				slot.SlotStatus = SlotStatusFree // 允许挂卖单
-			} else {
-				// 完全未成交被取消：重置为空槽位
-				logger.Info("🔄 [买单未成交取消] 价格: %s, 重置槽位为空闲",
-					formatPrice(price, spm.priceDecimals))
-				slot.PositionStatus = PositionStatusEmpty
-				slot.SlotStatus = SlotStatusFree // 允许重新挂买单
-				if slot.gapStackCount > 1 {
-					releaseStackParent = price
-					releaseStackCount = slot.gapStackCount
-					slot.gapStackCount = 0
-				}
-			}
-		} else if side == "SELL" {
-			// 卖单被取消/拒绝：应该还持有币，保持持仓状态
-			if slot.PositionQty > 0 {
-				// 记录撤销/拒绝次数供诊断；主动撤单、过期与 PostOnly 拒绝都可能进入此分支。
-				if !terminalSeen {
-					slot.PostOnlyFailCount++
-				}
-				logger.Info("🔄 [卖单取消] 价格: %s, 保持持仓状态: %.4f, 等待重挂, 撤销/拒绝计数: %d",
-					formatPrice(price, spm.priceDecimals), slot.PositionQty, slot.PostOnlyFailCount)
-				slot.PositionStatus = PositionStatusFilled
-				slot.SlotStatus = SlotStatusFree // 允许重新挂卖单
-			} else {
-				// 异常情况：卖单取消但没有持仓，重置为空
-				logger.Warn("⚠️ [异常] 卖单取消但无持仓，价格: %s, 重置为空",
-					formatPrice(price, spm.priceDecimals))
-				slot.PositionStatus = PositionStatusEmpty
-				slot.SlotStatus = SlotStatusFree
-			}
-		}
-
-		adjustmentNeeded = true
-		if update.Status == "REJECTED" {
-			// REJECTED 后若仍会重试同方向订单，先退避，避免订单流形成
-			// “拒绝 -> 立即补挂 -> 再拒绝”的紧循环。BUY 已有成交会转挂
-			// SELL，SELL 已完全成交会转挂 BUY，二者都必须立即调整。
-			retrySameSide := (side == "BUY" && slot.PositionQty <= 0 && slot.OrderFilledQty <= 0) ||
-				(side == "SELL" && slot.PositionQty > 0)
-			if retrySameSide {
-				adjustmentNotBefore = time.Now().Add(placementRetryCooldown)
-				slot.placementRetryNotBefore = adjustmentNotBefore
-			} else {
-				slot.placementRetryNotBefore = time.Time{}
-			}
-		}
-
-		spm.rememberTerminalOrderProgress(
-			update,
-			slot.OrderFilledQty,
-			slot.orderFilledQuote,
-			slot.orderReportedPNL,
-			slot.orderAccumulatedPNL,
-		)
-
-		// 清空订单信息
-		slot.OrderStatus = OrderStatusCanceled
-		slot.OrderID = 0
-		slot.ClientOID = ""
-		slot.OrderQuantity = 0
-		slot.OrderFilledQty = 0
-		slot.orderReportedPNL = 0
-		slot.orderAccumulatedPNL = 0
-		slot.orderFilledQuote = 0
-		slot.orderReleasedCost = 0
-		slot.orderAccumulatedGridPNL = 0
-		// 保留 OrderSide 用于日志调试
-	}
+	in.ReceivedAt, in.MeasureFillLatency = receivedAt, performance != nil
+	// Compute without touching live state; publication remains under this same
+	// mapped slot lock. Durable commit will be a separate integration step.
+	transition = reduceOrderUpdate(readOrderSlotState(slot), in)
+	spm.publishOrderTransitionLocked(slot, in, transition)
 }
 
 func isTerminalOrderStatus(status string) bool {
@@ -2246,118 +2001,6 @@ func isTerminalOrderStatus(status string) bool {
 	}
 }
 
-// applyOrderExecutionDelta 将交易所累计成交量转换成本地增量。
-// 所有可能携带最终累计量的状态都必须走这里，包括撤销、过期和拒绝。
-func (spm *SuperPositionManager) applyOrderExecutionDelta(slot *InventorySlot, update OrderUpdate, side string, slotPrice float64) (float64, bool) {
-	if math.IsNaN(update.ExecutedQty) || math.IsInf(update.ExecutedQty, 0) || update.ExecutedQty < 0 {
-		logger.Warn("⚠️ [忽略非法累计成交] 槽位 %s: 推送 %.12f, 状态 %s",
-			formatPrice(slotPrice, spm.priceDecimals), update.ExecutedQty, update.Status)
-		return 0, true
-	}
-	if update.ExecutedQty+fillQtyTolerance < slot.OrderFilledQty {
-		logger.Warn("⚠️ [忽略乱序成交] 槽位 %s: 已成交 %.12f, 推送 %.12f, 状态 %s",
-			formatPrice(slotPrice, spm.priceDecimals), slot.OrderFilledQty, update.ExecutedQty, update.Status)
-		return 0, true
-	}
-
-	previousFilledQty := slot.OrderFilledQty
-	deltaQty := update.ExecutedQty - previousFilledQty
-	if deltaQty < fillQtyTolerance {
-		deltaQty = 0
-	}
-
-	deltaQuote := 0.0
-	if deltaQty > 0 {
-		cumulativeQuote, ok := cumulativeExecutionQuote(update, slot.OrderPrice, slotPrice)
-		if !ok || cumulativeQuote+fillQtyTolerance < slot.orderFilledQuote {
-			logger.Warn("⚠️ [忽略非法累计成交额] 槽位 %s: 已成交额 %.12f, 推送 %.12f, 状态 %s",
-				formatPrice(slotPrice, spm.priceDecimals), slot.orderFilledQuote, cumulativeQuote, update.Status)
-			return 0, true
-		}
-		deltaQuote = cumulativeQuote - slot.orderFilledQuote
-		if deltaQuote <= 0 || math.IsNaN(deltaQuote) || math.IsInf(deltaQuote, 0) {
-			logger.Warn("⚠️ [忽略非法成交额增量] 槽位 %s: 数量增量 %.12f, 金额增量 %.12f",
-				formatPrice(slotPrice, spm.priceDecimals), deltaQty, deltaQuote)
-			return 0, true
-		}
-		slot.OrderFilledQty = update.ExecutedQty
-		slot.orderFilledQuote = cumulativeQuote
-	}
-
-	if side == "BUY" {
-		if deltaQty > 0 {
-			slot.PositionQty += deltaQty
-			slot.PositionCost += deltaQuote
-			oldTotal := spm.totalBuyQty.Load().(float64)
-			spm.totalBuyQty.Store(oldTotal + deltaQty)
-		}
-		return deltaQty, false
-	}
-
-	if deltaQty > 0 {
-		releasedCost := releasePositionCostLocked(slot, deltaQty)
-		slot.orderReleasedCost += releasedCost
-		slot.orderAccumulatedGridPNL += deltaQuote - releasedCost
-		slot.PositionQty -= deltaQty
-		if slot.PositionQty < 0 {
-			slot.PositionQty = 0
-		}
-		if slot.PositionQty <= fillQtyTolerance {
-			slot.PositionCost = 0
-		}
-		oldTotal := spm.totalSellQty.Load().(float64)
-		spm.totalSellQty.Store(oldTotal + deltaQty)
-	}
-	spm.applySellRealizedPNL(slot, update, deltaQty)
-	return deltaQty, false
-}
-
-// cumulativeExecutionQuote 把交易所的累计成交数量与累计成交均价转换成
-// 累计成交金额。orderPrice 和 slotPrice 只用于兼容缺少均价的本地测试/回读。
-func cumulativeExecutionQuote(update OrderUpdate, orderPrice, slotPrice float64) (float64, bool) {
-	if update.ExecutedQty <= 0 {
-		return 0, true
-	}
-	price := update.AvgPrice
-	if price <= 0 {
-		price = update.Price
-	}
-	if price <= 0 {
-		price = orderPrice
-	}
-	if price <= 0 {
-		price = slotPrice
-	}
-	quote := update.ExecutedQty * price
-	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) ||
-		quote <= 0 || math.IsNaN(quote) || math.IsInf(quote, 0) {
-		return 0, false
-	}
-	return quote, true
-}
-
-// releasePositionCostLocked 按槽位当前平均成本释放卖出数量对应的成本。
-// 历史/测试槽位若没有成本字段，则以逻辑槽位价初始化，保证升级兼容。
-func releasePositionCostLocked(slot *InventorySlot, quantity float64) float64 {
-	if slot == nil || quantity <= 0 || slot.PositionQty <= 0 {
-		return 0
-	}
-	positionQty := slot.PositionQty
-	positionCost := slot.PositionCost
-	if positionCost <= 0 || math.IsNaN(positionCost) || math.IsInf(positionCost, 0) {
-		positionCost = positionQty * slot.Price
-	}
-	unitCost := positionCost / positionQty
-	releasedQty := math.Min(quantity, positionQty)
-	releasedCost := releasedQty * unitCost
-	remainingCost := positionCost - releasedCost
-	if remainingCost < fillQtyTolerance {
-		remainingCost = 0
-	}
-	slot.PositionCost = remainingCost
-	return releasedCost
-}
-
 func (spm *SuperPositionManager) getTerminalOrderProgress(update OrderUpdate) (terminalOrderProgress, bool) {
 	key := filledOrderKey(update)
 	if key == "" {
@@ -2367,19 +2010,6 @@ func (spm *SuperPositionManager) getTerminalOrderProgress(update OrderUpdate) (t
 	progress, exists := spm.terminalOrders[key]
 	spm.terminalOrdersMu.RUnlock()
 	return progress, exists
-}
-
-func (spm *SuperPositionManager) rememberTerminalOrderProgress(
-	update OrderUpdate,
-	executedQty, executedQuote, reportedPNL, accountedPNL float64,
-) {
-	spm.storeTerminalOrderProgress(update, terminalOrderProgress{
-		ExecutedQty:   executedQty,
-		ExecutedQuote: executedQuote,
-		ReportedPNL:   reportedPNL,
-		AccountedPNL:  accountedPNL,
-		UpdateTime:    update.UpdateTime,
-	})
 }
 
 func (spm *SuperPositionManager) storeTerminalOrderProgress(update OrderUpdate, next terminalOrderProgress) {
@@ -2399,134 +2029,6 @@ func (spm *SuperPositionManager) storeTerminalOrderProgress(update OrderUpdate, 
 		}
 	}
 	spm.terminalOrdersMu.Unlock()
-}
-
-// applyTerminalOrderCorrection 只补记已终结旧订单的新增成交和可证明为更新版本的累计 PNL。
-// 它绝不触碰当前槽位绑定的订单身份、OrderStatus 或 SlotStatus，避免旧推送干扰新订单。
-func (spm *SuperPositionManager) applyTerminalOrderCorrection(
-	slot *InventorySlot,
-	update OrderUpdate,
-	side string,
-	slotPrice float64,
-	progress terminalOrderProgress,
-) bool {
-	if math.IsNaN(update.ExecutedQty) || math.IsInf(update.ExecutedQty, 0) || update.ExecutedQty < 0 {
-		logger.Warn("⚠️ [忽略非法终态累计成交] 槽位 %s: 推送 %.12f, 状态 %s",
-			formatPrice(slotPrice, spm.priceDecimals), update.ExecutedQty, update.Status)
-		return false
-	}
-	if update.ExecutedQty+fillQtyTolerance < progress.ExecutedQty {
-		logger.Debug("⏭️ [忽略回退的终态推送] ID=%d, ClientOID=%s, 已记录=%.12f, 推送=%.12f",
-			update.OrderID, update.ClientOrderID, progress.ExecutedQty, update.ExecutedQty)
-		return false
-	}
-
-	deltaQty := update.ExecutedQty - progress.ExecutedQty
-	if deltaQty < fillQtyTolerance {
-		deltaQty = 0
-	}
-	deltaQuote := 0.0
-	nextExecutedQuote := progress.ExecutedQuote
-	if deltaQty > 0 {
-		cumulativeQuote, ok := cumulativeExecutionQuote(update, 0, slotPrice)
-		if !ok || cumulativeQuote+fillQtyTolerance < progress.ExecutedQuote {
-			logger.Warn("⚠️ [忽略非法终态成交额] 槽位 %s: 已成交额 %.12f, 推送 %.12f",
-				formatPrice(slotPrice, spm.priceDecimals), progress.ExecutedQuote, cumulativeQuote)
-			return false
-		}
-		deltaQuote = cumulativeQuote - progress.ExecutedQuote
-		if deltaQuote <= 0 || math.IsNaN(deltaQuote) || math.IsInf(deltaQuote, 0) {
-			logger.Warn("⚠️ [忽略非法终态成交额增量] 槽位 %s: 数量增量 %.12f, 金额增量 %.12f",
-				formatPrice(slotPrice, spm.priceDecimals), deltaQty, deltaQuote)
-			return false
-		}
-		nextExecutedQuote = cumulativeQuote
-	}
-
-	// 数量不变时，只接受有严格事件版本的累计 PNL 修正。UpdateTime 缺失或
-	// 乱序时无法证明新旧关系，因此宁可忽略，也不能让累计盈亏来回回退。
-	hasCumulativePNL := side == "SELL" && !update.RealizedPNLIncremental && update.RealizedPNL != 0
-	pnlChanged := hasCumulativePNL && math.Abs(update.RealizedPNL-progress.ReportedPNL) > fillQtyTolerance
-	acceptPNLCorrection := pnlChanged && deltaQty == 0 &&
-		progress.UpdateTime > 0 && update.UpdateTime > progress.UpdateTime
-	if deltaQty == 0 && !acceptPNLCorrection {
-		logger.Debug("⏭️ [重复终态被忽略] ID=%d, ClientOID=%s, Status=%s",
-			update.OrderID, update.ClientOrderID, update.Status)
-		return false
-	}
-
-	if side == "BUY" {
-		if deltaQty > 0 {
-			slot.PositionQty += deltaQty
-			slot.PositionCost += deltaQuote
-			oldTotal := spm.totalBuyQty.Load().(float64)
-			spm.totalBuyQty.Store(oldTotal + deltaQty)
-			slot.PositionStatus = PositionStatusFilled
-		}
-	} else {
-		if deltaQty > 0 {
-			releasePositionCostLocked(slot, deltaQty)
-			slot.PositionQty -= deltaQty
-			if slot.PositionQty < 0 {
-				slot.PositionQty = 0
-			}
-			if slot.PositionQty <= fillQtyTolerance {
-				slot.PositionCost = 0
-			}
-			oldTotal := spm.totalSellQty.Load().(float64)
-			spm.totalSellQty.Store(oldTotal + deltaQty)
-		}
-
-		pnlDelta := 0.0
-		source := "成交价差"
-		if update.RealizedPNLIncremental {
-			// 同数量的增量 PNL 无法去重，上方已经拒绝；这里只处理新增成交。
-			pnlDelta = update.RealizedPNL
-			if pnlDelta != 0 {
-				source = "成交推送"
-			}
-		} else if update.RealizedPNL != 0 {
-			// 交易所累计值替换本地已经入账的回退/增量合计，只补二者差额。
-			pnlDelta = update.RealizedPNL - progress.AccountedPNL
-			progress.ReportedPNL = update.RealizedPNL
-			source = "成交推送"
-		}
-		if pnlDelta == 0 && deltaQty > 0 && !hasCumulativePNL {
-			sellPx := update.AvgPrice
-			if sellPx <= 0 {
-				sellPx = update.Price
-			}
-			if sellPx > 0 && slotPrice > 0 {
-				pnlDelta = deltaQty * (sellPx - slotPrice)
-			}
-		}
-		progress.AccountedPNL += pnlDelta
-		if hasCumulativePNL {
-			// 即使差额为零，权威累计值也定义了本订单最终已入账水位。
-			progress.AccountedPNL = update.RealizedPNL
-		}
-		if pnlDelta != 0 {
-			total := spm.addRealizedPNL(pnlDelta)
-			logger.Info("💵 [终态盈亏修正] 价格: %s, 本笔: %.6f, 累计: %.6f (%s)",
-				formatPrice(slotPrice, spm.priceDecimals), pnlDelta, total, source)
-		}
-
-		if slot.PositionQty < 0.000001 {
-			slot.PositionStatus = PositionStatusEmpty
-		} else {
-			slot.PositionStatus = PositionStatusFilled
-		}
-	}
-
-	if update.ExecutedQty > progress.ExecutedQty {
-		progress.ExecutedQty = update.ExecutedQty
-		progress.ExecutedQuote = nextExecutedQuote
-	}
-	if update.UpdateTime > progress.UpdateTime {
-		progress.UpdateTime = update.UpdateTime
-	}
-	spm.storeTerminalOrderProgress(update, progress)
-	return true
 }
 
 func filledOrderKey(update OrderUpdate) string {
@@ -2555,53 +2057,15 @@ func (spm *SuperPositionManager) recordFilledOrder(
 	side string,
 	orderPrice, slotPrice, entryPrice, gridPNL, realizedPNL float64,
 ) {
-	key := filledOrderKey(update)
+	in := spm.orderUpdateFacts(update, side, slotPrice, time.Now())
+	spm.appendFilledOrder(makeFilledOrderRecord(in, orderPrice, entryPrice, gridPNL, realizedPNL), in.Now)
+}
+
+func (spm *SuperPositionManager) appendFilledOrder(record FilledOrderRecord, now time.Time) {
+	key := filledOrderKey(OrderUpdate{OrderID: record.OrderID, ClientOrderID: record.ClientOrderID})
 	if key == "" {
 		return
 	}
-
-	price := update.AvgPrice
-	if price <= 0 {
-		price = update.Price
-	}
-	if price <= 0 {
-		price = orderPrice
-	}
-	if price <= 0 {
-		price = slotPrice
-	}
-	if side == "BUY" && entryPrice <= 0 {
-		entryPrice = price
-	}
-	targetPrice := 0.0
-	if slotPrice > 0 && spm.config != nil && spm.config.Trading.PriceInterval > 0 {
-		targetPrice = roundPrice(slotPrice+spm.config.Trading.PriceInterval, spm.priceDecimals)
-	}
-
-	symbol := update.Symbol
-	if symbol == "" && spm.config != nil {
-		symbol = spm.config.Trading.Symbol
-	}
-	filledAt := time.Now()
-	if update.UpdateTime > 0 {
-		filledAt = timestampToTime(update.UpdateTime)
-	}
-
-	record := FilledOrderRecord{
-		OrderID:       update.OrderID,
-		ClientOrderID: update.ClientOrderID,
-		Symbol:        symbol,
-		Side:          side,
-		Price:         price,
-		Quantity:      update.ExecutedQty,
-		SlotPrice:     slotPrice,
-		TargetPrice:   targetPrice,
-		EntryPrice:    entryPrice,
-		GridPNL:       gridPNL,
-		FilledAt:      filledAt,
-		RealizedPNL:   realizedPNL,
-	}
-
 	spm.filledOrdersMu.Lock()
 	defer spm.filledOrdersMu.Unlock()
 	if _, exists := spm.filledOrderKeys[key]; exists {
@@ -2613,7 +2077,7 @@ func (spm *SuperPositionManager) recordFilledOrder(
 	if len(spm.filledOrders) > maxRecentFilledOrders {
 		spm.filledOrders = append([]FilledOrderRecord(nil), spm.filledOrders[len(spm.filledOrders)-maxRecentFilledOrders:]...)
 	}
-	spm.addHourlyFillLocked(record, time.Now())
+	spm.addHourlyFillLocked(record, now)
 }
 
 func startOfLocalHour(t time.Time) time.Time {
@@ -2689,53 +2153,6 @@ func timestampToTime(timestamp int64) time.Time {
 	default:
 		return time.Unix(timestamp, 0)
 	}
-}
-
-func (spm *SuperPositionManager) applySellRealizedPNL(slot *InventorySlot, update OrderUpdate, deltaQty float64) {
-	var delta float64
-	source := "成交价差"
-	hasCumulativePNL := !update.RealizedPNLIncremental && update.RealizedPNL != 0
-	if update.RealizedPNLIncremental {
-		// 增量盈亏属于本笔成交；重复推送没有新增成交量时不得再次累加。
-		if deltaQty <= 0 {
-			return
-		}
-		delta = update.RealizedPNL
-		if delta != 0 {
-			source = "成交推送"
-		}
-	} else if hasCumulativePNL {
-		// 累计值是该订单的权威总额。以本地实际入账值（包括价差回退）为
-		// 基线补差，避免先回退 0.10、后累计 0.11 时最终变成 0.21。
-		delta = update.RealizedPNL - slot.orderAccumulatedPNL
-		slot.orderReportedPNL = update.RealizedPNL
-		source = "成交推送"
-	}
-	if delta == 0 && deltaQty > 0 && !hasCumulativePNL {
-		sellPx := update.AvgPrice
-		if sellPx <= 0 {
-			sellPx = update.Price
-		}
-		if sellPx > 0 && slot.Price > 0 {
-			delta = deltaQty * (sellPx - slot.Price)
-		}
-	}
-	slot.orderAccumulatedPNL += delta
-	if delta == 0 {
-		return
-	}
-	total := spm.addRealizedPNL(delta)
-	logger.Info("💵 [已实现盈亏] 价格: %s, 本笔: %.6f, 累计: %.6f (%s)",
-		formatPrice(slot.Price, spm.priceDecimals), delta, total, source)
-}
-
-func (spm *SuperPositionManager) addRealizedPNL(delta float64) float64 {
-	spm.pnlMu.Lock()
-	defer spm.pnlMu.Unlock()
-	old, _ := spm.realizedPNL.Load().(float64)
-	next := old + delta
-	spm.realizedPNL.Store(next)
-	return next
 }
 
 // GetRealizedPNL 卖单成交累计的已实现盈亏
