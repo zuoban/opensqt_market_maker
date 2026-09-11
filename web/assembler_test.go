@@ -38,6 +38,7 @@ func TestSafeAppViewOmitsSecrets(t *testing.T) {
 		FeeRate:   0.0002,
 	}
 	cfg.RiskControl.Enabled = true
+	cfg.Telegram = config.TelegramConfig{Enabled: true, BotToken: "TELEGRAM_SECRET", ChatID: "PRIVATE_CHAT_ID"}
 	cfg.RiskControl.MonitorSymbols = []string{"BTCUSDT"}
 	cfg.Dashboard.PushIntervalMS = 400
 	cfg.Execution.MakerGuardTicks = 2
@@ -70,6 +71,9 @@ func TestSafeAppViewOmitsSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(full)
+	if strings.Contains(body, cfg.Telegram.BotToken) || strings.Contains(body, cfg.Telegram.ChatID) {
+		t.Fatal("full snapshot leaked Telegram credentials")
+	}
 	if strings.Contains(body, "SECRETKEY_ABC") || strings.Contains(body, "SUPERSECRET_XYZ") {
 		t.Fatalf("full snapshot leaked secrets: %s", body)
 	}

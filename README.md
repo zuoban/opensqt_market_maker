@@ -141,6 +141,33 @@ opensqt_platform/
 
 也可以只使用 `.env`（例如 `OPENSQT_EXCHANGES_BINANCE_API_KEY`），不必提供 `config.yaml`。若两者都有，非空环境变量优先。保证金限制对应环境变量为 `OPENSQT_TRADING_MAX_MARGIN_USAGE_PERCENT`；完整变量列表见 [.env.example](.env.example)。
 
+#### Telegram 成交通知
+
+可选开启买单、卖单的全成交通知，默认关闭。在 Telegram 中通过 [@BotFather](https://t.me/BotFather) 创建 Bot 并取得 Bot Token，然后向自己的 Bot 发送 `/start`。向群组发送时，先把 Bot 加入群组并确保它有发送消息的权限；向频道发送时需授予 Bot 发布消息的权限。
+
+在 `.env` 中填写：
+
+```dotenv
+OPENSQT_TELEGRAM_ENABLED=true
+OPENSQT_TELEGRAM_BOT_TOKEN=你的BotToken
+OPENSQT_TELEGRAM_CHAT_ID=你的ChatID
+```
+
+Chat ID 可以是私聊数字 ID、群组负数 ID（超级群通常以 `-100` 开头）或公开频道的 `@频道名`。可在向 Bot 发送消息后，通过 Telegram Bot API 的 `getUpdates` 响应读取 `message.chat.id`；若 Bot 已配置 webhook，需使用现有 webhook 接收到的聊天 ID。不要公开包含 Token 的 API 地址。
+
+也支持 YAML 配置（非空环境变量优先）：
+
+```yaml
+telegram:
+  enabled: true
+  bot_token: "你的BotToken"
+  chat_id: "你的ChatID"
+```
+
+保存后重启程序生效。通知包含交易对、买卖方向、成交均价、数量、成交金额、订单 ID 和带时区的成交时间；卖单还包含按交易所口径记录的已实现盈亏（未扣手续费）。只在系统新确认订单全部成交（`FILLED`）后通知，部分成交、撤销、拒绝和重复事件不会发送；对账确认的全成交也经过同一去重入口。
+
+通知使用独立后台协程，队列最多 128 条，同一聊天发送间隔至少 1 秒；Telegram 明确返回限流时按 `retry_after` 等待，最多尝试 3 次，单次等待上限 60 秒。单次请求超时 10 秒，网络错误和其他发送失败只记日志，不影响交易；为避免重复送达，不重试结果不确定的网络请求。队列满时丢弃新通知并记录日志；队列和去重状态只在本次运行内有效，退出会取消发送，重启不补发历史通知。运行环境需能访问 `api.telegram.org`，支持标准 `HTTPS_PROXY` 环境变量。
+
 #### 严格 Maker 执行
 
 Binance 的 PostOnly 订单在到达撮合系统时如果会立即成交，会被明确拒绝。程序不会降级成 Taker，而是使用同一条市场数据 WebSocket 同时接收逐笔成交和 `bookTicker`，并在真正提交前按最新买一/卖一再次复检。逻辑网格价格保持不变；当 BUY 网格已经穿过 Maker 安全边界时，可把实际委托价向下移动到安全价，成交后仍按原逻辑槽位计算目标卖价。若 SELL 目标在下单前已被行情穿过，则挂到买一价上方最近的合法 Maker tick；多个卖单冲突时逐 tick 避让，不再额外抬高一整个网格。

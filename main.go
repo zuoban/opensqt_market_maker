@@ -15,6 +15,7 @@ import (
 	"opensqt/exchange"
 	"opensqt/logger"
 	"opensqt/monitor"
+	"opensqt/notification"
 	"opensqt/order"
 	"opensqt/position"
 	"opensqt/safety"
@@ -23,7 +24,7 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.5.14"
+var Version = "v3.5.15"
 
 func main() {
 	programStartedAt := time.Now()
@@ -206,6 +207,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go performance.Run(ctx)
+	if cfg.Telegram.Enabled {
+		telegram := notification.NewTelegram(ctx, cfg.Telegram, ex.GetQuoteAsset())
+		defer telegram.Close()
+		superPositionManager.SetFilledOrderNotifier(telegram.NotifyFill)
+		logger.Info("✅ Telegram 订单成交通知已启用（后台发送）")
+	}
 
 	// 🔥 关键修复：先启动订单流，再下单（避免错过成交推送）
 	// 启动订单流（通过交易所接口）

@@ -182,6 +182,16 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 
+	if err := setBool(&cfg.Telegram.Enabled, "OPENSQT_TELEGRAM_ENABLED"); err != nil {
+		return err
+	}
+	if err := setString(&cfg.Telegram.BotToken, "OPENSQT_TELEGRAM_BOT_TOKEN"); err != nil {
+		return err
+	}
+	if err := setString(&cfg.Telegram.ChatID, "OPENSQT_TELEGRAM_CHAT_ID"); err != nil {
+		return err
+	}
+
 	d := &cfg.Dashboard
 	if v, ok := lookupEnv("OPENSQT_DASHBOARD_ENABLED"); ok {
 		b, err := parseBool(v)

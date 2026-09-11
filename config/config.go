@@ -113,6 +113,15 @@ type Config struct {
 
 	// 监控面板（只读，嵌在主进程）
 	Dashboard DashboardConfig `yaml:"dashboard"`
+
+	Telegram TelegramConfig `yaml:"telegram"`
+}
+
+// TelegramConfig 可选的订单全成交通知，默认关闭。
+type TelegramConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	BotToken string `yaml:"bot_token" json:"-"`
+	ChatID   string `yaml:"chat_id" json:"-"`
 }
 
 // DashboardConfig 本地监控面板配置
@@ -351,6 +360,16 @@ func (c *Config) Validate() error {
 
 	if err := c.applyDashboardDefaults(); err != nil {
 		return err
+	}
+	c.Telegram.BotToken = strings.TrimSpace(c.Telegram.BotToken)
+	c.Telegram.ChatID = strings.TrimSpace(c.Telegram.ChatID)
+	if c.Telegram.Enabled {
+		if c.Telegram.BotToken == "" {
+			return fmt.Errorf("启用 Telegram 通知时必须设置 telegram.bot_token")
+		}
+		if c.Telegram.ChatID == "" {
+			return fmt.Errorf("启用 Telegram 通知时必须设置 telegram.chat_id")
+		}
 	}
 
 	return nil

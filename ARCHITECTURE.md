@@ -1,7 +1,7 @@
 # OpenSQT 做市商系统架构说明
 
-> **版本**: v3.5.14
-> **最近更新**: 2026-09-11
+> **版本**: v3.5.15
+> **最近更新**: 2026-09-12
 > **目的**: 说明当前运行架构、交易安全边界与扩展约束
 
 ---
@@ -135,6 +135,9 @@ opensqt_platform/
 │   ├── recorder.go            # 最近样本百分位、状态计数
 │   └── runtime.go             # Go 堆、GC、协程读数
 │
+├── notification/              # 可选 Telegram 全成交通知，固定容量后台队列
+│   └── telegram.go            # 限流、超时与安全错误日志；不参与交易门禁
+│
 └── utils/                     # 工具函数
     └── orderid.go             # 自定义订单ID生成
 ```
@@ -236,8 +239,12 @@ SuperPositionManager.OnOrderUpdate()
     ├── 规范化 ClientOrderID，在映射槽位锁内读取状态与去重进度
     ├── reduceOrderUpdate → 计算新状态、统计增量与通知意图
     ├── 同一槽位锁内发布到内存；全成交和终态进度仍在内存去重
-    └── 解锁后通知调整：FILLED 创建对向单，撤销/拒绝按剩余持仓重挂
+    ├── 解锁后通知调整：FILLED 创建对向单，撤销/拒绝按剩余持仓重挂
+    └── 新接受的 FILLED 记录经非阻塞回调进入 Telegram 队列（可选）
+        └── 单个后台协程发送；失败、满队列或退出丢弃通知，不影响交易
 ```
+
+Telegram 由 `telegram.enabled` / `OPENSQT_TELEGRAM_ENABLED` 控制，默认关闭。在订单流启动前注册成交通知，因此 WebSocket、对账和提交结果确认都复用仓位管理器的全成交去重，不从面板最近 20 条成交记录轮询。队列容量 128；HTTP 请求超时 10 秒，同一聊天至少间隔 1 秒。仅 Telegram 明确限流时有限重试，其他失败不重试；Token 与 Chat ID 不进入日志和面板快照。退出取消通知协程和在途请求，不持久化或补发队列。
 
 ### 交易逻辑流
 ```
@@ -1079,5 +1086,5 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 
 **官网**:
 - Website: www.OpenSQT.com
-- Version: v3.5.14
-- Last Updated: 2026-09-11
+- Version: v3.5.15
+- Last Updated: 2026-09-12

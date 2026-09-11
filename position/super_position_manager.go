@@ -305,10 +305,12 @@ type SuperPositionManager struct {
 	// adjustmentNotifier 将订单流状态变化和失败 reservation 的重试期限
 	// 非阻塞地交给外部串行协调器。回调不得直接重入 SuperPositionManager；
 	// delay<=0 表示尽快调整，delay>0 表示不早于该延迟再次调整。
-	adjustmentNotifierMu sync.RWMutex
-	adjustmentNotifier   func(delay time.Duration)
-	marketProviderMu     sync.RWMutex
-	marketProvider       func() exchange.MarketSnapshot
+	adjustmentNotifierMu  sync.RWMutex
+	adjustmentNotifier    func(delay time.Duration)
+	filledOrderNotifierMu sync.RWMutex
+	filledOrderNotifier   func(FilledOrderRecord)
+	marketProviderMu      sync.RWMutex
+	marketProvider        func() exchange.MarketSnapshot
 
 	// 价格锚点（初始化时的市场价格）
 	anchorPrice float64
@@ -1978,6 +1980,9 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 				delay = time.Until(transition.AdjustmentNotBefore)
 			}
 			spm.notifyAdjustment(delay)
+		}
+		if transition.RecordFill {
+			spm.notifyFilledOrder(transition.Fill)
 		}
 	}()
 

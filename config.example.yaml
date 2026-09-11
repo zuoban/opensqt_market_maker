@@ -115,6 +115,14 @@ risk_control:
   # 触发条件：当前价格 < 移动均价 且 成交量 > 均值×倍数
   # 解除条件：至少 recovery_threshold 个币种满足（当前价格 > 移动均价 且 成交量 < 均值×倍数）
 
+# Telegram 订单全成交通知（可选，默认关闭）
+# 先通过 @BotFather 创建 Bot，再向 Bot 发送 /start；群组需先添加 Bot。
+# 推荐在 .env 中填写 Token 和 Chat ID，勿提交真实凭据。
+telegram:
+  enabled: false
+  bot_token: ""             # OPENSQT_TELEGRAM_BOT_TOKEN
+  chat_id: ""               # OPENSQT_TELEGRAM_CHAT_ID；私聊 ID / 群组负数 ID / @频道名
+
 # 本地只读监控面板（嵌在主进程，不改交易逻辑）
 dashboard:
   enabled: true
