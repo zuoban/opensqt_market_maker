@@ -196,8 +196,8 @@ func formatFill(record position.FilledOrderRecord, quoteAsset string) string {
 		direction = "卖出"
 	}
 	number := func(value float64) string { return strconv.FormatFloat(value, 'f', -1, 64) }
-	text := fmt.Sprintf("OpenSQT 订单全部成交\n交易所：Binance\n交易对：%s\n方向：%s（%s）\n成交均价：%s %s\n成交数量：%s\n成交金额：%.8f %s\n订单 ID：%d\n成交时间：%s",
-		record.Symbol, direction, record.Side, number(record.Price), quoteAsset,
+	text := fmt.Sprintf("%s（%s）｜ 均价 %s %s\n\n交易对：%s\n成交数量：%s\n成交金额：%.8f %s\n订单 ID：%d\n成交时间：%s",
+		direction, record.Side, number(record.Price), quoteAsset, record.Symbol,
 		number(record.Quantity), record.Price*record.Quantity, quoteAsset, record.OrderID,
 		record.FilledAt.In(time.Local).Format("2006-01-02 15:04:05 MST (Z07:00)"))
 	if record.Side == "SELL" {

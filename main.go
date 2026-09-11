@@ -24,7 +24,7 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.5.15"
+var Version = "v3.5.16"
 
 func main() {
 	programStartedAt := time.Now()

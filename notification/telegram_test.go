@@ -46,7 +46,13 @@ func TestTelegramSendPayload(t *testing.T) {
 		if payload["chat_id"] != testTelegramConfig.ChatID || len(payload) != 2 {
 			t.Fatalf("unexpected payload: %+v", payload)
 		}
-		for _, want := range []string{"ETHUSDC", "卖出（SELL）", "2500.25 USDC", "0.01", "25.00250000 USDC", "订单 ID：42", "2026-09-12", "-0.02500000 USDC（未扣手续费）"} {
+		if !strings.HasPrefix(payload["text"], "卖出（SELL）｜ 均价 2500.25 USDC\n\n") {
+			t.Errorf("notification title missing direction or average price: %s", payload["text"])
+		}
+		if strings.Contains(payload["text"], "\n方向：") || strings.Contains(payload["text"], "\n成交均价：") || strings.Contains(payload["text"], "交易所") {
+			t.Error("notification body contains redundant fields")
+		}
+		for _, want := range []string{"ETHUSDC", "0.01", "25.00250000 USDC", "订单 ID：42", "2026-09-12", "-0.02500000 USDC（未扣手续费）"} {
 			if !strings.Contains(payload["text"], want) {
 				t.Errorf("notification missing %q: %s", want, payload["text"])
 			}
@@ -57,7 +63,7 @@ func TestTelegramSendPayload(t *testing.T) {
 	buy := testFill()
 	buy.Side = "BUY"
 	text := formatFill(buy, "USDC")
-	if !strings.Contains(text, "买入（BUY）") || strings.Contains(text, "盈亏") {
+	if !strings.HasPrefix(text, "买入（BUY）｜ 均价 2500.25 USDC\n\n") || strings.Contains(text, "盈亏") || strings.Contains(text, "交易所") {
 		t.Fatalf("unexpected buy notification: %s", text)
 	}
 }
