@@ -333,6 +333,9 @@ type SuperPositionManager struct {
 	lastAdjustedMarket    atomic.Pointer[exchange.MarketSnapshot]
 	quoteRetryPending     atomic.Bool
 
+	// 仅在 adjustMu 下访问，独立于可被重试清空的规划指纹。
+	gapWindow gapStackWindow
+
 	// 规划期之外只有订单更新会新增/改写远端卖价。版本和在途计数让同一轮
 	// 规划复用占价扫描；回调正在修改或已经修改时仍执行完整复查。
 	orderUpdateVersion atomic.Uint64
@@ -669,7 +672,12 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 
 	req.AcquireSubmissionLease = func() (func(), bool) {
 		slot.mu.Lock()
-		if !spm.matchesReservationLocked(slot, req) || !spm.reservationStillValidLocked(slot, req) {
+		valid := spm.matchesReservationLocked(slot, req) && spm.reservationStillValidLocked(slot, req)
+		var releaseChildren func()
+		if valid && req.GapStack > 1 {
+			releaseChildren, valid = spm.acquireGapStackChildrenLease(slot.Price, req.GapStack)
+		}
+		if !valid {
 			// 只清理由本请求创建且尚未被订单流确认的 reservation。若身份已经
 			// 变化，说明另一个时序已经接管槽位，绝不能碰它。
 			if spm.matchesReservationLocked(slot, req) {
@@ -682,7 +690,12 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 			slot.mu.Unlock()
 			return nil, false
 		}
-		return slot.mu.Unlock, true
+		return func() {
+			if releaseChildren != nil {
+				releaseChildren()
+			}
+			slot.mu.Unlock()
+		}, true
 	}
 	if spm.performance.Load() != nil && !slot.oppositeFillAt.IsZero() && slot.oppositeSubmitSide == req.Side {
 		req.OnSubmissionStarted = func() {
@@ -1017,6 +1030,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 		// 行情连接或盘口尚未完成新 epoch 初始化时不创建 reservation。
 		// 下一次盘口或成交事件会主动唤醒协调器，禁止对陈旧快照做定时热循环。
 		spm.logUnusableQuote(market, time.Now())
+		spm.gapWindow = gapStackWindow{}
 		return nil
 	}
 
@@ -1066,6 +1080,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 
 	// 动态计算网格价格
 	currentGridPrice := spm.findNearestGridPrice(currentPrice)
+	spm.observeGapStackGrid(currentGridPrice, market.StreamEpoch)
 	// logger.Debug("🔄 [实时调整] 当前价格: %s, 网格价格: %s, 买单窗口: %d, 卖单窗口: %d",
 	// 	formatPrice(currentPrice, spm.priceDecimals), formatPrice(currentGridPrice, spm.priceDecimals), buyWindowSize, sellWindowSize)
 
@@ -1172,9 +1187,8 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 
 	cancelIDs, leftoverOutOfWindowBuys, committedCancels := spm.commitOutOfWindowBuyCancels(outOfWindowBuys)
 
-	// 上方刚离开窗口的买单在扫描时仍是活跃订单，会暂时挡住跳格判断。
-	// 先把它们线性化为 CANCEL_REQUESTED，再复查当前格已有买单是否需要扩容；
-	// 否则当前格可能以单格金额先成交，永久漏掉本轮跳过的空格。
+	// 已证明被跨过的上方买单进入 CANCEL_REQUESTED 后，可一起撤掉当前格
+	// 金额不足的买单；合并新单仍必须等所有被合并买单确认撤销且未成交。
 	if buy, ok := spm.undersizedGapStackBuy(currentGridPrice); ok {
 		moreIDs, moreLeftover, moreCommitted := spm.commitOutOfWindowBuyCancels([]outOfWindowBuy{buy})
 		cancelIDs = append(cancelIDs, moreIDs...)
@@ -1423,12 +1437,16 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			stackCount := 1
 			var stackChildren []float64
 			if sameGridPrice(price, currentGridPrice) {
-				children, blocked := spm.collectGapStackSlots(price)
-				if !blocked && len(children) > 0 {
+				children, blocked := spm.collectGapStackSlots(price, false)
+				if blocked {
+					slot.mu.Unlock()
+					continue
+				}
+				if len(children) > 0 {
 					stackCount = 1 + len(children)
 					stackChildren = children
 					quantity = roundPrice(quantity*float64(stackCount), spm.quantityDecimals)
-					logger.Info("📦 [跳格合并] 当前格 %s 上方空出 %d 格，按 %d 倍金额在 %s 下一单",
+					logger.Info("📦 [跳格合并] 当前格 %s，已确认跨过且漏买 %d 格，按 %d 倍金额在 %s 下一单",
 						formatPrice(price, spm.priceDecimals), len(children), stackCount,
 						formatPrice(orderPrice, spm.priceDecimals))
 				}

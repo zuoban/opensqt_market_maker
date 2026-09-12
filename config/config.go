@@ -41,7 +41,7 @@ type ExecutionConfig struct {
 	MaxCatchUpSlotsPerAdjust  int     `yaml:"max_catch_up_slots_per_adjust"`
 	MaxCatchUpDistanceRatio   float64 `yaml:"max_catch_up_distance_ratio"`
 	NearTouchSingleOrderRatio float64 `yaml:"near_touch_single_order_ratio"`
-	MaxGapStackSlots          int     `yaml:"max_gap_stack_slots"`
+	MaxGapStackSlots          int     `yaml:"max_gap_stack_slots"` // 额外合并的已跨过漏买格数，0 关闭（默认）
 }
 
 // UnmarshalYAML 记录 max_margin_usage_percent 是否由用户显式配置，
@@ -326,9 +326,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Execution.MaxGapStackSlots < 0 {
 		return fmt.Errorf("execution.max_gap_stack_slots 不能为负数")
-	}
-	if c.Execution.MaxGapStackSlots == 0 {
-		c.Execution.MaxGapStackSlots = 1
 	}
 	if c.Execution.MaxGapStackSlots > 10 {
 		return fmt.Errorf("execution.max_gap_stack_slots 不能大于 10")

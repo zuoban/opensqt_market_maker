@@ -2,14 +2,16 @@ package position
 
 import (
 	"testing"
+	"time"
 
 	"opensqt/exchange"
 )
 
 type gapStackExecutor struct {
-	orders    []*OrderRequest
-	cancelIDs []int64
-	nextID    int64
+	orders      []*OrderRequest
+	cancelIDs   []int64
+	nextID      int64
+	beforeLease func(*OrderRequest)
 }
 
 func (e *gapStackExecutor) PlaceOrder(*OrderRequest) (*Order, error) { return nil, nil }
@@ -17,6 +19,9 @@ func (e *gapStackExecutor) PlaceOrder(*OrderRequest) (*Order, error) { return ni
 func (e *gapStackExecutor) BatchPlaceOrders(requests []*OrderRequest) ([]*Order, bool, error) {
 	placed := make([]*Order, 0, len(requests))
 	for _, req := range requests {
+		if e.beforeLease != nil {
+			e.beforeLease(req)
+		}
 		release, ok := req.AcquireSubmissionLease()
 		if !ok {
 			continue
@@ -54,10 +59,83 @@ func gapStackTestSetup(t *testing.T, executor OrderExecutorInterface) *SuperPosi
 	cfg.Execution.MakerGuardTicks = 2
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3, 0.01)
 	spm.anchorPrice = 103.75
+	observeGapStackBaseline(t, spm, 103.75)
 	market := freshMarket(103.55, 103.54, 103.60, 1)
 	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
 	prepareFilledSellSlot(spm, 103.75, 0.29)
 	return spm
+}
+
+// 通过真实规划入口建立观测起点，不预先下单或伪造跨格状态。
+func observeGapStackBaseline(t *testing.T, spm *SuperPositionManager, price float64) {
+	t.Helper()
+	buyWindow, sellWindow := spm.config.Trading.BuyWindowSize, spm.config.Trading.SellWindowSize
+	spm.config.Trading.BuyWindowSize, spm.config.Trading.SellWindowSize = 0, 0
+	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot {
+		return freshMarket(price, price-0.01, price+0.05, 1)
+	})
+	if err := spm.AdjustOrders(price); err != nil {
+		t.Fatalf("baseline AdjustOrders(%v): %v", price, err)
+	}
+	spm.config.Trading.BuyWindowSize, spm.config.Trading.SellWindowSize = buyWindow, sellWindow
+}
+
+func TestGapStackRequiresObservedDownwardJump(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		previous  []float64
+		max       int
+		epoch     uint64
+		wantCount int
+		wantQty   float64
+	}{
+		{"startup with empty upper grids", nil, 2, 1, 1, 0.14},
+		{"unchanged grid", []float64{736.78}, 2, 1, 1, 0.14},
+		{"one grid drop", []float64{737.78}, 2, 1, 1, 0.14},
+		{"successive one grid drops", []float64{739.78, 738.78, 737.78}, 2, 1, 1, 0.14},
+		{"upward move", []float64{734.78}, 2, 1, 1, 0.14},
+		{"two grid drop", []float64{738.78}, 2, 1, 2, 0.28},
+		{"three grid drop", []float64{739.78}, 2, 1, 3, 0.42},
+		{"configured extra grid cap", []float64{741.78}, 1, 1, 2, 0.28},
+		{"disabled", []float64{739.78}, 0, 1, 1, 0.14},
+		{"reconnected stream", []float64{739.78}, 2, 2, 1, 0.14},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.Trading.Symbol = "BNBUSDC"
+			cfg.Trading.PriceInterval = 1
+			cfg.Trading.OrderQuantity = 100
+			cfg.Trading.MinOrderValue = 6
+			cfg.Trading.BuyWindowSize, cfg.Trading.SellWindowSize = 1, 0
+			cfg.Execution.MaxGapStackSlots = tc.max
+			executor := &gapStackExecutor{}
+			spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 2, 0.01)
+			spm.anchorPrice = 739.78
+			for _, price := range tc.previous {
+				observeGapStackBaseline(t, spm, price)
+			}
+			market := freshMarket(736.78, 736.77, 736.83, 2)
+			market.StreamEpoch = tc.epoch
+			spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
+			if err := spm.AdjustOrders(736.78); err != nil {
+				t.Fatal(err)
+			}
+			if len(executor.orders) != 1 {
+				t.Fatalf("orders=%+v, want one BUY", executor.orders)
+			}
+			buy := executor.orders[0]
+			if buy.Side != "BUY" || buy.GapStack != tc.wantCount || buy.Quantity != tc.wantQty {
+				t.Fatalf("buy side=%s qty=%v count=%d, want BUY/%v/%d",
+					buy.Side, buy.Quantity, buy.GapStack, tc.wantQty, tc.wantCount)
+			}
+			if err := spm.AdjustOrders(736.78); err != nil {
+				t.Fatal(err)
+			}
+			if len(executor.orders) != 1 || len(executor.cancelIDs) != 0 {
+				t.Fatal("same-grid adjustment resubmitted or resized the existing BUY")
+			}
+		})
+	}
 }
 
 func TestGapStackBuyDoublesQuantityWhenUpperGridSkipped(t *testing.T) {
@@ -158,6 +236,76 @@ func TestGapStackFillSplitsAndPlacesSellsAtSkippedGrids(t *testing.T) {
 	if price, ok := sellBySlot[103.65]; !ok || price < 103.75-fillQtyTolerance {
 		t.Fatalf("103.65 inventory sell=%v, want >= 103.75: %+v", price, sellBySlot)
 	}
+	// 同一格内拆出的仓位全部卖完，也只能恢复普通一格买单，不能复用旧跌幅。
+	for _, req := range executor.orders[before:] {
+		if req.Side != "SELL" {
+			continue
+		}
+		slot := spm.getOrCreateSlot(req.LogicalPrice)
+		spm.OnOrderUpdate(OrderUpdate{
+			OrderID: slot.OrderID, ClientOrderID: req.ClientOrderID, Status: "FILLED",
+			Quantity: req.Quantity, ExecutedQty: req.Quantity, Price: req.Price, AvgPrice: req.Price, Side: "SELL",
+		})
+	}
+	before = len(executor.orders)
+	if err := spm.AdjustOrders(103.55); err != nil {
+		t.Fatal(err)
+	}
+	var rebought bool
+	for _, req := range executor.orders[before:] {
+		if req.Side == "BUY" && req.LogicalPrice == 103.55 {
+			rebought = true
+			if req.GapStack != 1 || req.Quantity != unit {
+				t.Fatalf("sold inventory caused repeated stacking: %+v", req)
+			}
+		}
+	}
+	if !rebought {
+		t.Fatal("missing ordinary BUY after sells")
+	}
+}
+
+func TestGapStackRechecksChildBeforeSubmission(t *testing.T) {
+	executor := &gapStackExecutor{}
+	spm := gapStackTestSetup(t, executor)
+	oldID := spm.generateClientOrderID(103.65, "BUY")
+	executor.beforeLease = func(req *OrderRequest) {
+		if req.Side == "BUY" && req.GapStack > 1 {
+			// 规划后、真实提交前收到旧买单迟到成交，不能仍提交双倍数量。
+			spm.OnOrderUpdate(OrderUpdate{
+				OrderID: 700, ClientOrderID: oldID, Status: "FILLED", Side: "BUY",
+				Quantity: 0.29, ExecutedQty: 0.29, Price: 103.65, AvgPrice: 103.65,
+			})
+		}
+	}
+	if err := spm.AdjustOrders(103.55); err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range executor.orders {
+		if req.Side == "BUY" {
+			t.Fatal("submitted stacked BUY after its child filled")
+		}
+	}
+	parent := spm.getOrCreateSlot(103.55)
+	if parent.ClientOID != "" || parent.SlotStatus != SlotStatusFree {
+		t.Fatal("invalidated parent reservation was not released")
+	}
+	child := spm.getOrCreateSlot(103.65)
+	if child.PositionQty != 0.29 {
+		t.Fatalf("lost late child fill: %v", child.PositionQty)
+	}
+	if child.stackedParentPrice != 0 {
+		t.Fatal("invalidated parent left the filled child reserved")
+	}
+	executor.beforeLease = nil
+	if err := spm.AdjustOrders(103.55); err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range executor.orders {
+		if req.Side == "BUY" && req.GapStack > 1 {
+			t.Fatal("late child fill was counted as a missing grid on retry")
+		}
+	}
 }
 
 func TestGapStackDoesNotStackWhenUpperGridAlreadyFilled(t *testing.T) {
@@ -235,6 +383,7 @@ func TestGapStackCancelsPreexistingCurrentBuyAfterUpperBuysLeaveWindow(t *testin
 	spm := gapStackTestSetup(t, executor)
 	spm.config.Execution.MaxGapStackSlots = 5
 	spm.anchorPrice = 103.27
+	observeGapStackBaseline(t, spm, 103.27)
 	market := freshMarket(102.67, 102.66, 102.72, 2)
 	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
 
@@ -272,6 +421,21 @@ func TestGapStackCancelsPreexistingCurrentBuyAfterUpperBuysLeaveWindow(t *testin
 	current := spm.getOrCreateSlot(102.67)
 	if current.OrderStatus != OrderStatusCancelRequested {
 		t.Fatalf("current buy status = %s, want CANCEL_REQUESTED", current.OrderStatus)
+	}
+	// 先确认当前格撤销。上方旧单仍有成交可能，不能提前创建合并买单。
+	first := liveBuys[0]
+	spm.OnOrderUpdate(OrderUpdate{
+		OrderID: first.orderID, ClientOrderID: first.clientID, Status: "CANCELED",
+		Quantity: first.quantity, Price: first.price, Side: "BUY",
+	})
+	spm.clearAdjustFingerprint()
+	if err := spm.AdjustOrders(102.67); err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range executor.orders {
+		if req.Side == "BUY" {
+			t.Fatal("submitted replacement before upper BUY cancellations were confirmed")
+		}
 	}
 
 	for _, buy := range liveBuys {
@@ -330,5 +494,24 @@ func TestGapStackFailedReservationReleasesChild(t *testing.T) {
 	parent := spm.getOrCreateSlot(103.55)
 	if parent.SlotStatus == SlotStatusPending {
 		t.Fatal("failed stacked buy left parent pending")
+	}
+	// 明确未提交的重试保留真实跨格证据，清除规划指纹不会制造或丢掉格数。
+	parent.placementRetryNotBefore = time.Time{}
+	spm.clearAdjustFingerprint()
+	before := len(executor.orders)
+	if err := spm.AdjustOrders(103.55); err != nil {
+		t.Fatal(err)
+	}
+	var retried bool
+	for _, req := range executor.orders[before:] {
+		if req.Side == "BUY" && req.LogicalPrice == 103.55 {
+			retried = true
+			if req.GapStack != 2 || req.Quantity != buy.Quantity {
+				t.Fatalf("retry changed proven gap quantity: %+v", req)
+			}
+		}
+	}
+	if !retried {
+		t.Fatal("missing BUY retry")
 	}
 }

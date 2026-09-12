@@ -8,6 +8,37 @@ import (
 
 const maxGapStackSlotsCap = 10
 
+// gapStackWindow 只保留最近一次向下跨格的证据。parentPrice 与 upperPrice
+// 之间的格子才可补买，不包含下跌起点。所有访问由 adjustMu 串行化。
+// 同格撤单/拒单重试保留证据；换格、断流或当前格已有成交时不再沿用。
+type gapStackWindow struct {
+	lastGridPrice float64
+	streamEpoch   uint64
+	parentPrice   float64
+	upperPrice    float64
+}
+
+func (spm *SuperPositionManager) observeGapStackGrid(gridPrice float64, epoch uint64) {
+	previous := spm.gapWindow
+	w := &spm.gapWindow
+	w.lastGridPrice, w.streamEpoch = gridPrice, epoch
+	if spm.maxGapStackSlots() <= 0 || previous.lastGridPrice <= 0 || previous.streamEpoch != epoch {
+		w.parentPrice, w.upperPrice = 0, 0
+		return
+	}
+	if !sameGridPrice(previous.lastGridPrice, gridPrice) {
+		w.parentPrice, w.upperPrice = 0, 0
+		upper := roundPrice(previous.lastGridPrice-spm.config.Trading.PriceInterval, spm.priceDecimals)
+		if upper > gridPrice+fillQtyTolerance {
+			w.parentPrice, w.upperPrice = gridPrice, upper
+		}
+	}
+	// 成交后先消费本次跨格证据，再拆仓/挂卖，避免卖完后在同一格重复加倍。
+	if sameGridPrice(w.parentPrice, gridPrice) && spm.gapSlotKindAt(gridPrice) == gapSlotFilled {
+		w.parentPrice, w.upperPrice = 0, 0
+	}
+}
+
 func (spm *SuperPositionManager) maxGapStackSlots() int {
 	if spm == nil || spm.config == nil {
 		return 0
@@ -54,6 +85,7 @@ const (
 	gapSlotEmpty gapSlotKind = iota
 	gapSlotFilled
 	gapSlotBlocked
+	gapSlotCanceling
 )
 
 func (spm *SuperPositionManager) gapSlotKindAt(price float64) gapSlotKind {
@@ -84,8 +116,8 @@ func gapSlotKindLocked(slot *InventorySlot) gapSlotKind {
 		slot.OrderSide == "BUY" &&
 		slot.OrderFilledQty <= fillQtyTolerance &&
 		slot.PositionQty <= fillQtyTolerance {
-		// 正在撤销的窗口外买单视为可合并的空格，但不能占用其订单身份。
-		return gapSlotEmpty
+		// 仅可用于提前撤掉当前格的小额买单；未确认撤销前不能补买这一格。
+		return gapSlotCanceling
 	}
 	if slot.OrderID != 0 || slot.ClientOID != "" {
 		return gapSlotBlocked
@@ -93,12 +125,18 @@ func gapSlotKindLocked(slot *InventorySlot) gapSlotKind {
 	if slot.SlotStatus == SlotStatusPending || slot.SlotStatus == SlotStatusLocked {
 		return gapSlotBlocked
 	}
+	if slot.stackedParentPrice > 0 {
+		return gapSlotBlocked
+	}
 	return gapSlotEmpty
 }
 
-func (spm *SuperPositionManager) collectGapStackSlots(currentGridPrice float64) (children []float64, blocked bool) {
+func (spm *SuperPositionManager) collectGapStackSlots(currentGridPrice float64, allowCanceling bool) (children []float64, blocked bool) {
 	max := spm.maxGapStackSlots()
 	if max <= 0 || currentGridPrice <= 0 || spm.config == nil {
+		return nil, false
+	}
+	if !sameGridPrice(spm.gapWindow.parentPrice, currentGridPrice) {
 		return nil, false
 	}
 	interval := spm.config.Trading.PriceInterval
@@ -107,11 +145,21 @@ func (spm *SuperPositionManager) collectGapStackSlots(currentGridPrice float64) 
 	}
 	for i := 1; i <= max; i++ {
 		price := roundPrice(currentGridPrice+float64(i)*interval, spm.priceDecimals)
+		if price > spm.gapWindow.upperPrice+fillQtyTolerance {
+			break
+		}
 		switch spm.gapSlotKindAt(price) {
 		case gapSlotFilled:
+			// 已买到的格子即使之后卖完，也不能再次计为本次漏单。
+			spm.gapWindow.upperPrice = roundPrice(price-interval, spm.priceDecimals)
 			return children, false
 		case gapSlotBlocked:
 			return children, true
+		case gapSlotCanceling:
+			if !allowCanceling {
+				return children, true
+			}
+			children = append(children, price)
 		default:
 			children = append(children, price)
 		}
@@ -138,6 +186,36 @@ func (spm *SuperPositionManager) reserveGapStackChildren(parentPrice float64, ch
 	}
 }
 
+// 调用方持有父槽锁，按价格升序再锁子槽，与分仓锁顺序一致。
+// 锁保持到真实提交结束，防止规划后的迟到成交把“漏买格”变成已有持仓。
+func (spm *SuperPositionManager) acquireGapStackChildrenLease(parentPrice float64, stackCount int) (func(), bool) {
+	children := spm.gapStackChildPrices(parentPrice, stackCount)
+	locked := make([]*InventorySlot, 0, len(children))
+	release := func() {
+		for i := len(locked) - 1; i >= 0; i-- {
+			locked[i].mu.Unlock()
+		}
+	}
+	for _, price := range children {
+		raw, ok := spm.slots.Load(price)
+		if !ok {
+			release()
+			return nil, false
+		}
+		child := raw.(*InventorySlot)
+		child.mu.Lock()
+		locked = append(locked, child)
+		mapped, exists := spm.slots.Load(price)
+		if !exists || mapped != child || child.stackedParentPrice != parentPrice ||
+			child.PositionQty > fillQtyTolerance || child.PositionStatus != PositionStatusEmpty ||
+			child.OrderID != 0 || child.ClientOID != "" || child.SlotStatus != SlotStatusFree {
+			release()
+			return nil, false
+		}
+	}
+	return release, true
+}
+
 func (spm *SuperPositionManager) releaseGapStackChildren(parentPrice float64, stackCount int) {
 	if spm == nil || parentPrice <= 0 || stackCount < 2 {
 		return
@@ -152,9 +230,8 @@ func (spm *SuperPositionManager) releaseGapStackChildren(parentPrice float64, st
 			continue
 		}
 		slot.mu.Lock()
-		if slot.stackedParentPrice == parentPrice &&
-			slot.PositionQty <= fillQtyTolerance &&
-			slot.OrderID == 0 && slot.ClientOID == "" {
+		// 父单已明确释放，只解除其占用标记；子槽迟到成交/新订单保持原样。
+		if slot.stackedParentPrice == parentPrice {
 			slot.stackedParentPrice = 0
 		}
 		slot.mu.Unlock()
@@ -186,7 +263,7 @@ func (spm *SuperPositionManager) ensureGapStackChildReservations() {
 }
 
 func (spm *SuperPositionManager) undersizedGapStackBuy(currentGridPrice float64) (outOfWindowBuy, bool) {
-	children, blocked := spm.collectGapStackSlots(currentGridPrice)
+	children, blocked := spm.collectGapStackSlots(currentGridPrice, true)
 	desired := 1 + len(children)
 	if blocked || desired < 2 {
 		return outOfWindowBuy{}, false

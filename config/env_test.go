@@ -91,6 +91,35 @@ func TestExecutionEnvOverrides(t *testing.T) {
 	}
 }
 
+func TestGapStackConfigLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		env  string
+		want int
+	}{
+		{"omitted defaults off", "", "", 0},
+		{"explicit yaml zero", "execution:\n  max_gap_stack_slots: 0\n", "", 0},
+		{"explicit yaml opt in", "execution:\n  max_gap_stack_slots: 2\n", "", 2},
+		{"env zero overrides yaml", "execution:\n  max_gap_stack_slots: 2\n", "0", 0},
+		{"env opt in", "", "2", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OPENSQT_EXECUTION_MAX_GAP_STACK_SLOTS", tc.env)
+			cfg, err := LoadConfig(writeTempYAML(t, envTestYAML+tc.yaml))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Execution.MaxGapStackSlots != tc.want {
+				t.Fatalf("max_gap_stack_slots=%d, want %d", cfg.Execution.MaxGapStackSlots, tc.want)
+			}
+			if err := cfg.Validate(); err != nil || cfg.Execution.MaxGapStackSlots != tc.want {
+				t.Fatalf("revalidation changed max_gap_stack_slots: %d, err=%v", cfg.Execution.MaxGapStackSlots, err)
+			}
+		})
+	}
+}
+
 func TestEmptyEnvDoesNotOverrideYAML(t *testing.T) {
 	t.Setenv("OPENSQT_EXCHANGES_BINANCE_API_KEY", "   ")
 	t.Setenv("OPENSQT_TRADING_SYMBOL", "")

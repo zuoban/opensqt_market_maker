@@ -35,7 +35,7 @@ func TestDashboardDefaults(t *testing.T) {
 		c.Execution.PostOnlyRetryBurst != 5 || c.Execution.CatchUpMode != "passive" ||
 		c.Execution.MaxActiveCatchUpSlots != 1 || c.Execution.MaxCatchUpSlotsPerAdjust != 1 ||
 		c.Execution.MaxCatchUpDistanceRatio != 0.5 || c.Execution.NearTouchSingleOrderRatio != 0.15 ||
-		c.Execution.MaxGapStackSlots != 1 {
+		c.Execution.MaxGapStackSlots != 0 {
 		t.Fatalf("execution defaults = %+v", c.Execution)
 	}
 	c.Dashboard.PushIntervalMS = 50
