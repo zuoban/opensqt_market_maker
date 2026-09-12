@@ -40,6 +40,69 @@ func freshMarket(last, bid, ask float64, quoteVersion uint64) exchange.MarketSna
 	}
 }
 
+func TestAdjustOrdersPlacesWhenBookLooksLikeQuantityNotPrice(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.Symbol = "BNBUSDC"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 100
+	cfg.Trading.MinOrderValue = 20
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 0
+	cfg.Execution.CatchUpMode = "passive"
+	cfg.Execution.MaxCatchUpDistanceRatio = 0.5
+
+	executor := &makerPolicyExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 3, 2, 0.01)
+	spm.anchorPrice = 736.58
+	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot {
+		return freshMarket(736.61, 10.50, 12.30, 3)
+	})
+
+	if err := spm.AdjustOrders(736.61); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	if len(executor.batches) != 1 || len(executor.batches[0]) < 8 {
+		t.Fatalf("quantity-like bookTicker blocked the buy window: %+v", executor.batches)
+	}
+}
+
+func TestAdjustOrdersPlacesBNBWindowBelowLiveAsk(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.Symbol = "BNBUSDC"
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.OrderQuantity = 100
+	cfg.Trading.MinOrderValue = 20
+	cfg.Trading.BuyWindowSize = 10
+	cfg.Trading.SellWindowSize = 0
+	cfg.Execution.CatchUpMode = "passive"
+
+	executor := &makerPolicyExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 3, 2, 0.01)
+	spm.anchorPrice = 736.58
+	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot {
+		return freshMarket(736.47, 736.46, 736.48, 4)
+	})
+
+	if err := spm.AdjustOrders(736.47); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	if len(executor.batches) != 1 || len(executor.batches[0]) < 8 {
+		t.Fatalf("live BNB book should fill the buy window: %+v", executor.batches)
+	}
+}
+
+func TestMakerCapReachableByBuyWindow(t *testing.T) {
+	if !makerCapReachableByBuyWindow(727.58, 736.46, 1, 10) {
+		t.Fatal("normal window below cap must be reachable")
+	}
+	if makerCapReachableByBuyWindow(727.58, 11.98, 1, 10) {
+		t.Fatal("quantity-like cap far below the window must be unreachable")
+	}
+	if !makerCapReachableByBuyWindow(100, 94.99, 10, 1) {
+		t.Fatal("catch-up just beyond half a grid must still be treated as the same market")
+	}
+}
+
 func TestAdjustOrdersPlacesWhenBookTickerIsQuietButTradesAreLive(t *testing.T) {
 	cfg := testConfig()
 	cfg.Trading.PriceInterval = 1

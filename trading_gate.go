@@ -481,7 +481,7 @@ func (r *tradingGateRuntime) snapshot() tradingGateHealth {
 		ReconcilerReady:  r.reconciler.IsHealthy(),
 		PriceFresh: market.Ready && market.LastPrice > 0 &&
 			priceIsFresh(r.price.GetLastPriceTime(), now, r.priceStaleAfter) &&
-			priceIsFresh(market.QuoteReceivedAt, now, r.priceStaleAfter),
+			priceIsFresh(market.LastEventAt(), now, r.priceStaleAfter),
 	}
 }
 

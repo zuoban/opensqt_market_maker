@@ -345,6 +345,7 @@ type SuperPositionManager struct {
 	catchUpOrders    atomic.Uint64
 	catchUpAbandoned atomic.Uint64
 	lastQuoteSkipLog atomic.Int64
+	lastEmptyBuyLog  atomic.Int64
 
 	// 仅测试：扫描窗口外买单之后、提交撤销之前调用。
 	beforeCommitOutOfWindowBuys func()
@@ -1331,6 +1332,15 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			maxCatchUpDistanceRatio = spm.config.Execution.MaxCatchUpDistanceRatio
 		}
 	}
+	if hasMakerBuyCap && len(slotPrices) > 0 &&
+		!makerCapReachableByBuyWindow(slotPrices[len(slotPrices)-1], buyMakerCap, priceInterval, buyWindowSize) {
+		logger.Warn("⚠️ [Maker盘口] 买一/卖一 %s/%s 相对现价 %s 无法覆盖买单窗口（Maker上限 %s，模式 %s），改用成交价安全垫",
+			formatPrice(market.BestBid, spm.priceDecimals),
+			formatPrice(market.BestAsk, spm.priceDecimals),
+			formatPrice(currentPrice, spm.priceDecimals),
+			formatPrice(buyMakerCap, spm.priceDecimals), catchUpMode)
+		hasMakerBuyCap = false
+	}
 	for _, price := range slotPrices {
 		slot := spm.getOrCreateSlot(price)
 		slot.mu.Lock()
@@ -1459,6 +1469,9 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 		}
 
 		slot.mu.Unlock()
+	}
+	if len(buyOrdersToPlace) == 0 && allowedNewBuyOrders > 0 && !buyPlacementPaused {
+		spm.logEmptyBuyWindow(currentPrice, currentGridPrice, slotPrices, market, buyMakerCap, hasMakerBuyCap, catchUpMode)
 	}
 
 	// ReduceOnly SELL 先进入执行边界；批次中后续请求失败时，
@@ -3074,6 +3087,55 @@ func (spm *SuperPositionManager) makerBuyCap(snapshot exchange.MarketSnapshot) (
 		return 0, false
 	}
 	return roundPrice(float64(tick)*spm.priceTickSize, spm.priceDecimals), true
+}
+
+func makerCapReachableByBuyWindow(lowest, cap, interval float64, windowSlots int) bool {
+	if cap <= 0 || lowest <= 0 {
+		return false
+	}
+	if lowest <= cap+fillQtyTolerance {
+		return true
+	}
+	if interval <= 0 {
+		return false
+	}
+	if windowSlots < 1 {
+		windowSlots = 1
+	}
+	return lowest-cap <= interval*float64(windowSlots)+fillQtyTolerance
+}
+
+func (spm *SuperPositionManager) logEmptyBuyWindow(
+	currentPrice, gridPrice float64,
+	slotPrices []float64,
+	market exchange.MarketSnapshot,
+	buyMakerCap float64,
+	hasMakerBuyCap bool,
+	catchUpMode string,
+) {
+	nowNano := time.Now().UnixNano()
+	last := spm.lastEmptyBuyLog.Load()
+	if last != 0 && nowNano-last < int64(5*time.Second) {
+		return
+	}
+	if !spm.lastEmptyBuyLog.CompareAndSwap(last, nowNano) {
+		return
+	}
+	lowest := 0.0
+	if len(slotPrices) > 0 {
+		lowest = slotPrices[len(slotPrices)-1]
+	}
+	capText := "无"
+	if hasMakerBuyCap {
+		capText = formatPrice(buyMakerCap, spm.priceDecimals)
+	}
+	logger.Warn("⚠️ [跳过买单] 空窗口未生成买单: 现价 %s 网格 %s 最低格 %s 买一/卖一 %s/%s Maker上限 %s 模式 %s",
+		formatPrice(currentPrice, spm.priceDecimals),
+		formatPrice(gridPrice, spm.priceDecimals),
+		formatPrice(lowest, spm.priceDecimals),
+		formatPrice(market.BestBid, spm.priceDecimals),
+		formatPrice(market.BestAsk, spm.priceDecimals),
+		capText, catchUpMode)
 }
 
 func (spm *SuperPositionManager) allocateMakerSafeSellPriceFromFloor(
