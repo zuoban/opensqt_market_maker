@@ -221,6 +221,33 @@ func TestMakerGuardRejectsStaleQuoteBeforeExchange(t *testing.T) {
 	}
 }
 
+func TestMakerGuardAllowsUnchangedBookWhenStreamIsLive(t *testing.T) {
+	ex := &recordingExchange{
+		placeOrder: func(req *exchange.OrderRequest) (*exchange.Order, error) {
+			return &exchange.Order{OrderID: 1, ClientOrderID: req.ClientOrderID, Status: exchange.OrderStatusNew}, nil
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "BNBUSDC", 0, 0)
+	now := time.Now()
+	executor.SetMakerGuard(func() exchange.MarketSnapshot {
+		return exchange.MarketSnapshot{
+			Symbol: "BNBUSDC", LastPrice: 736.61, BestBid: 736.60, BestAsk: 736.62, Ready: true,
+			QuoteReceivedAt: now.Add(-7 * time.Second), ReceivedAt: now,
+			QuoteVersion: 1, StreamEpoch: 1,
+		}
+	}, 0.01, 1, 1500*time.Millisecond)
+
+	order, err := executor.PlaceOrder(&OrderRequest{
+		Symbol: "BNBUSDC", Side: "BUY", Price: 735.53, Quantity: 0.14,
+	})
+	if err != nil || order == nil {
+		t.Fatalf("live stream with static book rejected: order=%v err=%v", order, err)
+	}
+	if len(ex.requests) != 1 {
+		t.Fatalf("exchange request count = %d, want 1", len(ex.requests))
+	}
+}
+
 func TestMakerGuardRejectsInvalidOrderPriceBeforeExchange(t *testing.T) {
 	ex := &recordingExchange{
 		placeOrder: func(*exchange.OrderRequest) (*exchange.Order, error) {

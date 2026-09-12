@@ -175,7 +175,7 @@ Binance 的 PostOnly 订单在到达撮合系统时如果会立即成交，会�
 ```yaml
 execution:
   maker_guard_ticks: 2
-  quote_stale_ms: 1500
+  quote_stale_ms: 30000
   post_only_retry_min_ms: 50
   post_only_retry_max_ms: 500
   post_only_retry_burst: 5
@@ -188,7 +188,7 @@ execution:
 ```
 
 - 同一盘口版本只尝试一次；明确 `-5022` 后默认按 50/100/200/400/500ms 退避，超过 5 次后每次至少等待 1 秒。
-- 盘口超过 1500ms 未更新、连接重建或快照不完整时暂停新提交；不会使用旧盘口盲挂。
+- 市场数据流（成交或 bookTicker）静默超过 30s、连接重建或快照不完整时暂停新提交。bookTicker 只在最优盘口变化时推送，没有新盘口不等于盘口失效。
 - 距盘口过近的订单拆成单笔请求，降低原生批量请求中共享陈旧盘口的概率。
 - 下单结果为 UNKNOWN 时保持原槽位 `PENDING` 和原 ClientOrderID，优先等待订单流；预留超过 5 秒后，对账会按同一 ClientOrderID 只读确认。只有 3 次、间隔至少 500ms 的查询都明确返回“订单不存在”才释放槽位；超时或异常响应仍保持关闭，避免重复下单。
 - `order_quantity` 始终表示每格报价货币金额；被动补格改变实际买价时会重新计算数量。

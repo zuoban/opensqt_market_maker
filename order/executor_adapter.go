@@ -183,9 +183,14 @@ func checkMakerGuardSnapshot(
 		return NewOrderRejectedError(OrderRejectionMarketDataStale,
 			fmt.Errorf("盘口交易对不匹配: got %s, want %s", snapshot.Symbol, req.Symbol))
 	}
-	if staleAfter > 0 && (snapshot.QuoteReceivedAt.IsZero() || time.Since(snapshot.QuoteReceivedAt) > staleAfter) {
+	now := time.Now()
+	if staleAfter > 0 && !snapshot.MakerBookUsable(now, staleAfter) {
+		age := now.Sub(snapshot.LastEventAt()).Round(time.Millisecond)
+		if snapshot.LastEventAt().IsZero() || now.Before(snapshot.LastEventAt()) {
+			age = 0
+		}
 		return NewOrderRejectedError(OrderRejectionMarketDataStale,
-			fmt.Errorf("最优盘口已过期: age=%s", time.Since(snapshot.QuoteReceivedAt).Round(time.Millisecond)))
+			fmt.Errorf("市场数据流已静默: age=%s", age))
 	}
 	if tickSize <= 0 || math.IsNaN(tickSize) || math.IsInf(tickSize, 0) {
 		return NewOrderRejectedError(OrderRejectionMarketDataStale,

@@ -123,6 +123,38 @@ type MarketSnapshot struct {
 	Ready           bool
 }
 
+// LastEventAt 是本进程最近一次收到该 epoch 市场数据的本地时间。
+// Binance bookTicker 只在最优价/量变化时推送；成交仍证明同一条 combined 流活着。
+func (s MarketSnapshot) LastEventAt() time.Time {
+	latest := s.ReceivedAt
+	if s.QuoteReceivedAt.After(latest) {
+		latest = s.QuoteReceivedAt
+	}
+	if s.TradeTime.After(latest) {
+		latest = s.TradeTime
+	}
+	return latest
+}
+
+// MakerBookUsable 表示当前 epoch 已有合法买卖一，且市场数据流仍在活动。
+// 没有新的 bookTicker 只说明最优盘口没变，不能当成盘口失效。
+func (s MarketSnapshot) MakerBookUsable(now time.Time, staleAfter time.Duration) bool {
+	if !s.Ready || s.BestBid <= 0 || s.BestAsk <= s.BestBid || s.QuoteReceivedAt.IsZero() {
+		return false
+	}
+	if staleAfter <= 0 {
+		return true
+	}
+	last := s.LastEventAt()
+	if last.IsZero() {
+		return false
+	}
+	if now.Before(last) {
+		return true
+	}
+	return now.Sub(last) <= staleAfter
+}
+
 // OrderUpdate WebSocket 订单更新事件（通用）
 type OrderUpdate struct {
 	OrderID                int64

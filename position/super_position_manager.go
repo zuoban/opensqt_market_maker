@@ -344,6 +344,7 @@ type SuperPositionManager struct {
 	postOnlyRejects  atomic.Uint64
 	catchUpOrders    atomic.Uint64
 	catchUpAbandoned atomic.Uint64
+	lastQuoteSkipLog atomic.Int64
 
 	// 仅测试：扫描窗口外买单之后、提交撤销之前调用。
 	beforeCommitOutOfWindowBuys func()
@@ -495,19 +496,40 @@ func (spm *SuperPositionManager) hasMarketSnapshotProvider() bool {
 	return configured
 }
 
-func (spm *SuperPositionManager) marketQuoteUsable(snapshot exchange.MarketSnapshot, now time.Time) bool {
-	if !snapshot.Ready || snapshot.LastPrice <= 0 || snapshot.BestBid <= 0 || snapshot.BestAsk <= snapshot.BestBid ||
-		snapshot.QuoteReceivedAt.IsZero() {
-		return false
-	}
-	staleAfter := 1500 * time.Millisecond
+func (spm *SuperPositionManager) quoteStaleAfter() time.Duration {
 	if spm != nil && spm.config != nil && spm.config.Execution.QuoteStaleMS > 0 {
-		staleAfter = time.Duration(spm.config.Execution.QuoteStaleMS) * time.Millisecond
+		return time.Duration(spm.config.Execution.QuoteStaleMS) * time.Millisecond
 	}
-	if now.Before(snapshot.QuoteReceivedAt) {
-		return true
+	return 30 * time.Second
+}
+
+func (spm *SuperPositionManager) marketQuoteUsable(snapshot exchange.MarketSnapshot, now time.Time) bool {
+	return snapshot.MakerBookUsable(now, spm.quoteStaleAfter())
+}
+
+func (spm *SuperPositionManager) logUnusableQuote(snapshot exchange.MarketSnapshot, now time.Time) {
+	last := spm.lastQuoteSkipLog.Load()
+	if last != 0 && now.UnixNano()-last < int64(5*time.Second) {
+		return
 	}
-	return now.Sub(snapshot.QuoteReceivedAt) <= staleAfter
+	if !spm.lastQuoteSkipLog.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	if !snapshot.Ready || snapshot.BestBid <= 0 || snapshot.BestAsk <= snapshot.BestBid ||
+		snapshot.QuoteReceivedAt.IsZero() {
+		logger.Warn("⚠️ [Maker盘口] 完整盘口尚未就绪，暂停本轮新单")
+		return
+	}
+	streamAge := time.Duration(0)
+	if lastEvent := snapshot.LastEventAt(); !lastEvent.IsZero() && !now.Before(lastEvent) {
+		streamAge = now.Sub(lastEvent)
+	}
+	quoteAge := time.Duration(0)
+	if !snapshot.QuoteReceivedAt.IsZero() && !now.Before(snapshot.QuoteReceivedAt) {
+		quoteAge = now.Sub(snapshot.QuoteReceivedAt)
+	}
+	logger.Warn("⚠️ [Maker盘口] 市场数据流已静默 %s（bookTicker %s 前），暂停本轮新单",
+		streamAge.Round(time.Millisecond), quoteAge.Round(time.Millisecond))
 }
 
 func makerRetryReadyForQuoteLocked(slot *InventorySlot, quoteVersion uint64) bool {
@@ -992,8 +1014,8 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 	}
 	if spm.hasMarketSnapshotProvider() && !spm.marketQuoteUsable(market, time.Now()) {
 		// 行情连接或盘口尚未完成新 epoch 初始化时不创建 reservation。
-		// 下一次盘口事件会主动唤醒协调器，禁止对陈旧快照做定时热循环。
-		logger.Debug("⏳ [Maker盘口] 完整或新鲜盘口尚未就绪，暂停本轮新单")
+		// 下一次盘口或成交事件会主动唤醒协调器，禁止对陈旧快照做定时热循环。
+		spm.logUnusableQuote(market, time.Now())
 		return nil
 	}
 

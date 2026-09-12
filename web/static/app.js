@@ -482,7 +482,7 @@
 		const age = finiteOrNull(market.quoteAgeMs);
 		const quoteAgeMs = quoteReady && age != null ? Math.max(0, age) : null;
 		const staleSetting = finiteOrNull(settings.quoteStaleMs);
-		const quoteStaleMs = staleSetting != null && staleSetting > 0 ? staleSetting : 1500;
+		const quoteStaleMs = staleSetting != null && staleSetting > 0 ? staleSetting : 30000;
 		const quoteStale = !quoteReady || quoteAgeMs == null || quoteAgeMs > quoteStaleMs;
 		const acceptanceRate = attempts > 0 ? clamp(accepted / attempts * 100, 0, 100) : null;
 

@@ -40,6 +40,34 @@ func freshMarket(last, bid, ask float64, quoteVersion uint64) exchange.MarketSna
 	}
 }
 
+func TestAdjustOrdersPlacesWhenBookTickerIsQuietButTradesAreLive(t *testing.T) {
+	cfg := testConfig()
+	cfg.Trading.PriceInterval = 1
+	cfg.Trading.BuyWindowSize = 3
+	cfg.Trading.SellWindowSize = 0
+	cfg.Execution.QuoteStaleMS = 1500
+	cfg.Execution.CatchUpMode = "exact_wait"
+
+	executor := &makerPolicyExecutor{}
+	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 3, 2, 0.01)
+	spm.anchorPrice = 736.53
+	now := time.Now()
+	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot {
+		return exchange.MarketSnapshot{
+			Symbol: "BNBUSDC", LastPrice: 736.61, BestBid: 736.60, BestAsk: 736.62,
+			QuoteReceivedAt: now.Add(-7 * time.Second), ReceivedAt: now,
+			QuoteVersion: 4, StreamEpoch: 1, Ready: true,
+		}
+	})
+
+	if err := spm.AdjustOrders(736.61); err != nil {
+		t.Fatalf("AdjustOrders() error = %v", err)
+	}
+	if len(executor.batches) != 1 || len(executor.batches[0]) == 0 {
+		t.Fatalf("quiet bookTicker blocked live-stream buys: %+v", executor.batches)
+	}
+}
+
 func TestPassiveCatchUpUsesMakerCapAndActualPriceForFixedNotional(t *testing.T) {
 	cfg := testConfig()
 	cfg.Trading.PriceInterval = 10

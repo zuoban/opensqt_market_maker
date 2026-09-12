@@ -262,7 +262,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("execution.quote_stale_ms 不能为负数")
 	}
 	if c.Execution.QuoteStaleMS == 0 {
-		c.Execution.QuoteStaleMS = 1500
+		c.Execution.QuoteStaleMS = 30000
 	}
 	if c.Execution.PostOnlyRetryMinMS < 0 {
 		return fmt.Errorf("execution.post_only_retry_min_ms 不能为负数")

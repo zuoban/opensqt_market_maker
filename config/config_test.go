@@ -30,7 +30,7 @@ func TestDashboardDefaults(t *testing.T) {
 	if c.Trading.OrderCleanupThreshold != 100 {
 		t.Fatalf("cleanup threshold = %d, want default 100", c.Trading.OrderCleanupThreshold)
 	}
-	if c.Execution.MakerGuardTicks != 2 || c.Execution.QuoteStaleMS != 1500 ||
+	if c.Execution.MakerGuardTicks != 2 || c.Execution.QuoteStaleMS != 30000 ||
 		c.Execution.PostOnlyRetryMinMS != 50 || c.Execution.PostOnlyRetryMaxMS != 500 ||
 		c.Execution.PostOnlyRetryBurst != 5 || c.Execution.CatchUpMode != "passive" ||
 		c.Execution.MaxActiveCatchUpSlots != 1 || c.Execution.MaxCatchUpSlotsPerAdjust != 1 ||
