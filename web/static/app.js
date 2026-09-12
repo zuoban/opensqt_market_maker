@@ -4,6 +4,16 @@
     const SNAPSHOT_INTERRUPTED_MS = 8000;
     const REST_TIMEOUT_MS = 4000;
 
+    function normalizeThemePref(value) {
+        return value === "light" || value === "dark" || value === "system" ? value : "system";
+    }
+
+    function resolveTheme(pref, systemTheme) {
+        const normalized = normalizeThemePref(pref);
+        if (normalized === "light" || normalized === "dark") return normalized;
+        return systemTheme === "light" ? "light" : "dark";
+    }
+
     if (typeof module !== "undefined" && module.exports) {
         module.exports = {
             buildKlineGridModel,
@@ -21,7 +31,9 @@
             formatRelativeTime,
             candleChangePct,
             formatCandleChange,
-            candleDetail
+            candleDetail,
+            normalizeThemePref,
+            resolveTheme
         };
         return;
     }
@@ -2954,6 +2966,106 @@
         if (websocketState() === "closed") connect();
     }
 
+    const THEME_KEY = "opensqt_theme";
+    const THEME_FALLBACK = { dark: "#080b0d", light: "#eef3f0" };
+
+    function systemThemeName(media) {
+        try {
+            const query = media || window.matchMedia("(prefers-color-scheme: light)");
+            return query.matches ? "light" : "dark";
+        } catch (_error) {
+            return "dark";
+        }
+    }
+
+    function readThemePref() {
+        try {
+            return normalizeThemePref(localStorage.getItem(THEME_KEY));
+        } catch (_error) {
+            return "system";
+        }
+    }
+
+    function saveThemePref(pref) {
+        try {
+            localStorage.setItem(THEME_KEY, pref);
+        } catch (_error) {
+            // Theme still applies for the current session without persistence.
+        }
+    }
+
+    function syncThemeSwitch(pref) {
+        const buttons = document.querySelectorAll(".theme-opt");
+        buttons.forEach((button) => {
+            const on = button.dataset.themePref === pref;
+            button.classList.toggle("is-on", on);
+            button.setAttribute("aria-checked", on ? "true" : "false");
+            button.tabIndex = on ? 0 : -1;
+        });
+    }
+
+    function applyTheme(pref, options) {
+        const normalized = normalizeThemePref(pref);
+        const theme = resolveTheme(normalized, systemThemeName());
+        const root = document.documentElement;
+        root.setAttribute("data-theme", theme);
+        root.setAttribute("data-theme-pref", normalized);
+        root.style.colorScheme = theme;
+        const meta = $("themeColor");
+        if (meta) {
+            const token = getComputedStyle(root).getPropertyValue("--theme-color").trim();
+            meta.setAttribute("content", token || THEME_FALLBACK[theme] || THEME_FALLBACK.dark);
+        }
+        const scheme = document.querySelector('meta[name="color-scheme"]');
+        if (scheme) scheme.setAttribute("content", theme);
+        syncThemeSwitch(normalized);
+        if (!options || options.redraw !== false) {
+            requestAnimationFrame(() => drawKlineChart());
+        }
+    }
+
+    function initTheme() {
+        applyTheme(readThemePref(), { redraw: false });
+        const group = document.querySelector(".theme-switch");
+        if (group) {
+            group.addEventListener("click", (event) => {
+                const button = event.target.closest(".theme-opt");
+                if (!button || !group.contains(button)) return;
+                const pref = normalizeThemePref(button.dataset.themePref);
+                saveThemePref(pref);
+                applyTheme(pref);
+            });
+            group.addEventListener("keydown", (event) => {
+                if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) {
+                    return;
+                }
+                const buttons = Array.from(group.querySelectorAll(".theme-opt"));
+                if (!buttons.length) return;
+                const current = buttons.findIndex((button) => button === document.activeElement);
+                let next = current < 0 ? 0 : current;
+                if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (next + 1) % buttons.length;
+                if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (next - 1 + buttons.length) % buttons.length;
+                if (event.key === "Home") next = 0;
+                if (event.key === "End") next = buttons.length - 1;
+                event.preventDefault();
+                buttons[next].focus();
+                saveThemePref(normalizeThemePref(buttons[next].dataset.themePref));
+                applyTheme(buttons[next].dataset.themePref);
+            });
+        }
+        try {
+            const media = window.matchMedia("(prefers-color-scheme: light)");
+            const onChange = () => {
+                if (readThemePref() === "system") applyTheme("system");
+            };
+            if (media.addEventListener) media.addEventListener("change", onChange);
+            else if (media.addListener) media.addListener(onChange);
+        } catch (_error) {
+            // matchMedia may be unavailable in restricted embeddings.
+        }
+    }
+
+    initTheme();
     initKlineChart();
     initHourlyChart();
     initCopyOrders();

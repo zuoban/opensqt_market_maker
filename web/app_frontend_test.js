@@ -18,7 +18,9 @@ const {
     formatRelativeTime,
     candleChangePct,
     formatCandleChange,
-    candleDetail
+    candleDetail,
+    normalizeThemePref,
+    resolveTheme
 } = require("./static/app.js");
 
 test("maker execution model reports quote health and strict-maker outcomes", () => {
@@ -435,6 +437,37 @@ test("a delayed REST instance cannot retire the current websocket generation", (
         time: "2026-09-02T10:00:03Z"
     }, currentWebSocket.sourceOrder, retired, true);
     assert.equal(nextCurrentWebSocket.accepted, true);
+});
+
+test("theme resolver maps stored preference onto a concrete palette", () => {
+    assert.equal(normalizeThemePref("light"), "light");
+    assert.equal(normalizeThemePref("dark"), "dark");
+    assert.equal(normalizeThemePref("system"), "system");
+    assert.equal(normalizeThemePref(""), "system");
+    assert.equal(normalizeThemePref("nope"), "system");
+    assert.equal(resolveTheme("light", "dark"), "light");
+    assert.equal(resolveTheme("dark", "light"), "dark");
+    assert.equal(resolveTheme("system", "light"), "light");
+    assert.equal(resolveTheme("system", "dark"), "dark");
+    assert.equal(resolveTheme("weird", "light"), "light");
+});
+
+test("dashboard markup exposes a persistent light/dark theme switch", () => {
+    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
+    const css = fs.readFileSync(__dirname + "/static/app.css", "utf8");
+    const js = fs.readFileSync(__dirname + "/static/app.js", "utf8");
+
+    assert.match(html, /data-theme-pref="system"/);
+    assert.match(html, /role="radiogroup"[^>]*aria-label="界面主题"/);
+    assert.match(html, /data-theme-pref="light"/);
+    assert.match(html, /data-theme-pref="dark"/);
+    assert.match(html, /opensqt_theme/);
+    assert.match(html, /id="themeColor"/);
+    assert.match(css, /html\[data-theme="light"\]/);
+    assert.match(cssBlock(css, ".theme-switch"), /display:\s*inline-flex/);
+    assert.match(cssBlock(css, 'html[data-theme="light"]'), /--ink:\s*#1c2a26/);
+    assert.match(js, /function applyTheme/);
+    assert.match(js, /localStorage.setItem\(THEME_KEY/);
 });
 
 test("event stream follows execution tape at the end of the dashboard", () => {
