@@ -23,6 +23,17 @@ func TestMakerBookUsableTreatsLiveTradesAsFreshBook(t *testing.T) {
 	}
 }
 
+func TestBookAgreesWithLastRejectsQuantityScale(t *testing.T) {
+	ok := MarketSnapshot{LastPrice: 736.52, BestBid: 736.50, BestAsk: 736.54}
+	if !ok.BookAgreesWithLast() {
+		t.Fatal("live BNB book should agree with last")
+	}
+	bad := MarketSnapshot{LastPrice: 736.52, BestBid: 0.72, BestAsk: 1.04}
+	if bad.BookAgreesWithLast() {
+		t.Fatal("quantity-scale bookTicker should not agree with last")
+	}
+}
+
 func TestMakerBookUsableRequiresReadyBook(t *testing.T) {
 	now := time.Now()
 	snapshot := MarketSnapshot{

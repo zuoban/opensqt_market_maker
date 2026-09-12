@@ -136,6 +136,17 @@ func (s MarketSnapshot) LastEventAt() time.Time {
 	return latest
 }
 
+// BookAgreesWithLast 判断买卖一是否和最近成交价属于同一价格量级。
+// Binance bookTicker 同时带 b/B、a/A；解析若把数量写进价格，会出现 ask≈1 而 last≈736。
+func (s MarketSnapshot) BookAgreesWithLast() bool {
+	if s.LastPrice <= 0 || s.BestBid <= 0 || s.BestAsk <= s.BestBid {
+		return s.BestBid > 0 && s.BestAsk > s.BestBid
+	}
+	low := s.LastPrice * 0.5
+	high := s.LastPrice * 1.5
+	return s.BestBid >= low && s.BestBid <= high && s.BestAsk >= low && s.BestAsk <= high
+}
+
 // MakerBookUsable 表示当前 epoch 已有合法买卖一，且市场数据流仍在活动。
 // 没有新的 bookTicker 只说明最优盘口没变，不能当成盘口失效。
 func (s MarketSnapshot) MakerBookUsable(now time.Time, staleAfter time.Duration) bool {

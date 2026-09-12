@@ -139,12 +139,14 @@ func (w *WebSocketManager) Start(ctx context.Context, callback OrderUpdateCallba
 type combinedMarketEnvelope struct {
 	Stream string `json:"stream"`
 	Data   struct {
-		EventType string `json:"e"`
-		EventTime int64  `json:"E"`
-		Symbol    string `json:"s"`
-		Price     string `json:"p"`
-		BestBid   string `json:"b"`
-		BestAsk   string `json:"a"`
+		EventType  string `json:"e"`
+		EventTime  int64  `json:"E"`
+		Symbol     string `json:"s"`
+		Price      string `json:"p"`
+		BestBid    string `json:"b"`
+		BestBidQty string `json:"B"`
+		BestAsk    string `json:"a"`
+		BestAskQty string `json:"A"`
 	} `json:"data"`
 }
 

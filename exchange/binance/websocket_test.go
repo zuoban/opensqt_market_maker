@@ -39,6 +39,19 @@ func TestParseCombinedMarketUpdate(t *testing.T) {
 		book.StreamEpoch != 3 || !book.EventTime.Equal(time.UnixMilli(1_700_000_000_456)) {
 		t.Fatalf("book update = %+v", book)
 	}
+
+	qtyOverwritten, recognized, err := parseCombinedMarketUpdate([]byte(`{
+		"stream":"bnbusdc@bookTicker",
+		"data":{"e":"bookTicker","E":1700000000789,"s":"BNBUSDC",
+			"b":"736.520","B":"0.72","a":"736.540","A":"1.04"}
+	}`), "BNBUSDC", 7, 3, receivedAt)
+	if err != nil || !recognized {
+		t.Fatalf("qty book parse = recognized:%v err:%v", recognized, err)
+	}
+	if qtyOverwritten.BestBid != 736.520 || qtyOverwritten.BestAsk != 736.540 {
+		t.Fatalf("bookTicker quantity overwrote price: bid=%v ask=%v",
+			qtyOverwritten.BestBid, qtyOverwritten.BestAsk)
+	}
 }
 
 func TestParseCombinedMarketUpdateRejectsInvalidBookAndSymbol(t *testing.T) {

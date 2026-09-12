@@ -200,18 +200,22 @@ func checkMakerGuardSnapshot(
 		guardTicks = 1
 	}
 	guard := float64(guardTicks) * tickSize
+	bid, ask := snapshot.BestBid, snapshot.BestAsk
+	if snapshot.LastPrice > 0 && !snapshot.BookAgreesWithLast() {
+		bid, ask = snapshot.LastPrice, snapshot.LastPrice
+	}
 	switch strings.ToUpper(req.Side) {
 	case "BUY":
-		capPrice := snapshot.BestAsk - guard
+		capPrice := ask - guard
 		if req.Price > capPrice+tickSize*1e-6 {
 			return NewOrderRejectedError(OrderRejectionMakerMoved,
-				fmt.Errorf("BUY %.12g 超过 Maker 上限 %.12g (ask=%.12g)", req.Price, capPrice, snapshot.BestAsk))
+				fmt.Errorf("BUY %.12g 超过 Maker 上限 %.12g (ask=%.12g)", req.Price, capPrice, ask))
 		}
 	case "SELL":
-		floorPrice := snapshot.BestBid + guard
+		floorPrice := bid + guard
 		if req.Price < floorPrice-tickSize*1e-6 {
 			return NewOrderRejectedError(OrderRejectionMakerMoved,
-				fmt.Errorf("SELL %.12g 低于 Maker 下限 %.12g (bid=%.12g)", req.Price, floorPrice, snapshot.BestBid))
+				fmt.Errorf("SELL %.12g 低于 Maker 下限 %.12g (bid=%.12g)", req.Price, floorPrice, bid))
 		}
 	default:
 		return NewOrderRejectedError(OrderRejectionMakerMoved,

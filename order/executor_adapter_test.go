@@ -221,6 +221,29 @@ func TestMakerGuardRejectsStaleQuoteBeforeExchange(t *testing.T) {
 	}
 }
 
+func TestMakerGuardFallsBackToLastPriceWhenBookLooksLikeQuantity(t *testing.T) {
+	ex := &recordingExchange{
+		placeOrder: func(req *exchange.OrderRequest) (*exchange.Order, error) {
+			return &exchange.Order{OrderID: 1, ClientOrderID: req.ClientOrderID, Status: exchange.OrderStatusNew}, nil
+		},
+	}
+	executor := NewExchangeOrderExecutor(ex, "BNBUSDC", 0, 0)
+	now := time.Now()
+	executor.SetMakerGuard(func() exchange.MarketSnapshot {
+		return exchange.MarketSnapshot{
+			Symbol: "BNBUSDC", LastPrice: 736.52, BestBid: 0.72, BestAsk: 1.04, Ready: true,
+			QuoteReceivedAt: now, ReceivedAt: now, QuoteVersion: 1, StreamEpoch: 1,
+		}
+	}, 0.01, 2, 1500*time.Millisecond)
+
+	order, err := executor.PlaceOrder(&OrderRequest{
+		Symbol: "BNBUSDC", Side: "BUY", Price: 735.74, Quantity: 0.14,
+	})
+	if err != nil || order == nil {
+		t.Fatalf("quantity-like bookTicker blocked last-price pad buy: order=%v err=%v", order, err)
+	}
+}
+
 func TestMakerGuardAllowsUnchangedBookWhenStreamIsLive(t *testing.T) {
 	ex := &recordingExchange{
 		placeOrder: func(req *exchange.OrderRequest) (*exchange.Order, error) {
