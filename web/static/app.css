@@ -58,8 +58,8 @@
     --primary-soft: rgba(46, 230, 166, 0.12);
     --cyan: #5ec6ff;
     --cyan-soft: rgba(94, 198, 255, 0.12);
-    --buy: #ff7a73;
-    --sell: #3ee0a4;
+    --buy: #3ee0a4;
+    --sell: #ff7a73;
     --positive: #3ee0a4;
     --negative: #ff7a73;
     --warn: #f0c15a;
@@ -145,8 +145,8 @@ html[data-theme="light"] {
     --primary-soft: rgba(10, 110, 82, 0.12);
     --cyan: #0f6496;
     --cyan-soft: rgba(15, 100, 150, 0.12);
-    --buy: #b4332e;
-    --sell: #0a6e52;
+    --buy: #0a6e52;
+    --sell: #b4332e;
     --positive: #0a6e52;
     --negative: #b4332e;
     --warn: #8a5808;
@@ -1162,9 +1162,16 @@ main { display: block; }
 
 .board {
     display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 12px;
+    grid-template-columns: minmax(0, 1.62fr) minmax(360px, 1fr);
+    align-items: start;
+    gap: 14px;
     margin-top: 22px;
+}
+
+.board-side {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
 }
 
 .panel {
@@ -1972,11 +1979,7 @@ main { display: block; }
 
 .fill-key.buy::before { background: var(--buy); }
 .fill-key.sell::before {
-    background: repeating-linear-gradient(
-        -45deg,
-        var(--sell) 0 3px,
-        color-mix(in srgb, var(--positive) 45%, transparent) 3px 6px
-    );
+    background: var(--sell);
 }
 
 .fill-mobile-hint { display: none; }
@@ -2140,11 +2143,7 @@ main { display: block; }
 
 .hour-bar.buy.is-on { background: var(--buy); }
 .hour-bar.sell.is-on {
-    background: repeating-linear-gradient(
-        -45deg,
-        var(--sell) 0 4px,
-        color-mix(in srgb, var(--positive) 55%, transparent) 4px 8px
-    );
+    background: var(--sell);
 }
 
 .hour-label {
@@ -2635,9 +2634,9 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .section-heading h2 { font-size: 22px; }
     .section-heading p { font-size: 12px; }
     .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    .kpi { min-height: 96px; padding: 13px 12px 12px; }
+    .kpi { min-height: 84px; padding: 10px 11px 11px; }
     .kpi .lab { font-size: 11px; }
-    .kpi .val { margin-top: 8px; font-size: 16px; }
+    .kpi .val { margin-top: 6px; font-size: 15px; }
 
     .strategy-panel summary {
         grid-template-columns: 1fr auto;

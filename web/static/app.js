@@ -1636,8 +1636,8 @@
             lineStrong: color("--line-strong", "rgba(154,186,176,.28)"),
             up: color("--positive", "#3ee0a4"),
             down: color("--negative", "#ff7a73"),
-            buy: color("--buy", "#ff7a73"),
-            sell: color("--sell", "#3ee0a4"),
+            buy: color("--buy", "#3ee0a4"),
+            sell: color("--sell", "#ff7a73"),
             position: color("--cyan", "#5ec6ff"),
             grid: color("--warn", "#f0c15a"),
             pending: color("--warn", "#f0c15a"),
@@ -1738,7 +1738,7 @@
             const live = !candle.isClosed;
             ctx.setLineDash([]);
             ctx.strokeStyle = candleColor;
-            ctx.lineWidth = live ? 1.6 : 1.15;
+            ctx.lineWidth = live ? 1.6 : (bullish ? 1.15 : 1.35);
             ctx.beginPath();
             ctx.moveTo(x, highY);
             ctx.lineTo(x, lowY);
