@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3282,5 +3283,8 @@ func ceilPrice(price float64, decimals int) float64 {
 
 // formatPrice 格式化价格字符串，使用指定的小数位数
 func formatPrice(price float64, decimals int) string {
-	return fmt.Sprintf("%.*f", decimals, price)
+	if decimals < 0 {
+		decimals = 0
+	}
+	return strconv.FormatFloat(price, 'f', decimals, 64)
 }

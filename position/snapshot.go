@@ -132,7 +132,14 @@ func hasVisiblePosition(quantity float64) bool {
 }
 
 func snapshotSlotVisible(item SlotSnapshot, gridPriceText string) bool {
+	return isSnapshotSlotVisible(item, 0, gridPriceText)
+}
+
+func isSnapshotSlotVisible(item SlotSnapshot, gridPrice float64, gridPriceText string) bool {
 	if item.InBuyWindow || item.InSellWindow {
+		return true
+	}
+	if gridPrice > 0 && item.Price == gridPrice {
 		return true
 	}
 	if gridPriceText != "" && item.PriceText == gridPriceText {
@@ -232,8 +239,8 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	snap.MakerExecution.CatchUpOrders = spm.catchUpOrders.Load()
 	snap.MakerExecution.CatchUpAbandoned = spm.catchUpAbandoned.Load()
 
-	buyWindow := map[string]bool{}
-	sellWindow := map[string]bool{}
+	var buyWindow map[float64]bool
+	var sellWindow map[float64]bool
 	if snap.AnchorPrice > 0 && lastPrice > 0 {
 		grid := spm.findNearestGridPrice(lastPrice)
 		snap.GridPrice = grid
@@ -241,11 +248,13 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		sellPrices := spm.calculateSlotPrices(grid, snap.SellWindowSize, "up")
 		snap.BuyWindowPrices = buyPrices
 		snap.SellWindowPrices = sellPrices
+		buyWindow = make(map[float64]bool, len(buyPrices))
 		for _, p := range buyPrices {
-			buyWindow[formatPrice(p, snap.PriceDecimals)] = true
+			buyWindow[p] = true
 		}
+		sellWindow = make(map[float64]bool, len(sellPrices))
 		for _, p := range sellPrices {
-			sellWindow[formatPrice(p, snap.PriceDecimals)] = true
+			sellWindow[p] = true
 		}
 	}
 
@@ -287,11 +296,8 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		}
 		slot.mu.RUnlock()
 
-		// 展示格式化放在槽位锁外，避免阻塞订单回调。
-		item.PriceText = strconv.FormatFloat(price, 'f', snap.PriceDecimals, 64)
-		item.PositionQtyText = strconv.FormatFloat(item.PositionQty, 'f', snap.QuantityDecimals, 64)
-		item.InBuyWindow = buyWindow[item.PriceText]
-		item.InSellWindow = sellWindow[item.PriceText]
+		item.InBuyWindow = buyWindow != nil && buyWindow[price]
+		item.InSellWindow = sellWindow != nil && sellWindow[price]
 		if hasVisiblePosition(item.PositionQty) {
 			snap.FilledSlotCount++
 			snap.PositionQty += item.PositionQty
@@ -317,7 +323,10 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 		case SlotWaitStateLockedInconsistent:
 			snap.InconsistentSlotCount++
 		}
-		if snapshotSlotVisible(item, gridPriceText) {
+		if isSnapshotSlotVisible(item, snap.GridPrice, gridPriceText) {
+			// 仅对可见槽位进行展示格式化，避免大量空槽位的无用字符串分配。
+			item.PriceText = strconv.FormatFloat(price, 'f', snap.PriceDecimals, 64)
+			item.PositionQtyText = strconv.FormatFloat(item.PositionQty, 'f', snap.QuantityDecimals, 64)
 			slots = append(slots, item)
 		}
 		return true
