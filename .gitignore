@@ -53,5 +53,21 @@ vendor/
 .DS_Store
 Thumbs.db
 
+# Rust build output and private runtime state (Cargo.lock is tracked).
+/rust/target/
+/rust/state/
+/rust/logs/
+# Retain only reviewed synthetic offline validation logs in the evidence directory.
+!/rust/docs/p6-results/**/*.log
+!/rust/docs/p7-results/**/*.log
+testnet-state/
+testnet.yaml
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
+
+
 
 opensqt

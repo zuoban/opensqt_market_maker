@@ -30,3 +30,7 @@ Dockerfile
 README.md
 ARCHITECTURE.md
 RELEASE.md
+
+# The existing Go image does not build or ship the Rust migration workspace.
+rust
+RUST_CORE_IMPLEMENTATION_PLAN.md
