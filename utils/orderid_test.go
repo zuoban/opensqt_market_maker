@@ -46,3 +46,18 @@ func TestBinanceBrokerPrefix(t *testing.T) {
 		t.Fatal("Binance client order ID should be truncated to 36 characters")
 	}
 }
+
+func BenchmarkGenerateOrderID(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = GenerateOrderID(65000.5, "BUY", 2)
+	}
+}
+
+func BenchmarkParseOrderID(b *testing.B) {
+	id := "6500050_B_1702468800001"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = ParseOrderID(id, 2)
+	}
+}

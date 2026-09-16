@@ -1,13 +1,23 @@
 package utils
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+var pow10Table = [...]float64{
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+}
+
+func pow10(decimals int) float64 {
+	if decimals >= 0 && decimals < len(pow10Table) {
+		return pow10Table[decimals]
+	}
+	return math.Pow(10, float64(decimals))
+}
 
 // OrderIDGenerator 订单ID生成器
 // 生成紧凑的 ClientOrderID，最大长度不超过18字符
@@ -35,60 +45,70 @@ var globalIDGen = &OrderIDGenerator{}
 //
 // 注意: 为给 Binance 经纪商前缀预留空间，总长度控制在18字符以内
 func GenerateOrderID(price float64, side string, priceDecimals int) string {
-	globalIDGen.mu.Lock()
-	defer globalIDGen.mu.Unlock()
-
-	// 1. 将价格转为整数字符串（避免浮点数）
-	multiplier := math.Pow(10, float64(priceDecimals))
+	multiplier := pow10(priceDecimals)
 	priceInt := int64(math.Round(price * multiplier))
 
-	// 2. 方向编码（单字符）
-	sideCode := "B"
+	sideByte := byte('B')
 	if side == "SELL" {
-		sideCode = "S"
+		sideByte = 'S'
 	}
 
-	// 3. 生成紧凑的时间戳 + 序列号
+	globalIDGen.mu.Lock()
 	now := time.Now()
 	currentSec := now.Unix()
 
-	// 重置序列号（每秒重置）
 	if currentSec != globalIDGen.lastSec {
 		globalIDGen.lastSec = currentSec
 		globalIDGen.sequence = 0
 	}
-
 	globalIDGen.sequence++
+	seq := globalIDGen.sequence
+	globalIDGen.mu.Unlock()
 
-	// 时间戳(10位) + 序列号(3位) = 13字符
-	timestampSeq := fmt.Sprintf("%d%03d", currentSec, globalIDGen.sequence)
+	buf := make([]byte, 0, 32)
+	buf = strconv.AppendInt(buf, priceInt, 10)
+	buf = append(buf, '_', sideByte, '_')
+	buf = strconv.AppendInt(buf, currentSec, 10)
+	if seq < 10 {
+		buf = append(buf, '0', '0', byte('0'+seq))
+	} else if seq < 100 {
+		buf = append(buf, '0', byte('0'+seq/10), byte('0'+seq%10))
+	} else {
+		buf = strconv.AppendInt(buf, int64(seq), 10)
+	}
 
-	// 最终格式: {price}_{side}_{timestamp}{seq}
-	// 例如: 65000_B_1702468800001 (约18字符)
-	return fmt.Sprintf("%d_%s_%s", priceInt, sideCode, timestampSeq)
+	return string(buf)
 }
 
 // ParseOrderID 解析紧凑的订单ID
 // 返回: price, side, timestamp, valid
 func ParseOrderID(clientOrderID string, priceDecimals int) (float64, string, int64, bool) {
-	parts := strings.Split(clientOrderID, "_")
-	if len(parts) != 3 {
+	firstUnderscore := strings.IndexByte(clientOrderID, '_')
+	if firstUnderscore <= 0 {
+		return 0, "", 0, false
+	}
+	remaining := clientOrderID[firstUnderscore+1:]
+	secondUnderscore := strings.IndexByte(remaining, '_')
+	if secondUnderscore <= 0 {
 		return 0, "", 0, false
 	}
 
+	priceStr := clientOrderID[:firstUnderscore]
+	sideStr := remaining[:secondUnderscore]
+	timestampSeq := remaining[secondUnderscore+1:]
+
 	// 1. 解析价格整数
-	priceInt, err := strconv.ParseInt(parts[0], 10, 64)
+	priceInt, err := strconv.ParseInt(priceStr, 10, 64)
 	if err != nil || priceInt <= 0 {
 		return 0, "", 0, false
 	}
 
-	// 还原为浮点数价格
-	multiplier := math.Pow(10, float64(priceDecimals))
+	multiplier := pow10(priceDecimals)
 	price := float64(priceInt) / multiplier
 
 	// 2. 解析方向
 	var side string
-	switch parts[1] {
+	switch sideStr {
 	case "B":
 		side = "BUY"
 	case "S":
@@ -98,7 +118,6 @@ func ParseOrderID(clientOrderID string, priceDecimals int) (float64, string, int
 	}
 
 	// 3. 解析时间戳（前10位）
-	timestampSeq := parts[2]
 	if len(timestampSeq) < 10 {
 		return 0, "", 0, false
 	}
