@@ -1,7 +1,7 @@
 package web
 
 import (
-	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -179,5 +179,5 @@ func formatDec(v float64, decimals int) string {
 	if decimals < 0 {
 		decimals = 2
 	}
-	return fmt.Sprintf("%.*f", decimals, v)
+	return strconv.FormatFloat(v, 'f', decimals, 64)
 }
