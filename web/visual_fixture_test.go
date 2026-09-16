@@ -49,8 +49,14 @@ func TestVisualFixture(t *testing.T) {
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	t.Log("visual fixture http://127.0.0.1:18789")
+	timeout := 2 * time.Minute
+	if d := os.Getenv("WEB_VISUAL_TIMEOUT"); d != "" {
+		if parsed, err := time.ParseDuration(d); err == nil {
+			timeout = parsed
+		}
+	}
 	select {
-	case <-time.After(2 * time.Minute):
+	case <-time.After(timeout):
 		_ = server.Close()
 	}
 }
