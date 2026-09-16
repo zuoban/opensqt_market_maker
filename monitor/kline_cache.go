@@ -172,8 +172,12 @@ func (pm *PriceMonitor) recordCandlePrice(price float64, now time.Time) {
 		}
 	}
 
-	if n := len(pm.klineCache.candles); n > 0 && pm.klineCache.candles[n-1].Timestamp < bucket {
+	n := len(pm.klineCache.candles)
+	needSort := false
+	if n > 0 && pm.klineCache.candles[n-1].Timestamp < bucket {
 		pm.klineCache.candles[n-1].IsClosed = true
+	} else if n > 0 && pm.klineCache.candles[n-1].Timestamp > bucket {
+		needSort = true
 	}
 	pm.klineCache.candles = append(pm.klineCache.candles, exchange.Candle{
 		Symbol:    pm.symbol,
@@ -184,11 +188,14 @@ func (pm *PriceMonitor) recordCandlePrice(price float64, now time.Time) {
 		Timestamp: bucket,
 		IsClosed:  false,
 	})
-	sort.Slice(pm.klineCache.candles, func(i, j int) bool {
-		return pm.klineCache.candles[i].Timestamp < pm.klineCache.candles[j].Timestamp
-	})
-	if len(pm.klineCache.candles) > pm.klineCache.limit {
-		pm.klineCache.candles = append([]exchange.Candle(nil), pm.klineCache.candles[len(pm.klineCache.candles)-pm.klineCache.limit:]...)
+	if needSort {
+		sort.Slice(pm.klineCache.candles, func(i, j int) bool {
+			return pm.klineCache.candles[i].Timestamp < pm.klineCache.candles[j].Timestamp
+		})
+	}
+	if excess := len(pm.klineCache.candles) - pm.klineCache.limit; excess > 0 {
+		copy(pm.klineCache.candles, pm.klineCache.candles[excess:])
+		pm.klineCache.candles = pm.klineCache.candles[:pm.klineCache.limit]
 	}
 	pm.klineCache.updatedAt = now
 }
