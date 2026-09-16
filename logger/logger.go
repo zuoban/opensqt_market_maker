@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,15 +23,16 @@ const (
 )
 
 var (
-	globalLevel LogLevel = INFO
-	mu          sync.RWMutex
+	globalLevel atomic.Int32
 
 	// 文件日志相关
-	fileLogger  *log.Logger
-	logFile     *os.File
-	currentDate string
-	fileMu      sync.Mutex
-	logDir      = "log" // 日志文件夹
+	fileLogger     *log.Logger
+	logFile        *os.File
+	currentDate    string
+	fileMu         sync.Mutex
+	logDir         = "log" // 日志文件夹
+	fileLogCh      chan asyncFileLogItem
+	fileWorkerDone chan struct{}
 
 	ringCap  = 200
 	ringMu   sync.Mutex
@@ -38,6 +40,16 @@ var (
 	ringNext int
 	ringSize int
 )
+
+func init() {
+	globalLevel.Store(int32(INFO))
+}
+
+type asyncFileLogItem struct {
+	time      time.Time
+	levelText string
+	message   string
+}
 
 // LogEntry 环缓冲中的一条日志
 type LogEntry struct {
@@ -85,9 +97,7 @@ func ParseLogLevel(level string) LogLevel {
 
 // SetLevel 设置全局日志级别
 func SetLevel(level LogLevel) {
-	mu.Lock()
-	defer mu.Unlock()
-	globalLevel = level
+	globalLevel.Store(int32(level))
 
 	// 如果设置为DEBUG级别，启用文件日志
 	if level == DEBUG {
@@ -102,44 +112,66 @@ func initFileLogger() {
 	fileMu.Lock()
 	defer fileMu.Unlock()
 
-	// 如果已经初始化且日期相同，不需要重新初始化
 	today := time.Now().Format("2006-01-02")
-	if fileLogger != nil && currentDate == today {
-		return
+	if fileLogger == nil || currentDate != today {
+		if logFile != nil {
+			logFile.Close()
+			logFile = nil
+		}
+
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			log.Printf("[WARN] 创建日志文件夹失败: %v，将只输出到控制台", err)
+			return
+		}
+
+		logFileName := filepath.Join(logDir, fmt.Sprintf("opensqt-%s.log", today))
+		file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Printf("[WARN] 打开日志文件失败: %v，将只输出到控制台", err)
+			return
+		}
+
+		logFile = file
+		currentDate = today
+		fileLogger = log.New(file, "", 0)
+		log.Printf("[INFO] 文件日志已启用，日志文件: %s", logFileName)
 	}
 
-	// 关闭旧文件
-	if logFile != nil {
-		logFile.Close()
-		logFile = nil
+	if fileLogCh == nil {
+		fileLogCh = make(chan asyncFileLogItem, 4096)
+		fileWorkerDone = make(chan struct{})
+		ch := fileLogCh
+		done := fileWorkerDone
+		go func() {
+			defer close(done)
+			for item := range ch {
+				fileMu.Lock()
+				checkAndRotateLog()
+				if fileLogger != nil {
+					fileLogger.Printf("%s [%s] %s", item.time.Format("2006/01/02 15:04:05"), item.levelText, item.message)
+				}
+				fileMu.Unlock()
+			}
+		}()
 	}
-
-	// 创建log文件夹
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		// 如果创建失败，只输出到控制台
-		log.Printf("[WARN] 创建日志文件夹失败: %v，将只输出到控制台", err)
-		return
-	}
-
-	// 创建日志文件（按日期命名）
-	logFileName := filepath.Join(logDir, fmt.Sprintf("opensqt-%s.log", today))
-	file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		// 如果打开失败，只输出到控制台
-		log.Printf("[WARN] 打开日志文件失败: %v，将只输出到控制台", err)
-		return
-	}
-
-	logFile = file
-	currentDate = today
-	// 创建文件日志器（不包含时间戳，因为标准log已经包含）
-	fileLogger = log.New(file, "", 0)
-
-	log.Printf("[INFO] 文件日志已启用，日志文件: %s", logFileName)
 }
 
-// closeFileLogger 关闭文件日志
+// closeFileLogger 关闭文件日志并等待刷盘完成
 func closeFileLogger() {
+	fileMu.Lock()
+	ch := fileLogCh
+	done := fileWorkerDone
+	fileLogCh = nil
+	fileWorkerDone = nil
+	fileMu.Unlock()
+
+	if ch != nil {
+		close(ch)
+		if done != nil {
+			<-done
+		}
+	}
+
 	fileMu.Lock()
 	defer fileMu.Unlock()
 
@@ -151,24 +183,18 @@ func closeFileLogger() {
 	}
 }
 
-// checkAndRotateLog 检查并轮转日志文件（如果需要）
-// 注意：调用此函数前必须已持有fileMu锁
 func checkAndRotateLog() {
 	today := time.Now().Format("2006-01-02")
 	if currentDate != today {
-		// 日期变化，重新初始化文件日志
-		// 关闭旧文件
 		if logFile != nil {
 			logFile.Close()
 			logFile = nil
 		}
 
-		// 创建log文件夹
 		if err := os.MkdirAll(logDir, 0755); err != nil {
 			return
 		}
 
-		// 创建新的日志文件
 		logFileName := filepath.Join(logDir, fmt.Sprintf("opensqt-%s.log", today))
 		file, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
@@ -223,14 +249,25 @@ func RecentLogs(n int) []LogEntry {
 
 // GetLevel 获取全局日志级别
 func GetLevel() LogLevel {
-	mu.RLock()
-	defer mu.RUnlock()
-	return globalLevel
+	return LogLevel(globalLevel.Load())
 }
 
 // shouldLog 判断是否应该输出日志
 func shouldLog(level LogLevel) bool {
-	return level >= globalLevel
+	return int32(level) >= globalLevel.Load()
+}
+
+func enqueueFileLog(item asyncFileLogItem) {
+	fileMu.Lock()
+	ch := fileLogCh
+	fileMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- item:
+		default:
+			// 队列已满时非阻塞丢弃，避免磁盘写停顿阻塞做市主流程
+		}
+	}
 }
 
 // logf 内部日志输出函数
@@ -245,16 +282,13 @@ func logf(level LogLevel, format string, args ...interface{}) {
 	// 正文只格式化一次；控制台、环缓冲和 DEBUG 文件复用同一结果。
 	log.Printf("[%s] %s", levelText, message)
 
-	// 如果日志级别为DEBUG，同时写入文件
-	if globalLevel == DEBUG {
-		fileMu.Lock()
-		// 检查是否需要轮转日志文件
-		checkAndRotateLog()
-		if fileLogger != nil {
-			// 写入文件（包含时间戳）
-			fileLogger.Printf("%s [%s] %s", time.Now().Format("2006/01/02 15:04:05"), levelText, message)
-		}
-		fileMu.Unlock()
+	// 如果日志级别为DEBUG，异步写入文件
+	if LogLevel(globalLevel.Load()) == DEBUG {
+		enqueueFileLog(asyncFileLogItem{
+			time:      time.Now(),
+			levelText: levelText,
+			message:   message,
+		})
 	}
 }
 
@@ -264,22 +298,19 @@ func logln(level LogLevel, args ...interface{}) {
 		return
 	}
 	prefix := fmt.Sprintf("[%s] ", level.String())
-	message := fmt.Sprintln(append([]interface{}{prefix}, args...)...)
-	recordLog(level, strings.TrimSpace(fmt.Sprintln(args...)))
+	cleaned := strings.TrimSpace(fmt.Sprintln(args...))
+	recordLog(level, cleaned)
 
 	// 输出到控制台（标准输出）
 	log.Println(append([]interface{}{prefix}, args...)...)
 
-	// 如果日志级别为DEBUG，同时写入文件
-	if globalLevel == DEBUG {
-		fileMu.Lock()
-		// 检查是否需要轮转日志文件
-		checkAndRotateLog()
-		if fileLogger != nil {
-			// 写入文件（包含时间戳，去掉末尾的换行符，因为Println会自动添加）
-			fileLogger.Printf("%s %s", time.Now().Format("2006/01/02 15:04:05"), strings.TrimSuffix(message, "\n"))
-		}
-		fileMu.Unlock()
+	// 如果日志级别为DEBUG，异步写入文件
+	if LogLevel(globalLevel.Load()) == DEBUG {
+		enqueueFileLog(asyncFileLogItem{
+			time:      time.Now(),
+			levelText: level.String(),
+			message:   cleaned,
+		})
 	}
 }
 
@@ -326,12 +357,14 @@ func Errorln(args ...interface{}) {
 // Fatal 输出致命错误日志并退出程序
 func Fatal(format string, args ...interface{}) {
 	logf(FATAL, format, args...)
+	Close()
 	os.Exit(1)
 }
 
 // Fatalln 输出致命错误日志并退出程序（无格式）
 func Fatalln(args ...interface{}) {
 	logln(FATAL, args...)
+	Close()
 	os.Exit(1)
 }
 
