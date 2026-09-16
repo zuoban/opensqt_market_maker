@@ -196,6 +196,20 @@ func (b *BinanceAdapter) ensureStatusAwareTransport() {
 	})
 }
 
+var defaultBinancePooledTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   50,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
 func installStatusAwareTransport(client *futures.Client) {
 	if client == nil {
 		return
@@ -206,8 +220,8 @@ func installStatusAwareTransport(client *futures.Client) {
 	}
 	clientCopy := *httpClient
 	transport := clientCopy.Transport
-	if transport == nil {
-		transport = http.DefaultTransport
+	if transport == nil || transport == http.DefaultTransport {
+		transport = defaultBinancePooledTransport
 	}
 	if _, ok := transport.(*statusAwareTransport); !ok {
 		clientCopy.Transport = &statusAwareTransport{base: transport}
