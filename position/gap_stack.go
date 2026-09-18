@@ -392,6 +392,7 @@ func (spm *SuperPositionManager) splitGapStackedSlot(parentPrice float64, stackC
 		if accept {
 			child.oppositeFillAt = parent.oppositeFillAt
 			child.oppositeSubmitSide = parent.oppositeSubmitSide
+			child.oppositePending.Store(parent.oppositePending.Load())
 			child.PositionQty = share
 			child.PositionCost = share * parentUnitCost
 			child.PositionStatus = PositionStatusFilled

@@ -15,6 +15,7 @@ import (
 	"opensqt/monitor"
 	"opensqt/order"
 	"opensqt/safety"
+	"opensqt/telemetry"
 )
 
 const (
@@ -238,9 +239,11 @@ type tradingGateRuntime struct {
 	marginCancelDone  atomic.Bool
 	adjustStopped     atomic.Bool
 
-	adjustMu        sync.Mutex
-	adjustImmediate bool
-	adjustDeadlines []time.Time
+	adjustMu         sync.Mutex
+	adjustImmediate  bool
+	adjustDeadlines  []time.Time
+	adjustReadySince time.Time
+	performance      atomic.Pointer[telemetry.Recorder]
 
 	lifecycleMu sync.Mutex
 	cancel      context.CancelFunc
@@ -319,6 +322,9 @@ func (r *tradingGateRuntime) RequestAdjustOrders(delay time.Duration) bool {
 	}
 	if immediate {
 		r.adjustImmediate = true
+		if r.adjustReadySince.IsZero() {
+			r.adjustReadySince = time.Now()
+		}
 	} else {
 		deadline := time.Now().Add(delay)
 		index := sort.Search(len(r.adjustDeadlines), func(i int) bool {
@@ -358,6 +364,10 @@ func (r *tradingGateRuntime) promoteDueAdjustRequestsLocked(now time.Time) bool 
 		return false
 	}
 	r.adjustImmediate = true
+	if r.adjustReadySince.IsZero() || r.adjustDeadlines[0].Before(r.adjustReadySince) {
+		// 冷却本身不计入排队时间；从最早已到期的 deadline 开始计时。
+		r.adjustReadySince = r.adjustDeadlines[0]
+	}
 	if due == len(r.adjustDeadlines) {
 		r.adjustDeadlines = nil
 	} else {
@@ -391,6 +401,10 @@ func (r *tradingGateRuntime) takeReadyAdjustRequest(now time.Time) bool {
 		return false
 	}
 	r.adjustImmediate = false
+	if !r.adjustReadySince.IsZero() {
+		r.performance.Load().Observe(telemetry.AdjustRequestWait, now.Sub(r.adjustReadySince), false)
+		r.adjustReadySince = time.Time{}
+	}
 	return true
 }
 
@@ -401,6 +415,7 @@ func (r *tradingGateRuntime) stopAdjustRequests() {
 	r.adjustStopped.Store(true)
 	r.adjustMu.Lock()
 	r.adjustImmediate = false
+	r.adjustReadySince = time.Time{}
 	r.adjustDeadlines = nil
 	r.adjustMu.Unlock()
 }

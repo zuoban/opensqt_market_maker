@@ -1,6 +1,7 @@
 package web
 
 import (
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
@@ -60,7 +61,8 @@ type wsEnvelope struct {
 }
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: dashboardOriginAllowed,
+	CheckOrigin:       dashboardOriginAllowed,
+	EnableCompression: true,
 }
 
 func dashboardOriginAllowed(r *http.Request) bool {
@@ -323,6 +325,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		logger.Debug("监控面板 WS upgrade 失败: %v", err)
 		return
 	}
+	// 浏览器协商 permessage-deflate；未协商的客户端仍接收原始 JSON。
+	// PreparedMessage 按压缩选项共享结果，不为每个连接重复压缩。
+	_ = conn.SetCompressionLevel(flate.BestSpeed)
 	client := newWSClient(s.hub, conn)
 	client.enqueue(wsEnvelope{Type: "snapshot", Data: s.assembler.Build()})
 	if !s.hub.register(client) {

@@ -52,8 +52,8 @@ type OrderRequest struct {
 	NearTouch     bool   // 距离盘口较近，避免与深度订单共享陈旧批次
 
 	// AcquireSubmissionLease 必须在每次真正的交易所请求前调用，并在该次请求
-	// 返回后释放。实现会在 lease 期间持有槽位锁，因此不得从 PlaceOrder 同步
-	// 重入同一槽位的订单更新回调；真实订单流应通过异步边界投递。
+	// 返回后释放。Binance 将只读确认移到释放之后，每次重试重新获取 lease。
+	// lease 期间持有槽位锁，实际创建请求中不得同步重入同槽订单回调。
 	AcquireSubmissionLease func() (release func(), ok bool)
 	// OnSubmissionStarted 在所有本地门禁通过后、持有 lease 时记录首次实际提交。
 	OnSubmissionStarted func()
@@ -443,7 +443,7 @@ func acquireSubmissionLease(req *OrderRequest) (func(), bool) {
 	if release == nil {
 		release = func() {}
 	}
-	return release, true
+	return sync.OnceFunc(release), true
 }
 
 func nativeExchangeRequest(req *OrderRequest) *exchange.OrderRequest {
@@ -548,61 +548,16 @@ func (oe *ExchangeOrderExecutor) PlaceOrder(req *OrderRequest) (*Order, error) {
 
 		// 限流完成后才获取槽位 lease。lease 将“最终状态复检”和本次真实
 		// PlaceOrder 调用线性化，终态修正无法插入二者之间使请求过期。
-		release, ok := acquireSubmissionLease(req)
-		if !ok {
-			return nil, ErrOrderSubmissionStale
-		}
-		if !oe.newOrdersEnabled.Load() || placeCtx.Err() != nil {
-			release()
-			gateErr := placeCtx.Err()
-			if gateErr == nil {
-				gateErr = ErrNewOrdersStopped
-			}
-			return nil, oe.placementContextError("下单前交易门禁已关闭", gateErr)
-		}
-		if guardErr := oe.checkSubmissionHealth(); guardErr != nil {
-			// 健康复检失败时请求尚未进入交易所边界。先释放槽位
-			// lease，再立即取消执行器的整代新单上下文，确保本批不会
-			// 继续提交其余订单。
-			release()
-			oe.StopNewOrders()
-			return nil, fmt.Errorf("%w: %v", ErrTradingHealthGuardRejected, guardErr)
-		}
-		// guard 执行期间健康观察器也可能已关闭执行器；真正
-		// 进入交易所前再复检一次可取消门禁。
-		if !oe.newOrdersEnabled.Load() || placeCtx.Err() != nil {
-			release()
-			gateErr := placeCtx.Err()
-			if gateErr == nil {
-				gateErr = ErrNewOrdersStopped
-			}
-			return nil, oe.placementContextError("健康复检后交易门禁已关闭", gateErr)
-		}
-		if makerErr := oe.checkMakerGuard(req); makerErr != nil {
-			release()
-			var rejected *OrderRejectedError
-			if errors.As(makerErr, &rejected) {
-				noteDefiniteRejection(req, rejected.Kind)
-			}
-			return nil, makerErr
+		release, guardErr := oe.acquireGuardedSubmission(placeCtx, req)
+		if guardErr != nil {
+			return nil, guardErr
 		}
 
-		exchangeReq := &exchange.OrderRequest{
-			Symbol:        req.Symbol,
-			Side:          exchange.Side(req.Side),
-			Type:          exchange.OrderTypeLimit,
-			TimeInForce:   exchange.TimeInForceGTC,
-			Quantity:      req.Quantity,
-			Price:         req.Price,
-			PriceDecimals: req.PriceDecimals,
-			ReduceOnly:    req.ReduceOnly,
-			// 在最终下单边界强制 PostOnly，防止上层遗漏导致 Taker 成交。
-			PostOnly:      true,
-			ClientOrderID: req.ClientOrderID,
-		}
+		exchangeReq := nativeExchangeRequest(req)
+		exchangeReq.BeginSubmission = oe.submissionBoundary(req, release, placeCtx)
 
-		// lease 必须覆盖实际交易所调用，但在返回后立即释放，以免占用后续
-		// 重试等待。订单流是异步边界，会在此处短暂等待同一槽位锁。
+		// Binance 在每次创建响应返回后释放 lease，确认查询不占槽位锁。
+		// 外层 release 幂等兜底，兼容不支持细分边界的适配器。
 		requestCtx, cancel := oe.requestContext(placeCtx)
 		performance := oe.performance.Load()
 		started := performance.Start()
@@ -661,7 +616,7 @@ func (s *batchPlaceState) note(exchangeName string, req *OrderRequest, order *Or
 		}
 		return false
 	}
-	if errors.Is(err, ErrOrderSubmissionStale) {
+	if errors.Is(err, ErrOrderSubmissionStale) && !errors.Is(err, exchange.ErrOrderPlacementUnknown) {
 		logger.Debug("⏭️ [%s] 跳过已失效 reservation: %.2f %s (ClientOID=%s)",
 			exchangeName, req.Price, req.Side, req.ClientOrderID)
 		return false
@@ -705,6 +660,14 @@ func (s *batchPlaceState) note(exchangeName string, req *OrderRequest, order *Or
 func (oe *ExchangeOrderExecutor) nativeBatcher() (exchange.PlaceOrderBatcher, bool) {
 	batcher, ok := oe.exchange.(exchange.PlaceOrderBatcher)
 	return batcher, ok && batcher.PlaceOrderBatchSize() > 0
+}
+
+// PlacementBatchSize 供协调器限制单轮工作量。无原生批量能力时逐笔让出。
+func (oe *ExchangeOrderExecutor) PlacementBatchSize() int {
+	if batcher, ok := oe.nativeBatcher(); ok {
+		return batcher.PlaceOrderBatchSize()
+	}
+	return 1
 }
 
 // BatchPlaceOrders 批量下单
@@ -890,6 +853,7 @@ func (oe *ExchangeOrderExecutor) placeNativeChunk(state *batchPlaceState, chunk 
 
 	exchangeReqs := make([]*exchange.OrderRequest, len(submitted))
 	for i, item := range submitted {
+		item.exchangeReq.BeginSubmission = oe.submissionBoundary(item.req, item.release, placeCtx)
 		exchangeReqs[i] = item.exchangeReq
 	}
 	requestCtx, cancel := oe.requestContext(placeCtx)

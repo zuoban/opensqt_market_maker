@@ -1,6 +1,9 @@
 package exchange
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // Side 交易方向
 type Side string
@@ -52,6 +55,11 @@ type OrderRequest struct {
 	PostOnly      bool    // 是否只做 Maker（Post Only）
 	PriceDecimals int     // 价格精度（用于格式化）
 	ClientOrderID string  // 自定义订单ID
+	// BeginSubmission 由执行器提供：每次实际创建请求前取得提交边界，返回的
+	// release 必须在该次创建响应返回后、任何只读确认查询之前调用。
+	// 同 ID 重试也必须重新调用；回调可返回 UNKNOWN 来保留此前请求身份。
+	// 不支持此可选协议的适配器仍由执行器在整个调用外围持有 lease。
+	BeginSubmission func(context.Context) (release func(), err error) `json:"-"`
 }
 
 // Order 订单信息（通用）

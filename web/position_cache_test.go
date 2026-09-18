@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,68 @@ import (
 
 type countingPositionSnapshotSource struct {
 	calls int
+}
+
+func TestPositionCacheSkipsIdleRefreshAndResumesOnRead(t *testing.T) {
+	source := &countingPositionSnapshotSource{}
+	cache := newPositionCache(source, time.Millisecond)
+	cache.refresh()
+	now := time.Now().Add(time.Second)
+	cache.refreshIfActive(now)
+	if source.calls != 1 {
+		t.Fatal("cache refreshed without a reader")
+	}
+	cache.lastRead.Store(now.Add(-positionIdleAfter).UnixNano())
+	cache.refreshIfActive(now)
+	if source.calls != 1 {
+		t.Fatal("cache continued refreshing after reader became idle")
+	}
+	cache.viewReadOnly()
+	cache.refreshIfActive(now)
+	if source.calls != 2 {
+		t.Fatal("reading did not reactivate cache")
+	}
+	cache.refreshIfActive(time.Now())
+	if source.calls != 2 {
+		t.Fatal("wake and tick duplicated a fresh snapshot")
+	}
+}
+
+type signaledPositionSource struct {
+	calls atomic.Int32
+	done  chan struct{}
+}
+
+func (s *signaledPositionSource) Snapshot() position.PositionSnapshot {
+	s.calls.Add(1)
+	s.done <- struct{}{}
+	return position.PositionSnapshot{Initialized: true}
+}
+
+func TestPositionCacheReadWakesIdleWorker(t *testing.T) {
+	source := &signaledPositionSource{done: make(chan struct{}, 2)}
+	cache := newPositionCache(source, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { cache.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-source.done:
+	case <-time.After(time.Second):
+		t.Fatal("initial snapshot did not run")
+	}
+	// 等待首次发布，然后模拟空闲已超过刷新间隔，ticker 一小时后才到。
+	deadline := time.Now().Add(time.Second)
+	for cache.latest.Load() == nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cache.latest.Store(&positionCacheEntry{updatedAt: time.Now().Add(-2 * time.Hour)})
+	cache.viewReadOnly()
+	select {
+	case <-source.done:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not wake refresh before next ticker")
+	}
 }
 
 func (s *countingPositionSnapshotSource) Snapshot() position.PositionSnapshot {

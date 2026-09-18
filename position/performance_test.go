@@ -1,13 +1,19 @@
 package position
 
 import (
+	"bytes"
+	"compress/flate"
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
+
+	"opensqt/telemetry"
 )
 
 var benchmarkSnapshotSink PositionSnapshot
 var benchmarkBytesSink []byte
+var benchmarkStateSink telemetry.StateCounts
 
 func benchmarkPositionManager(n, c int) (*SuperPositionManager, []*InventorySlot) {
 	cfg := testConfig()
@@ -73,6 +79,20 @@ func BenchmarkPositionSnapshot(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkTelemetryPendingStateCounts(b *testing.B) {
+	spm, _ := benchmarkPositionManager(5000, 0)
+	since := time.Now().Add(-time.Second)
+	spm.forEachSlot(func(_ float64, slot *InventorySlot) bool {
+		slot.oppositePending.Store(&oppositeWaitState{side: "SELL", since: since})
+		return true
+	})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		benchmarkStateSink = spm.TelemetryStateCounts()
+	}
+}
 func BenchmarkPositionSnapshotJSON(b *testing.B) {
 	for _, n := range []int{100, 1000, 5000} {
 		b.Run(fmt.Sprintf("slots=%d", n), func(b *testing.B) {
@@ -85,6 +105,38 @@ func BenchmarkPositionSnapshotJSON(b *testing.B) {
 				benchmarkBytesSink, _ = json.Marshal(snap)
 			}
 			b.ReportMetric(float64(len(data)), "payload_B")
+		})
+	}
+}
+
+// 与面板协商的压缩等级一致；仅测 JSON 压缩，不含编码、网络和浏览器解压。
+func BenchmarkPositionSnapshotDeflate(b *testing.B) {
+	for _, n := range []int{100, 1000, 5000} {
+		b.Run(fmt.Sprintf("slots=%d", n), func(b *testing.B) {
+			spm, _ := benchmarkPositionManager(n, 0)
+			payload, err := json.Marshal(spm.Snapshot())
+			if err != nil {
+				b.Fatal(err)
+			}
+			var compressed bytes.Buffer
+			writer, err := flate.NewWriter(&compressed, flate.BestSpeed)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				compressed.Reset()
+				writer.Reset(&compressed)
+				if _, err := writer.Write(payload); err != nil {
+					b.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(len(payload)), "payload_B")
+			b.ReportMetric(float64(compressed.Len()), "deflate_B")
 		})
 	}
 }

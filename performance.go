@@ -19,9 +19,15 @@ func logPerformance(s telemetry.Snapshot) {
 	if !s.Ready {
 		return
 	}
-	logger.Info("📊 [性能] P95 规划=%s 限流=%s 下单=%s 回调锁等待=%s 买成→卖提交=%s 卖成→买提交=%s 堆=%.2fMiB GC=%d 槽位=%d 成交去重键=%d",
+	consoleDropped, fileDropped := logger.DroppedLogs()
+	logger.Info("📊 [性能] P95 规划=%s 限流=%s 下单=%s 回调锁等待=%s 买成→卖提交=%s 卖成→买提交=%s 堆=%.2fMiB GC=%d 槽位=%d 成交去重键=%d 日志队列丢弃=控制台%d/文件%d",
 		performanceP95(s, telemetry.Planning), performanceP95(s, telemetry.RateLimitWait),
 		performanceP95(s, telemetry.PlaceRequest), performanceP95(s, telemetry.OrderUpdateLockWait),
 		performanceP95(s, telemetry.BuyFillToSellSubmit), performanceP95(s, telemetry.SellFillToBuySubmit),
-		float64(s.Runtime.HeapObjectsBytes)/(1024*1024), s.Runtime.GCCycles, s.State.Slots, s.State.FilledDedupKeys)
+		float64(s.Runtime.HeapObjectsBytes)/(1024*1024), s.Runtime.GCCycles, s.State.Slots, s.State.FilledDedupKeys,
+		consoleDropped, fileDropped)
+	logger.Info("📊 [补单等待] P95 调度=%s 对账=%s 待买=%d(最长%.0fms) 待卖=%d(最长%.0fms)",
+		performanceP95(s, telemetry.AdjustRequestWait), performanceP95(s, telemetry.ReconcileTotal),
+		s.State.PendingOppositeBuys, s.State.OldestOppositeBuyWaitMS,
+		s.State.PendingOppositeSells, s.State.OldestOppositeSellWaitMS)
 }

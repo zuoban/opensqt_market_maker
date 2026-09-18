@@ -37,7 +37,11 @@ func TestPerformanceRouteRequiresDashboardToken(t *testing.T) {
 func TestPerformanceEndpointOnlyReadsCachedSnapshot(t *testing.T) {
 	r := telemetry.New(time.Now())
 	collections := 0
-	r.SetStateProvider(func() telemetry.StateCounts { collections++; return telemetry.StateCounts{Slots: 42} })
+	r.SetStateProvider(func() telemetry.StateCounts {
+		collections++
+		return telemetry.StateCounts{Slots: 42, PendingOppositeBuys: 2, PendingOppositeSells: 3,
+			OldestOppositeBuyWaitMS: 250, OldestOppositeSellWaitMS: 500}
+	})
 	s := New(Options{Performance: r})
 	if s.assembler.performance != r {
 		t.Fatal("recorder not wired")
@@ -49,6 +53,8 @@ func TestPerformanceEndpointOnlyReadsCachedSnapshot(t *testing.T) {
 		t.Fatal("uncollected endpoint returned ready")
 	}
 	r.Observe(telemetry.Planning, 2*time.Millisecond, false)
+	r.Observe(telemetry.AdjustRequestWait, 5*time.Millisecond, false)
+	r.Observe(telemetry.ReconcileTotal, 10*time.Millisecond, true)
 	r.Refresh()
 	r.Observe(telemetry.Planning, time.Second, false)
 	for i := 0; i < 3; i++ {
@@ -64,8 +70,16 @@ func TestPerformanceEndpointOnlyReadsCachedSnapshot(t *testing.T) {
 		if !got.Ready || got.State.Slots != 42 || got.Latencies[telemetry.Planning].Count != 1 || got.Latencies[telemetry.Planning].P95MS != 2 {
 			t.Fatalf("endpoint didn't use cached snapshot: %+v", got)
 		}
+		if got.State.PendingOppositeBuys != 2 || got.State.PendingOppositeSells != 3 ||
+			got.State.OldestOppositeBuyWaitMS != 250 || got.State.OldestOppositeSellWaitMS != 500 ||
+			got.Latencies[telemetry.AdjustRequestWait].Name != "adjust_request_wait" ||
+			got.Latencies[telemetry.AdjustRequestWait].P95MS != 5 ||
+			got.Latencies[telemetry.ReconcileTotal].Name != "reconcile_total" ||
+			got.Latencies[telemetry.ReconcileTotal].Errors != 1 {
+			t.Fatalf("scheduling observation missing from API: %+v", got)
+		}
 		full := s.assembler.Build()
-		if full.Performance == nil || full.Performance.SampledAt != r.Snapshot().SampledAt {
+		if full.Performance == nil || full.Performance.SampledAt != r.Snapshot().SampledAt || full.Performance.State != got.State {
 			t.Fatal("full snapshot missing same performance view")
 		}
 		full.Performance.State.Slots = 0

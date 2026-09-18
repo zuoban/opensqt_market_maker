@@ -5,10 +5,11 @@ import (
 	"sync"
 )
 
-// slotPriceIndex 保存槽位价格的有序副本，供窗口扫描替代 sync.Map.Range。
+// slotPriceIndex 保存按不可变 Price 排序的槽位指针。扫描直接访问槽位，
+// 不再对每个价格重复查询 sync.Map；成员增删以写时复制发布。
 type slotPriceIndex struct {
-	mu     sync.RWMutex
-	prices []float64
+	mu    sync.RWMutex
+	slots []*InventorySlot
 }
 
 func (idx *slotPriceIndex) insert(price float64) {
@@ -17,7 +18,7 @@ func (idx *slotPriceIndex) insert(price float64) {
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	idx.insertLocked(price)
+	idx.insertLocked(newEmptySlot(price))
 }
 
 func (idx *slotPriceIndex) remove(price float64) {
@@ -29,41 +30,41 @@ func (idx *slotPriceIndex) remove(price float64) {
 	idx.removeLocked(price)
 }
 
-func (idx *slotPriceIndex) insertLocked(price float64) {
-	i := sort.Search(len(idx.prices), func(i int) bool { return idx.prices[i] >= price })
-	if i < len(idx.prices) && idx.prices[i] == price {
+func (idx *slotPriceIndex) insertLocked(slot *InventorySlot) {
+	i := sort.Search(len(idx.slots), func(i int) bool { return idx.slots[i].Price >= slot.Price })
+	if i < len(idx.slots) && idx.slots[i].Price == slot.Price {
 		return
 	}
 	// 读取远多于增删。写入时复制，保证 snapshot 返回的旧视图在解锁后
 	// 仍然不可变；热路径遍历因此无需每次复制整个价格索引。
-	next := make([]float64, len(idx.prices)+1)
-	copy(next, idx.prices[:i])
-	next[i] = price
-	copy(next[i+1:], idx.prices[i:])
-	idx.prices = next
+	next := make([]*InventorySlot, len(idx.slots)+1)
+	copy(next, idx.slots[:i])
+	next[i] = slot
+	copy(next[i+1:], idx.slots[i:])
+	idx.slots = next
 }
 
 func (idx *slotPriceIndex) removeLocked(price float64) {
-	i := sort.Search(len(idx.prices), func(i int) bool { return idx.prices[i] >= price })
-	if i == len(idx.prices) || idx.prices[i] != price {
+	i := sort.Search(len(idx.slots), func(i int) bool { return idx.slots[i].Price >= price })
+	if i == len(idx.slots) || idx.slots[i].Price != price {
 		return
 	}
-	next := make([]float64, len(idx.prices)-1)
-	copy(next, idx.prices[:i])
-	copy(next[i:], idx.prices[i+1:])
-	idx.prices = next
+	next := make([]*InventorySlot, len(idx.slots)-1)
+	copy(next, idx.slots[:i])
+	copy(next[i:], idx.slots[i+1:])
+	idx.slots = next
 }
 
-// snapshot 返回只读的不可变价格视图。调用方不得修改返回的切片；后续索引
-// 写入会发布新的底层数组，因此当前视图可在解锁后安全遍历且不产生分配。
-func (idx *slotPriceIndex) snapshot() []float64 {
+// snapshot 返回成员不可变的视图，槽位内容仍须持有各自的锁才能访问。
+// 后续索引写入不会修改已发布的切片；回收的旧槽由 retired 标记跳过。
+func (idx *slotPriceIndex) snapshot() []*InventorySlot {
 	if idx == nil {
 		return nil
 	}
 	idx.mu.RLock()
-	prices := idx.prices
+	slots := idx.slots
 	idx.mu.RUnlock()
-	return prices
+	return slots
 }
 
 // hasPriceInOpenClosedRange reports whether the index contains a price in
@@ -76,6 +77,6 @@ func (idx *slotPriceIndex) hasPriceInOpenClosedRange(lowerExclusive, upperInclus
 	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	i := sort.Search(len(idx.prices), func(i int) bool { return idx.prices[i] > lowerExclusive })
-	return i < len(idx.prices) && idx.prices[i] <= upperInclusive
+	i := sort.Search(len(idx.slots), func(i int) bool { return idx.slots[i].Price > lowerExclusive })
+	return i < len(idx.slots) && idx.slots[i].Price <= upperInclusive
 }

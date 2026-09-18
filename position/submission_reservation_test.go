@@ -10,6 +10,38 @@ import (
 	"opensqt/utils"
 )
 
+func TestGapStackRetryAfterConfirmationRetainsPendingIdentity(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
+	spm.anchorPrice = 100
+	spm.config.Execution.MaxGapStackSlots = 1
+	parent, child := spm.getOrCreateSlot(100), spm.getOrCreateSlot(101)
+	oldID := utils.GenerateOrderID(101, "BUY", 2)
+	bindTerminalOrder(child, 77, oldID, "BUY", .3)
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 77, ClientOrderID: oldID, Status: "CANCELED", UpdateTime: 1})
+	child.stackedParentPrice = 100
+	req := &OrderRequest{Symbol: "ETHUSDT", Side: "BUY", Price: 100, Quantity: .6,
+		GapStack: 2, ClientOrderID: utils.GenerateOrderID(100, "BUY", 2), PostOnly: true}
+	parent.mu.Lock()
+	spm.reserveOrderLocked(parent, req)
+	parent.mu.Unlock()
+	release, ok := req.AcquireSubmissionLease()
+	if !ok {
+		t.Fatal("initial gap-stack lease rejected")
+	}
+	req.OnSubmissionStarted()
+	release()
+	// 创建响应返回后的只读确认期间，子槽收到迟到成交修正。
+	spm.OnOrderUpdate(OrderUpdate{OrderID: 77, ClientOrderID: oldID, Status: "CANCELED",
+		ExecutedQty: .1, AvgPrice: 101, UpdateTime: 2})
+	if retryRelease, ok := req.AcquireSubmissionLease(); ok {
+		retryRelease()
+		t.Fatal("gap-stack retry ignored child inventory correction")
+	}
+	if parent.ClientOID != req.ClientOrderID || parent.SlotStatus != SlotStatusPending || child.stackedParentPrice != 100 {
+		t.Fatal("retry validation released uncertain parent identity or child reservation")
+	}
+}
+
 type leaseAwareExecutor struct {
 	beforeAcquire func(*OrderRequest)
 	submitted     []submittedOrder

@@ -24,6 +24,8 @@ const (
 	OrderUpdateLockWait
 	BuyFillToSellSubmit
 	SellFillToBuySubmit
+	AdjustRequestWait
+	ReconcileTotal
 	metricCount
 )
 
@@ -36,6 +38,7 @@ var metricNames = [metricCount]string{
 	"adjust_total", "adjust_lock_wait", "planning", "quote_to_planning",
 	"rate_limit_wait", "place_request", "cancel_request", "order_update_total",
 	"order_update_lock_wait", "buy_fill_to_sell_submit", "sell_fill_to_buy_submit",
+	"adjust_request_wait", "reconcile_total",
 }
 
 type LatencySnapshot struct {
@@ -54,11 +57,15 @@ type LatencySnapshot struct {
 }
 
 type StateCounts struct {
-	Slots              int   `json:"slots"`
-	FilledDedupKeys    int   `json:"filledDedupKeys"`
-	TerminalOrderKeys  int   `json:"terminalOrderKeys"`
-	PendingAbsenceKeys int   `json:"pendingAbsenceKeys"`
-	FilledOrders       int64 `json:"filledOrders"`
+	Slots                    int     `json:"slots"`
+	FilledDedupKeys          int     `json:"filledDedupKeys"`
+	TerminalOrderKeys        int     `json:"terminalOrderKeys"`
+	PendingAbsenceKeys       int     `json:"pendingAbsenceKeys"`
+	FilledOrders             int64   `json:"filledOrders"`
+	PendingOppositeBuys      int     `json:"pendingOppositeBuys"`
+	PendingOppositeSells     int     `json:"pendingOppositeSells"`
+	OldestOppositeBuyWaitMS  float64 `json:"oldestOppositeBuyWaitMs"`
+	OldestOppositeSellWaitMS float64 `json:"oldestOppositeSellWaitMs"`
 }
 
 type Snapshot struct {

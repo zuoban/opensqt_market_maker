@@ -62,16 +62,17 @@ const (
 )
 
 type OrderRequest struct {
-	Symbol        string
-	Side          Side
-	Type          OrderType
-	TimeInForce   TimeInForce
-	Quantity      float64
-	Price         float64
-	ReduceOnly    bool
-	PostOnly      bool // 是否只做 Maker（使用 GTX）
-	PriceDecimals int
-	ClientOrderID string // 自定义订单ID
+	Symbol          string
+	Side            Side
+	Type            OrderType
+	TimeInForce     TimeInForce
+	Quantity        float64
+	Price           float64
+	ReduceOnly      bool
+	PostOnly        bool // 是否只做 Maker（使用 GTX）
+	PriceDecimals   int
+	ClientOrderID   string                                            // 自定义订单ID
+	BeginSubmission func(context.Context) (release func(), err error) `json:"-"`
 }
 
 type Order struct {
@@ -312,7 +313,14 @@ func (b *BinanceAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Or
 			orderService = orderService.ReduceOnly(true)
 		}
 
-		resp, createErr := orderService.Do(ctx)
+		release, boundaryErr := beginOrderSubmission(ctx, req)
+		if boundaryErr != nil {
+			return nil, boundaryErr
+		}
+		resp, createErr := func() (*futures.CreateOrderResponse, error) {
+			defer release()
+			return orderService.Do(ctx)
+		}()
 		invalidSuccessResponse := isCreateResponseDecodeError(createErr)
 		if createErr == nil {
 			if responseErr := validateCreateOrderResponse(resp, b.contractSpec.Symbol, clientOrderID); responseErr != nil {

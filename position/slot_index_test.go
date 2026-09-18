@@ -17,14 +17,14 @@ func TestSlotPriceIndexInsertRemoveAndSnapshot(t *testing.T) {
 		t.Fatalf("snapshot = %v, want %v", got, want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if got[i].Price != want[i] {
 			t.Fatalf("snapshot = %v, want %v", got, want)
 		}
 	}
 	idx.remove(100)
 	idx.remove(50)
 	got = idx.snapshot()
-	if len(got) != 2 || got[0] != 99 || got[1] != 101 {
+	if len(got) != 2 || got[0].Price != 99 || got[1].Price != 101 {
 		t.Fatalf("after remove snapshot = %v", got)
 	}
 }
@@ -37,11 +37,11 @@ func TestSlotPriceIndexSnapshotRemainsImmutableAfterWrite(t *testing.T) {
 
 	idx.insert(101)
 	idx.remove(99)
-	if len(old) != 2 || old[0] != 99 || old[1] != 100 {
+	if len(old) != 2 || old[0].Price != 99 || old[1].Price != 100 {
 		t.Fatalf("旧快照被后续写入修改: %v", old)
 	}
 	current := idx.snapshot()
-	if len(current) != 2 || current[0] != 100 || current[1] != 101 {
+	if len(current) != 2 || current[0].Price != 100 || current[1].Price != 101 {
 		t.Fatalf("当前快照 = %v, want [100 101]", current)
 	}
 }
@@ -92,7 +92,7 @@ func TestGetOrCreateSlotUpdatesIndex(t *testing.T) {
 	spm.getOrCreateSlot(102)
 	spm.getOrCreateSlot(98)
 	got := spm.slotIndex.snapshot()
-	if len(got) != 2 || got[0] != 98 || got[1] != 102 {
+	if len(got) != 2 || got[0].Price != 98 || got[1].Price != 102 {
 		t.Fatalf("index = %v, want [98 102]", got)
 	}
 }
@@ -104,7 +104,11 @@ func requireSlotIndexMatchesMap(t *testing.T, spm *SuperPositionManager) {
 		inMap[key.(float64)] = struct{}{}
 		return true
 	})
-	for _, price := range spm.slotIndex.snapshot() {
+	for _, slot := range spm.slotIndex.snapshot() {
+		price := slot.Price
+		if current, _ := spm.slots.Load(price); current != slot {
+			t.Fatalf("index points to detached slot at %v", price)
+		}
 		if _, ok := inMap[price]; !ok {
 			t.Fatalf("index has %v missing from map", price)
 		}
@@ -155,7 +159,7 @@ func TestDeleteSlotKeepsIndexWhenPointerReplaced(t *testing.T) {
 		t.Fatal("replacement slot was removed from map")
 	}
 	idx := spm.slotIndex.snapshot()
-	if len(idx) != 1 || idx[0] != price {
+	if len(idx) != 1 || idx[0].Price != price {
 		t.Fatalf("index = %v, want [%v]", idx, price)
 	}
 }
@@ -178,6 +182,31 @@ func TestLockMappedSlotReturnsNewSlotAfterRecycle(t *testing.T) {
 	current, ok := spm.slots.Load(price)
 	if !ok || current != locked {
 		t.Fatal("lockMappedSlot returned a detached slot")
+	}
+	requireSlotIndexMatchesMap(t, spm)
+}
+
+func TestSlotIndexRetiresOldPointerWhenPriceIsReused(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
+	old := spm.getOrCreateSlot(90)
+	oldView := spm.slotIndex.snapshot()
+	old.mu.Lock()
+	deleted := spm.deleteSlotIfCurrentAndRecyclable(90, old)
+	old.mu.Unlock()
+	if !deleted || !old.retired.Load() {
+		t.Fatal("recycled slot was not retired")
+	}
+	replacement := spm.getOrCreateSlot(90)
+	if oldView[0] != old || replacement == old || replacement.retired.Load() {
+		t.Fatal("price reuse mutated the old view or resurrected a retired slot")
+	}
+	var visited []*InventorySlot
+	spm.forEachSlot(func(_ float64, slot *InventorySlot) bool {
+		visited = append(visited, slot)
+		return true
+	})
+	if len(visited) != 1 || visited[0] != replacement {
+		t.Fatal("scan did not use the current slot pointer")
 	}
 	requireSlotIndexMatchesMap(t, spm)
 }

@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"opensqt/config"
 	"opensqt/exchange"
 	"opensqt/order"
 	"opensqt/position"
@@ -12,22 +15,30 @@ import (
 
 type performanceBoundaryExchange struct {
 	exchange.IExchange
-	check func(int)
+	check  func(int)
+	nextID int64
 }
 
 func (e *performanceBoundaryExchange) GetName() string { return "performance-test" }
 func (e *performanceBoundaryExchange) PlaceOrder(_ context.Context, req *exchange.OrderRequest) (*exchange.Order, error) {
 	e.check(1)
-	return &exchange.Order{OrderID: 1, ClientOrderID: req.ClientOrderID, Status: exchange.OrderStatusNew}, nil
+	return e.accept(req), nil
 }
 func (e *performanceBoundaryExchange) PlaceOrderBatchSize() int { return 5 }
 func (e *performanceBoundaryExchange) PlaceOrderBatch(_ context.Context, reqs []*exchange.OrderRequest) ([]exchange.PlaceOrderBatchItem, error) {
 	e.check(len(reqs))
 	items := make([]exchange.PlaceOrderBatchItem, len(reqs))
 	for i, req := range reqs {
-		items[i].Order = &exchange.Order{OrderID: int64(i + 1), ClientOrderID: req.ClientOrderID, Status: exchange.OrderStatusNew}
+		items[i].Order = e.accept(req)
 	}
 	return items, nil
+}
+
+func (e *performanceBoundaryExchange) accept(req *exchange.OrderRequest) *exchange.Order {
+	e.nextID++
+	return &exchange.Order{OrderID: e.nextID, ClientOrderID: req.ClientOrderID,
+		Symbol: req.Symbol, Side: req.Side, Price: req.Price, Quantity: req.Quantity,
+		Status: exchange.OrderStatusNew}
 }
 
 func TestAdapterForwardsSubmissionTimingUnderLease(t *testing.T) {
@@ -67,5 +78,60 @@ func TestPerformanceLogMissingSample(t *testing.T) {
 	s.Latencies[telemetry.Planning] = telemetry.LatencySnapshot{Samples: 10, P95MS: 1.25}
 	if performanceP95(s, telemetry.Planning) != "1.25ms(n=10)" {
 		t.Fatal("log statistic missing units/count")
+	}
+}
+
+func TestAdapterForwardsPlacementBatchCapacity(t *testing.T) {
+	native := &performanceBoundaryExchange{}
+	// 只暴露基础接口的 wrapper 没有原生批量能力。
+	sequential := struct{ exchange.IExchange }{native}
+	for _, tc := range []struct {
+		ex   exchange.IExchange
+		want int
+	}{{native, 5}, {sequential, 1}} {
+		executor := order.NewExchangeOrderExecutor(tc.ex, "ETHUSDT", 0, 0)
+		adapter := &exchangeExecutorAdapter{executor: executor}
+		if got := adapter.PlacementBatchSize(); got != tc.want {
+			t.Fatalf("planner batch limit=%d want=%d", got, tc.want)
+		}
+		executor.Shutdown()
+	}
+}
+
+func TestOneBatchSchedulingThroughCoordinatorLoop(t *testing.T) {
+	var submitted atomic.Int32
+	finished := make(chan struct{}, 1)
+	ex := &performanceBoundaryExchange{check: func(n int) {
+		if n > 5 {
+			t.Errorf("native batch overflow: %d", n)
+		}
+		if submitted.Add(int32(n)) == 19 {
+			finished <- struct{}{}
+		}
+	}}
+	executor := order.NewExchangeOrderExecutor(ex, "BTCUSDT", 0, 0)
+	defer executor.Shutdown()
+	cfg := &config.Config{}
+	cfg.Trading.Symbol, cfg.Trading.PriceInterval, cfg.Trading.OrderQuantity = "BTCUSDT", 1, 30
+	cfg.Trading.BuyWindowSize, cfg.Trading.SellWindowSize, cfg.Trading.OrderCleanupThreshold = 20, 20, 100
+	spm := position.NewSuperPositionManager(cfg, &exchangeExecutorAdapter{executor: executor}, nil, 2, 3)
+	runtime, _, _ := newHealthyTradingGateTestRuntime(t, spm)
+	performance := telemetry.New(time.Now())
+	runtime.performance.Store(performance)
+	spm.SetTelemetry(performance)
+	if err := runtime.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Stop()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatalf("same-price continuation stopped at %d orders", submitted.Load())
+	}
+	runtime.Stop() // 等待最后一批的本地绑定与观测写入完成。
+	performance.Refresh()
+	if submitted.Load() != 19 || performance.Snapshot().Latencies[telemetry.AdjustTotal].Count != 4 ||
+		performance.Snapshot().Latencies[telemetry.AdjustRequestWait].Count != 3 {
+		t.Fatalf("unexpected continuation counts: submitted=%d snapshot=%+v", submitted.Load(), performance.Snapshot())
 	}
 }

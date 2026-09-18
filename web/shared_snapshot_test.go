@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,48 @@ import (
 type countedJSON struct {
 	calls atomic.Int32
 	err   error
+}
+
+func TestDashboardCompressionNegotiationAndLegacyClients(t *testing.T) {
+	server := startServer(t, "")
+	defer server.Shutdown(time.Second)
+	for _, compress := range []bool{false, true} {
+		dialer := *websocket.DefaultDialer
+		dialer.EnableCompression = compress
+		conn, response, err := dialer.Dial("ws://"+server.Addr()+"/ws", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		negotiated := strings.Contains(response.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate")
+		if negotiated != compress {
+			t.Fatalf("compression negotiated=%v want=%v", negotiated, compress)
+		}
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		var first wsEnvelope
+		if err := conn.ReadJSON(&first); err != nil || first.Type != "snapshot" || first.Data == nil {
+			t.Fatalf("initial snapshot: %+v err=%v", first, err)
+		}
+		server.hub.broadcast(struct {
+			Type string `json:"type"`
+			Data string `json:"data"`
+		}{Type: "compression-test", Data: strings.Repeat("槽位快照", 1000)})
+		for {
+			var message struct {
+				Type string      `json:"type"`
+				Data interface{} `json:"data"`
+			}
+			if err := conn.ReadJSON(&message); err != nil {
+				t.Fatal(err)
+			}
+			if message.Type == "compression-test" {
+				if message.Data != strings.Repeat("槽位快照", 1000) {
+					t.Fatal("compressed broadcast changed payload")
+				}
+				break
+			}
+		}
+	}
 }
 
 func (v *countedJSON) MarshalJSON() ([]byte, error) {

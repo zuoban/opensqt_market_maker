@@ -45,6 +45,7 @@ func (spm *SuperPositionManager) orderUpdateFacts(update OrderUpdate, side strin
 // the callback. It is still in-memory; no durable commit or rollback is claimed.
 func (spm *SuperPositionManager) publishOrderTransitionLocked(slot *InventorySlot, in orderUpdateInput, next orderTransition) {
 	applyOrderSlotState(slot, next.Slot)
+	slot.updateOppositeWaitLocked(in, next)
 	spm.publishExecutionEffect(next.Effect, in.SlotPrice, next.Disposition == transitionCorrection)
 	if next.StoreTerminal {
 		spm.storeTerminalOrderProgress(in.Update, next.Terminal)
@@ -74,7 +75,7 @@ func (spm *SuperPositionManager) publishExecutionEffect(effect executionEffect, 
 		spm.realizedPNL.Store(total)
 	}
 	spm.pnlMu.Unlock()
-	if effect.RealizedPNL != 0 {
+	if effect.RealizedPNL != 0 && logger.GetLevel() <= logger.INFO {
 		label, source := "已实现盈亏", "成交价差"
 		if correction {
 			label = "终态盈亏修正"
@@ -91,7 +92,9 @@ func (spm *SuperPositionManager) publishExecutionEffect(effect executionEffect, 
 func (spm *SuperPositionManager) applyOrderExecutionDelta(slot *InventorySlot, update OrderUpdate, side string, slotPrice float64) (float64, bool) {
 	next, effect, deltaQty, issue := reduceOrderExecution(readOrderSlotState(slot), update, side, slotPrice)
 	if issue != executionOK {
-		logger.Warn("⚠️ [忽略成交进度] 价格: %s, 状态: %s, 原因: %s", formatPrice(slotPrice, spm.priceDecimals), update.Status, issue)
+		if logger.GetLevel() <= logger.WARN {
+			logger.Warn("⚠️ [忽略成交进度] 价格: %s, 状态: %s, 原因: %s", formatPrice(slotPrice, spm.priceDecimals), update.Status, issue)
+		}
 		return 0, true
 	}
 	applyOrderSlotState(slot, next)
@@ -100,22 +103,39 @@ func (spm *SuperPositionManager) applyOrderExecutionDelta(slot *InventorySlot, u
 }
 
 func (spm *SuperPositionManager) logOrderTransition(in orderUpdateInput, next orderTransition) {
+	// Filter before formatting prices or boxing variadic arguments. Logging
+	// remains after state/accounting publication and cannot suppress an effect.
+	level := logger.GetLevel()
+	if level > logger.WARN {
+		return
+	}
 	u := in.Update
 	if next.Issue != executionOK {
 		if next.Issue == executionDuplicate {
-			logger.Debug("⏭️ [重复终态被忽略] ID=%d, ClientOID=%s, Status=%s", u.OrderID, u.ClientOrderID, u.Status)
+			if level <= logger.DEBUG {
+				logger.Debug("⏭️ [重复终态被忽略] ID=%d, ClientOID=%s, Status=%s", u.OrderID, u.ClientOrderID, u.Status)
+			}
 		} else {
 			logger.Warn("⚠️ [忽略成交进度] 价格: %s, 状态: %s, 原因: %s", formatPrice(in.SlotPrice, spm.priceDecimals), u.Status, next.Issue)
 		}
 	}
 	switch next.Disposition {
 	case transitionFilledReplay:
-		logger.Debug("⏭️ [已完成订单更新被忽略] ID=%d, ClientOID=%s, Status=%s", u.OrderID, u.ClientOrderID, u.Status)
+		if level <= logger.DEBUG {
+			logger.Debug("⏭️ [已完成订单更新被忽略] ID=%d, ClientOID=%s, Status=%s", u.OrderID, u.ClientOrderID, u.Status)
+		}
 	case transitionTerminalReplay:
-		logger.Debug("⏭️ [忽略终态后的乱序推送] ID=%d, ClientOID=%s, Status=%s", u.OrderID, u.ClientOrderID, u.Status)
+		if level <= logger.DEBUG {
+			logger.Debug("⏭️ [忽略终态后的乱序推送] ID=%d, ClientOID=%s, Status=%s", u.OrderID, u.ClientOrderID, u.Status)
+		}
 	case transitionWrongIdentity:
-		logger.Info("⚠️ [订单更新被忽略] 槽位 %.2f: ClientOID不匹配 (槽位: %s, 推送: %s, OrderID: %d)", in.SlotPrice, next.Slot.ClientOID, u.ClientOrderID, u.OrderID)
+		if level <= logger.INFO {
+			logger.Info("⚠️ [订单更新被忽略] 槽位 %.2f: ClientOID不匹配 (槽位: %s, 推送: %s, OrderID: %d)", in.SlotPrice, next.Slot.ClientOID, u.ClientOrderID, u.OrderID)
+		}
 	case transitionApplied:
+		if level > logger.INFO {
+			return
+		}
 		if next.RecordFill {
 			side := "买"
 			if in.Side == "SELL" {

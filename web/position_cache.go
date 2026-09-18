@@ -10,6 +10,7 @@ import (
 )
 
 const defaultPositionRefreshInterval = 400 * time.Millisecond
+const positionIdleAfter = 10 * time.Second
 
 // PositionSnapshotSource 是仓位缓存依赖的最小只读接口。
 type PositionSnapshotSource interface {
@@ -28,6 +29,8 @@ type PositionCache struct {
 	interval time.Duration
 	latest   atomic.Pointer[positionCacheEntry]
 	running  atomic.Bool
+	lastRead atomic.Int64
+	wake     chan struct{}
 }
 
 func newPositionCache(src PositionSnapshotSource, interval time.Duration) *PositionCache {
@@ -37,7 +40,7 @@ func newPositionCache(src PositionSnapshotSource, interval time.Duration) *Posit
 	if isNilPositionSnapshotSource(src) {
 		src = nil
 	}
-	return &PositionCache{src: src, interval: interval}
+	return &PositionCache{src: src, interval: interval, wake: make(chan struct{}, 1)}
 }
 
 func isNilPositionSnapshotSource(src PositionSnapshotSource) bool {
@@ -66,16 +69,47 @@ func (c *PositionCache) Run(ctx context.Context) {
 	}
 
 	c.refresh()
-	ticker := time.NewTicker(c.interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(c.interval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			c.refresh()
+		case <-timer.C:
+		case <-c.wake:
 		}
+		if ctx.Err() != nil {
+			return
+		}
+		c.refreshIfActive(time.Now())
+		// 从上次完成时刻安排下一次刷新，避免 ticker 与请求唤醒撞在一起
+		// 导致重复扫描，或因几微秒偏差跳过整轮。空闲时只低频检查。
+		now := time.Now()
+		delay := positionIdleAfter
+		if c.active(now) {
+			delay = c.interval
+			if entry := c.latest.Load(); entry != nil {
+				delay = max(0, entry.updatedAt.Add(c.interval).Sub(now))
+			}
+		}
+		timer.Stop()
+		timer.Reset(delay)
 	}
+}
+
+func (c *PositionCache) active(now time.Time) bool {
+	lastRead := c.lastRead.Load()
+	return lastRead != 0 && now.Sub(time.Unix(0, lastRead)) < positionIdleAfter
+}
+
+func (c *PositionCache) refreshIfActive(now time.Time) {
+	if !c.active(now) {
+		return
+	}
+	if entry := c.latest.Load(); entry != nil && now.Sub(entry.updatedAt) < c.interval {
+		return
+	}
+	c.refresh()
 }
 
 func (c *PositionCache) refresh() {
@@ -106,7 +140,16 @@ func (c *PositionCache) viewReadOnly() (position.PositionSnapshot, time.Time, bo
 	if c == nil {
 		return position.PositionSnapshot{}, time.Time{}, false
 	}
+	now := time.Now()
+	c.lastRead.Store(now.UnixNano())
 	entry := c.latest.Load()
+	if entry == nil || now.Sub(entry.updatedAt) >= c.interval {
+		// 首次访问/空闲后恢复只唤醒唯一刷新协程，HTTP/WS 不等待槽位锁。
+		select {
+		case c.wake <- struct{}{}:
+		default:
+		}
+	}
 	if entry == nil {
 		return position.PositionSnapshot{}, time.Time{}, false
 	}

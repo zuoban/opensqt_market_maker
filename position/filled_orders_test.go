@@ -2,6 +2,8 @@ package position
 
 import (
 	"fmt"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -216,6 +218,92 @@ func TestFilledOrdersKeepNewestRecords(t *testing.T) {
 	if snap.FilledOrders[len(snap.FilledOrders)-1].OrderID != 2 {
 		t.Fatalf("oldest retained order id = %d", snap.FilledOrders[len(snap.FilledOrders)-1].OrderID)
 	}
+}
+
+func recentFillFixture(id int, now time.Time) FilledOrderRecord {
+	return FilledOrderRecord{
+		OrderID: int64(id), ClientOrderID: fmt.Sprintf("recent-fill-%d", id),
+		Symbol: "ETHUSDT", Side: "BUY", Price: float64(id), Quantity: .25, FilledAt: now,
+	}
+}
+
+func assertRecentFillSnapshot(t *testing.T, snap PositionSnapshot, now time.Time) {
+	t.Helper()
+	wantLen := min(int(snap.FilledOrderCount), maxRecentFilledOrders)
+	if len(snap.FilledOrders) != wantLen {
+		t.Fatalf("recent fills: got %d records for count %d, want %d", len(snap.FilledOrders), snap.FilledOrderCount, wantLen)
+	}
+	for i, record := range snap.FilledOrders {
+		want := recentFillFixture(int(snap.FilledOrderCount)-i, now)
+		if record != want {
+			t.Fatalf("recent fill %d: got %+v, want %+v", i, record, want)
+		}
+	}
+}
+
+func TestFilledOrderSnapshotsStayIndependentAfterOverflow(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
+	now := time.Now()
+	frozen := []PositionSnapshot{spm.Snapshot()}
+	const count = 4*maxRecentFilledOrders + 1
+	for id := 1; id <= count; id++ {
+		spm.appendFilledOrder(recentFillFixture(id, now), now)
+		snap := spm.Snapshot()
+		assertRecentFillSnapshot(t, snap, now)
+		switch id {
+		case 1, maxRecentFilledOrders - 1, maxRecentFilledOrders, maxRecentFilledOrders + 1:
+			frozen = append(frozen, snap)
+		}
+	}
+	for _, snap := range frozen {
+		assertRecentFillSnapshot(t, snap, now)
+	}
+	before := spm.Snapshot()
+	// Replaying a fill that has left the visible list must still deduplicate.
+	spm.appendFilledOrder(recentFillFixture(1, now), now)
+	after := spm.Snapshot()
+	if after.FilledOrderCount != count || !slices.Equal(before.FilledOrders, after.FilledOrders) ||
+		!slices.Equal(before.FilledHourly, after.FilledHourly) {
+		t.Fatal("trimmed fill replay changed history or hourly accounting")
+	}
+	// A consumer can edit its own copy without corrupting the live history.
+	after.FilledOrders[0].ClientOrderID = "consumer-edit"
+	assertRecentFillSnapshot(t, spm.Snapshot(), now)
+}
+
+func TestFilledOrderSnapshotsDuringConcurrentOverflow(t *testing.T) {
+	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 2, 3)
+	now := time.Now()
+	for id := 1; id <= maxRecentFilledOrders; id++ {
+		spm.appendFilledOrder(recentFillFixture(id, now), now)
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		<-start
+		for id := maxRecentFilledOrders + 1; id <= 1000; id++ {
+			spm.appendFilledOrder(recentFillFixture(id, now), now)
+		}
+	})
+	for range 4 {
+		wg.Go(func() {
+			<-start
+			for range 100 {
+				snap := spm.Snapshot()
+				// Validate outside the history lock, while the writer may be
+				// shifting the live buffer; race detection covers aliasing too.
+				assertRecentFillSnapshot(t, snap, now)
+				snap.FilledOrders[0].ClientOrderID = "consumer-edit"
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	final := spm.Snapshot()
+	if final.FilledOrderCount != 1000 {
+		t.Fatalf("final fill count = %d, want 1000", final.FilledOrderCount)
+	}
+	assertRecentFillSnapshot(t, final, now)
 }
 
 func TestHourlyFillsKeep24HoursAfterListTrim(t *testing.T) {

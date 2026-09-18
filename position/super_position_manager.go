@@ -131,16 +131,17 @@ type OrderRequest struct {
 	PlannedAt     time.Time
 
 	// AcquireSubmissionLease 在每次真正调用交易所下单接口前执行。成功时返回的
-	// release 会一直持有对应槽位锁，调用方必须在该次接口调用返回后立即释放。
-	// 限流和重试等待期间不得持有 lease；同步重入同一槽位的订单回调也不受支持。
+	// release 会一直持有对应槽位锁，Binance 在该次创建 HTTP 返回后立即释放。
+	// 确认查询、限流和重试等待不持有 lease；实际创建调用期间不能同步重入同槽回调。
 	AcquireSubmissionLease func() (release func(), ok bool)
 	// OnSubmissionStarted 仅在所有门禁通过、持有 submission lease 时调用。
-	// 只记录性能样本；本地拒绝不消耗成交后的首次提交标记。
+	// 标记已进入创建边界并记录性能样本；本地拒绝不消耗首次提交标记。
 	OnSubmissionStarted func()
 
 	// submissionUncertain 表示至少一次交易所请求已经发出，但最终结果无法确认。
 	// 这种 reservation 不能按普通失败释放，否则下一轮会换 ClientOrderID 重下。
 	submissionUncertain atomic.Bool
+	submissionStarted   atomic.Bool  // 已进入创建边界；重试复检失败不得提前释放旧身份
 	definiteRejection   atomic.Value // string
 }
 
@@ -217,7 +218,8 @@ const (
 
 // InventorySlot 库存槽位（每个价格点一个）
 type InventorySlot struct {
-	Price float64 // 价格（作为key，支持高精度）
+	Price   float64     // 价格（作为key，支持高精度）
+	retired atomic.Bool // 已从当前映射回收；供旧索引视图跳过，不替代槽位锁
 
 	// 持仓信息
 	PositionStatus string  // 持仓状态：空仓/有仓
@@ -273,6 +275,7 @@ type InventorySlot struct {
 	// 只读性能关联数据，受 mu 保护，不参与下单决策或槽位回收判断。
 	oppositeFillAt     time.Time
 	oppositeSubmitSide string
+	oppositePending    atomic.Pointer[oppositeWaitState] // 只读观测：直到对向单确认受理
 
 	mu sync.RWMutex // 槽位级别的锁（细粒度锁）
 }
@@ -425,6 +428,7 @@ func NewSuperPositionManager(
 		priceDecimals:        priceDecimals,
 		priceTickSize:        priceTickSize,
 		quantityDecimals:     quantityDecimals,
+		filledOrders:         make([]FilledOrderRecord, 0, maxRecentFilledOrders),
 		filledOrderKeys:      make(map[string]struct{}),
 		filledHourly:         make(map[int64]*hourlyFillAcc),
 		terminalOrders:       make(map[string]terminalOrderProgress),
@@ -679,9 +683,10 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 			releaseChildren, valid = spm.acquireGapStackChildrenLease(slot.Price, req.GapStack)
 		}
 		if !valid {
-			// 只清理由本请求创建且尚未被订单流确认的 reservation。若身份已经
-			// 变化，说明另一个时序已经接管槽位，绝不能碰它。
-			if spm.matchesReservationLocked(slot, req) {
+			// 首次提交前的失效可直接清理；创建边界已经进入后，这也可能是
+			// UNKNOWN 确认后的同 ID 重试。此时必须等最终提交结果决定，
+			// 不能在复检阶段释放旧请求的 reservation 与跳格子槽。
+			if !req.submissionStarted.Load() && spm.matchesReservationLocked(slot, req) {
 				parentPrice, stackCount := slot.Price, slot.gapStackCount
 				spm.clearReservationLocked(slot)
 				slot.mu.Unlock()
@@ -698,20 +703,19 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 			slot.mu.Unlock()
 		}, true
 	}
-	if spm.performance.Load() != nil && !slot.oppositeFillAt.IsZero() && slot.oppositeSubmitSide == req.Side {
-		req.OnSubmissionStarted = func() {
-			// 执行器已经持有此槽位的 lease，不能在这里重复加锁。
-			if slot.oppositeSubmitSide != req.Side || slot.oppositeFillAt.IsZero() {
-				return
-			}
-			metric := telemetry.BuyFillToSellSubmit
-			if req.Side == "BUY" {
-				metric = telemetry.SellFillToBuySubmit
-			}
-			spm.performance.Load().ObserveSince(metric, slot.oppositeFillAt, false)
-			slot.oppositeFillAt = time.Time{}
-			slot.oppositeSubmitSide = ""
+	req.OnSubmissionStarted = func() {
+		req.submissionStarted.Store(true)
+		// 执行器已经持有此槽位的 lease，不能在这里重复加锁。
+		if slot.oppositeSubmitSide != req.Side || slot.oppositeFillAt.IsZero() {
+			return
 		}
+		metric := telemetry.BuyFillToSellSubmit
+		if req.Side == "BUY" {
+			metric = telemetry.SellFillToBuySubmit
+		}
+		spm.performance.Load().ObserveSince(metric, slot.oppositeFillAt, false)
+		slot.oppositeFillAt = time.Time{}
+		slot.oppositeSubmitSide = ""
 	}
 }
 
@@ -1013,7 +1017,15 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 	spm.adjustMu.Lock()
 	performance.ObserveSince(telemetry.AdjustLockWait, started, false)
 	var adjustmentDeadlines []time.Time
+	batch := newAdjustmentBatch(spm.executor)
 	defer func() {
+		if batch.deferred {
+			spm.clearAdjustFingerprint()
+			// UNKNOWN/门禁错误交给协调器先关门恢复；明确拒单已有冷却通知。
+			if retErr == nil {
+				adjustmentDeadlines = append(adjustmentDeadlines, time.Time{})
+			}
+		}
 		spm.adjustMu.Unlock()
 		// 失败 reservation 和保证金锁到期通知都延迟到 adjustMu 释放之后。
 		// 生产回调只会向串行协调器入队；这里也从实现上杜绝未来回调
@@ -1300,6 +1312,10 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 					priceInterval*spm.nearTouchRatio()+fillQtyTolerance,
 				PlannedAt: adjustmentTime,
 			}
+			if !batch.accept(req) {
+				slot.mu.Unlock()
+				break
+			}
 			spm.reserveOrderLocked(slot, req)
 			spm.makerAttempts.Add(1)
 			occupiedSellPriceTicks[sellPriceTick] = struct{}{}
@@ -1472,6 +1488,10 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 					priceInterval*spm.nearTouchRatio()+fillQtyTolerance,
 				PlannedAt: adjustmentTime,
 			}
+			if !batch.accept(req) {
+				slot.mu.Unlock()
+				break
+			}
 			spm.reserveOrderLocked(slot, req)
 			spm.makerAttempts.Add(1)
 			buyOrdersToPlace = append(buyOrdersToPlace, req)
@@ -1489,7 +1509,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 
 		slot.mu.Unlock()
 	}
-	if len(buyOrdersToPlace) == 0 && allowedNewBuyOrders > 0 && !buyPlacementPaused {
+	if len(buyOrdersToPlace) == 0 && allowedNewBuyOrders > 0 && !buyPlacementPaused && !batch.deferred {
 		spm.logEmptyBuyWindow(currentPrice, currentGridPrice, slotPrices, market, buyMakerCap, hasMakerBuyCap, catchUpMode)
 	}
 
@@ -1720,6 +1740,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 				}
 				// 🔥 订单提交成功，设置为LOCKED状态
 				slot.SlotStatus = SlotStatusLocked
+				slot.confirmOppositeOrderLocked(side)
 				// 注意：不在这里重置PostOnlyFailCount，因为订单可能立即被撤销
 				// 撤销/拒绝诊断计数只在订单真正成交时重置
 
@@ -1994,6 +2015,8 @@ func (spm *SuperPositionManager) deleteSlotIfCurrentAndRecyclable(price float64,
 	if !spm.slots.CompareAndDelete(price, slot) {
 		return false
 	}
+	slot.retired.Store(true)
+	slot.oppositePending.Store(nil)
 	spm.slotIndex.removeLocked(price)
 	return true
 }
@@ -2063,12 +2086,8 @@ func isTerminalOrderStatus(status string) bool {
 }
 
 func (spm *SuperPositionManager) getTerminalOrderProgress(update OrderUpdate) (terminalOrderProgress, bool) {
-	key := filledOrderKey(update)
-	if key == "" {
-		return terminalOrderProgress{}, false
-	}
 	spm.terminalOrdersMu.RLock()
-	progress, exists := spm.terminalOrders[key]
+	progress, exists := lookupOrderHistory(spm.terminalOrders, update)
 	spm.terminalOrdersMu.RUnlock()
 	return progress, exists
 }
@@ -2094,12 +2113,8 @@ func filledOrderKey(update OrderUpdate) string {
 }
 
 func (spm *SuperPositionManager) wasFilledOrderRecorded(update OrderUpdate) bool {
-	key := filledOrderKey(update)
-	if key == "" {
-		return false
-	}
 	spm.filledOrdersMu.RLock()
-	_, exists := spm.filledOrderKeys[key]
+	_, exists := lookupOrderHistory(spm.filledOrderKeys, update)
 	spm.filledOrdersMu.RUnlock()
 	return exists
 }
@@ -2124,11 +2139,15 @@ func (spm *SuperPositionManager) appendFilledOrder(record FilledOrderRecord, now
 		return
 	}
 	spm.filledOrderKeys[key] = struct{}{}
-	spm.filledOrders = append(spm.filledOrders, record)
-	spm.filledOrderCount++
-	if len(spm.filledOrders) > maxRecentFilledOrders {
-		spm.filledOrders = append([]FilledOrderRecord(nil), spm.filledOrders[len(spm.filledOrders)-maxRecentFilledOrders:]...)
+	if len(spm.filledOrders) < maxRecentFilledOrders {
+		spm.filledOrders = append(spm.filledOrders, record)
+	} else {
+		// 保持旧到新的内部顺序并复用容量。Snapshot 在同一锁下复制，
+		// 因此原地移动不会修改已发布的快照，也不会保留被移除的记录。
+		copy(spm.filledOrders, spm.filledOrders[1:])
+		spm.filledOrders[len(spm.filledOrders)-1] = record
 	}
+	spm.filledOrderCount++
 	spm.addHourlyFillLocked(record, now)
 }
 
@@ -2240,7 +2259,7 @@ func (spm *SuperPositionManager) getOrCreateSlot(price float64) *InventorySlot {
 	actual, loaded := spm.slots.LoadOrStore(price, created)
 	slot := actual.(*InventorySlot)
 	if !loaded {
-		spm.slotIndex.insertLocked(price)
+		spm.slotIndex.insertLocked(slot)
 	}
 	return slot
 }
@@ -2259,16 +2278,11 @@ func (spm *SuperPositionManager) lockMappedSlot(price float64) *InventorySlot {
 }
 
 func (spm *SuperPositionManager) forEachSlot(fn func(price float64, slot *InventorySlot) bool) {
-	for _, price := range spm.slotIndex.snapshot() {
-		raw, ok := spm.slots.Load(price)
-		if !ok {
+	for _, slot := range spm.slotIndex.snapshot() {
+		if slot.retired.Load() {
 			continue
 		}
-		slot, ok := raw.(*InventorySlot)
-		if !ok || slot == nil {
-			continue
-		}
-		if !fn(price, slot) {
+		if !fn(slot.Price, slot) {
 			return
 		}
 	}

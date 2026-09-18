@@ -198,6 +198,7 @@ func main() {
 
 	// === 创建对账器（从仓位管理器剖离） ===
 	reconciler := safety.NewReconciler(cfg, exchangeAdapter, superPositionManager)
+	reconciler.SetTelemetry(performance)
 	// 将风控状态注入到对账器，用于暂停对账日志
 	reconciler.SetPauseChecker(func() bool {
 		return riskMonitor.IsTriggered()
@@ -297,6 +298,7 @@ func main() {
 		time.Duration(cfg.Trading.ReconcileInterval)*time.Second,
 	)
 	marginMonitor.SetLimitHandler(gateRuntime.handleMarginLimit)
+	gateRuntime.performance.Store(performance)
 	shutdownRequested := consumePendingShutdownSignal(sigChan)
 	if shutdownRequested {
 		logger.Warn("⚠️ 交易门禁启动前已收到退出信号，跳过首次挂单并直接进入安全关闭")
@@ -603,6 +605,10 @@ func (a *positionExchangeAdapter) CancelAllOrders(ctx context.Context, symbol st
 // exchangeExecutorAdapter 适配器，将 order.ExchangeOrderExecutor 转换为 position.OrderExecutorInterface
 type exchangeExecutorAdapter struct {
 	executor *order.ExchangeOrderExecutor
+}
+
+func (a *exchangeExecutorAdapter) PlacementBatchSize() int {
+	return a.executor.PlacementBatchSize()
 }
 
 func (a *exchangeExecutorAdapter) PlaceOrder(req *position.OrderRequest) (*position.Order, error) {

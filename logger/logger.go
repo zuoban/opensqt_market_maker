@@ -31,8 +31,11 @@ var (
 	currentDate    string
 	fileMu         sync.Mutex
 	logDir         = "log" // 日志文件夹
-	fileLogCh      chan asyncFileLogItem
-	fileWorkerDone chan struct{}
+	fileSink       atomic.Pointer[asyncLogSink]
+	consoleSink    atomic.Pointer[asyncLogSink]
+	lifecycleMu    sync.Mutex
+	consoleDropped atomic.Uint64
+	fileDropped    atomic.Uint64
 
 	ringCap  = 200
 	ringMu   sync.Mutex
@@ -43,9 +46,10 @@ var (
 
 func init() {
 	globalLevel.Store(int32(INFO))
+	startConsoleLogger()
 }
 
-type asyncFileLogItem struct {
+type asyncLogItem struct {
 	time      time.Time
 	levelText string
 	message   string
@@ -97,6 +101,9 @@ func ParseLogLevel(level string) LogLevel {
 
 // SetLevel 设置全局日志级别
 func SetLevel(level LogLevel) {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	startConsoleLogger()
 	globalLevel.Store(int32(level))
 
 	// 如果设置为DEBUG级别，启用文件日志
@@ -137,44 +144,23 @@ func initFileLogger() {
 		log.Printf("[INFO] 文件日志已启用，日志文件: %s", logFileName)
 	}
 
-	if fileLogCh == nil {
-		fileLogCh = make(chan asyncFileLogItem, 4096)
-		fileWorkerDone = make(chan struct{})
-		ch := fileLogCh
-		done := fileWorkerDone
-		go func() {
-			defer close(done)
-			for item := range ch {
-				fileMu.Lock()
-				checkAndRotateLog()
-				if fileLogger != nil {
-					fileLogger.Printf("%s [%s] %s", item.time.Format("2006/01/02 15:04:05"), item.levelText, item.message)
-				}
-				fileMu.Unlock()
+	if fileSink.Load() == nil {
+		fileSink.Store(newAsyncLogSink(4096, &fileDropped, func(item asyncLogItem) {
+			fileMu.Lock()
+			defer fileMu.Unlock()
+			checkAndRotateLog()
+			if fileLogger != nil {
+				fileLogger.Printf("%s [%s] %s", item.time.Format("2006/01/02 15:04:05"), item.levelText, item.message)
 			}
-		}()
+		}))
 	}
 }
 
-// closeFileLogger 关闭文件日志并等待刷盘完成
+// closeFileLogger 由 lifecycleMu 串行化；先停止入队并排空，再关闭文件。
 func closeFileLogger() {
-	fileMu.Lock()
-	ch := fileLogCh
-	done := fileWorkerDone
-	fileLogCh = nil
-	fileWorkerDone = nil
-	fileMu.Unlock()
-
-	if ch != nil {
-		close(ch)
-		if done != nil {
-			<-done
-		}
-	}
-
+	fileSink.Swap(nil).close()
 	fileMu.Lock()
 	defer fileMu.Unlock()
-
 	if logFile != nil {
 		logFile.Close()
 		logFile = nil
@@ -207,9 +193,12 @@ func checkAndRotateLog() {
 	}
 }
 
-// Close 关闭文件日志（程序退出时调用）
+// Close 停止接收输出日志并等待控制台、文件队列排空（程序退出时调用）
 func Close() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
 	closeFileLogger()
+	consoleSink.Swap(nil).close()
 }
 
 func recordLog(level LogLevel, msg string) {
@@ -257,60 +246,39 @@ func shouldLog(level LogLevel) bool {
 	return int32(level) >= globalLevel.Load()
 }
 
-func enqueueFileLog(item asyncFileLogItem) {
-	fileMu.Lock()
-	ch := fileLogCh
-	fileMu.Unlock()
-	if ch != nil {
-		select {
-		case ch <- item:
-		default:
-			// 队列已满时非阻塞丢弃，避免磁盘写停顿阻塞做市主流程
-		}
-	}
+func enqueueFileLog(item asyncLogItem) {
+	fileSink.Load().enqueue(item)
 }
 
-// logf 内部日志输出函数
-func logf(level LogLevel, format string, args ...interface{}) {
-	if !shouldLog(level) {
-		return
-	}
-	levelText := level.String()
-	message := fmt.Sprintf(format, args...)
+// DroppedLogs 返回输出队列饱和后丢弃的累计条数。面板环缓冲仍记录日志。
+func DroppedLogs() (console, file uint64) {
+	return consoleDropped.Load(), fileDropped.Load()
+}
+
+func emitLog(level LogLevel, message string) {
 	recordLog(level, message)
-
-	// 正文只格式化一次；控制台、环缓冲和 DEBUG 文件复用同一结果。
-	log.Printf("[%s] %s", levelText, message)
-
-	// 如果日志级别为DEBUG，异步写入文件
+	item := asyncLogItem{time: time.Now(), levelText: level.String(), message: message}
+	if level == FATAL {
+		// 致命错误不能因队列饱和丢失；退出路径允许等待控制台。
+		consoleSink.Swap(nil).close()
+		log.Printf("[%s] %s", item.levelText, message)
+	} else {
+		consoleSink.Load().enqueue(item)
+	}
 	if LogLevel(globalLevel.Load()) == DEBUG {
-		enqueueFileLog(asyncFileLogItem{
-			time:      time.Now(),
-			levelText: levelText,
-			message:   message,
-		})
+		enqueueFileLog(item)
 	}
 }
 
-// logln 内部日志输出函数（无格式）
-func logln(level LogLevel, args ...interface{}) {
-	if !shouldLog(level) {
-		return
+func logf(level LogLevel, format string, args ...interface{}) {
+	if shouldLog(level) {
+		emitLog(level, fmt.Sprintf(format, args...))
 	}
-	prefix := fmt.Sprintf("[%s] ", level.String())
-	cleaned := strings.TrimSpace(fmt.Sprintln(args...))
-	recordLog(level, cleaned)
+}
 
-	// 输出到控制台（标准输出）
-	log.Println(append([]interface{}{prefix}, args...)...)
-
-	// 如果日志级别为DEBUG，异步写入文件
-	if LogLevel(globalLevel.Load()) == DEBUG {
-		enqueueFileLog(asyncFileLogItem{
-			time:      time.Now(),
-			levelText: level.String(),
-			message:   cleaned,
-		})
+func logln(level LogLevel, args ...interface{}) {
+	if shouldLog(level) {
+		emitLog(level, strings.TrimSpace(fmt.Sprintln(args...)))
 	}
 }
 

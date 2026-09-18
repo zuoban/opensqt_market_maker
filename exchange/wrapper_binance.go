@@ -18,16 +18,17 @@ func (w *binanceWrapper) GetName() string {
 
 func (w *binanceWrapper) PlaceOrder(ctx context.Context, req *OrderRequest) (*Order, error) {
 	binanceReq := &binance.OrderRequest{
-		Symbol:        req.Symbol,
-		Side:          binance.Side(req.Side),
-		Type:          binance.OrderType(req.Type),
-		TimeInForce:   binance.TimeInForce(req.TimeInForce),
-		Quantity:      req.Quantity,
-		Price:         req.Price,
-		ReduceOnly:    req.ReduceOnly,
-		PostOnly:      req.PostOnly,
-		PriceDecimals: req.PriceDecimals,
-		ClientOrderID: req.ClientOrderID,
+		Symbol:          req.Symbol,
+		Side:            binance.Side(req.Side),
+		Type:            binance.OrderType(req.Type),
+		TimeInForce:     binance.TimeInForce(req.TimeInForce),
+		Quantity:        req.Quantity,
+		Price:           req.Price,
+		ReduceOnly:      req.ReduceOnly,
+		PostOnly:        req.PostOnly,
+		PriceDecimals:   req.PriceDecimals,
+		ClientOrderID:   req.ClientOrderID,
+		BeginSubmission: req.BeginSubmission,
 	}
 
 	binanceOrder, err := w.adapter.PlaceOrder(ctx, binanceReq)
@@ -55,16 +56,17 @@ func (w *binanceWrapper) BatchPlaceOrders(ctx context.Context, orders []*OrderRe
 	binanceOrders := make([]*binance.OrderRequest, len(orders))
 	for i, req := range orders {
 		binanceOrders[i] = &binance.OrderRequest{
-			Symbol:        req.Symbol,
-			Side:          binance.Side(req.Side),
-			Type:          binance.OrderType(req.Type),
-			TimeInForce:   binance.TimeInForce(req.TimeInForce),
-			Quantity:      req.Quantity,
-			Price:         req.Price,
-			ReduceOnly:    req.ReduceOnly,
-			PostOnly:      req.PostOnly,
-			PriceDecimals: req.PriceDecimals,
-			ClientOrderID: req.ClientOrderID,
+			Symbol:          req.Symbol,
+			Side:            binance.Side(req.Side),
+			Type:            binance.OrderType(req.Type),
+			TimeInForce:     binance.TimeInForce(req.TimeInForce),
+			Quantity:        req.Quantity,
+			Price:           req.Price,
+			ReduceOnly:      req.ReduceOnly,
+			PostOnly:        req.PostOnly,
+			PriceDecimals:   req.PriceDecimals,
+			ClientOrderID:   req.ClientOrderID,
+			BeginSubmission: req.BeginSubmission,
 		}
 	}
 
@@ -102,16 +104,17 @@ func (w *binanceWrapper) PlaceOrderBatch(ctx context.Context, orders []*OrderReq
 			continue
 		}
 		native[i] = &binance.OrderRequest{
-			Symbol:        req.Symbol,
-			Side:          binance.Side(req.Side),
-			Type:          binance.OrderType(req.Type),
-			TimeInForce:   binance.TimeInForce(req.TimeInForce),
-			Quantity:      req.Quantity,
-			Price:         req.Price,
-			ReduceOnly:    req.ReduceOnly,
-			PostOnly:      req.PostOnly,
-			PriceDecimals: req.PriceDecimals,
-			ClientOrderID: req.ClientOrderID,
+			Symbol:          req.Symbol,
+			Side:            binance.Side(req.Side),
+			Type:            binance.OrderType(req.Type),
+			TimeInForce:     binance.TimeInForce(req.TimeInForce),
+			Quantity:        req.Quantity,
+			Price:           req.Price,
+			ReduceOnly:      req.ReduceOnly,
+			PostOnly:        req.PostOnly,
+			PriceDecimals:   req.PriceDecimals,
+			ClientOrderID:   req.ClientOrderID,
+			BeginSubmission: req.BeginSubmission,
 		}
 	}
 	items, err := w.adapter.PlaceOrderBatch(ctx, native)

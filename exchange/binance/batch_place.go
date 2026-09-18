@@ -29,6 +29,7 @@ type preparedOrder struct {
 	normalized normalizedOrder
 	clientOID  string
 	createSvc  *futures.CreateOrderService
+	release    func()
 }
 
 type unknownBatchResolution struct {
@@ -77,13 +78,25 @@ func (b *BinanceAdapter) placeOrderBatchChunk(ctx context.Context, orders []*Ord
 	}
 
 	prepared := make([]preparedOrder, 0, len(orders))
+	releasePrepared := func() {
+		for _, item := range prepared {
+			item.release()
+		}
+	}
+	defer releasePrepared()
 	for i, req := range orders {
 		if req == nil {
 			results[i].Err = exchangeerr.WrapOrderPlacementRejected(fmt.Errorf("订单请求不能为空"))
 			continue
 		}
+		release, boundaryErr := beginOrderSubmission(ctx, req)
+		if boundaryErr != nil {
+			results[i].Err = boundaryErr
+			continue
+		}
 		normalized, err := b.contractSpec.normalizeOrder(req)
 		if err != nil {
+			release()
 			results[i].Err = exchangeerr.WrapOrderPlacementRejected(fmt.Errorf("Binance 订单参数无效: %w", err))
 			continue
 		}
@@ -92,6 +105,7 @@ func (b *BinanceAdapter) placeOrderBatchChunk(ctx context.Context, orders []*Ord
 			timeInForce = futures.TimeInForceTypeGTX
 		}
 		if req.ClientOrderID == "" {
+			release()
 			results[i].Err = exchangeerr.WrapOrderPlacementRejected(fmt.Errorf("Binance 批量下单缺少 clientOrderID"))
 			continue
 		}
@@ -115,6 +129,7 @@ func (b *BinanceAdapter) placeOrderBatchChunk(ctx context.Context, orders []*Ord
 			normalized: normalized,
 			clientOID:  clientOID,
 			createSvc:  svc,
+			release:    release,
 		})
 	}
 	if len(prepared) == 0 {
@@ -126,7 +141,10 @@ func (b *BinanceAdapter) placeOrderBatchChunk(ctx context.Context, orders []*Ord
 	for i, item := range prepared {
 		services[i] = item.createSvc
 	}
-	resp, createErr := b.client.NewCreateBatchOrdersService().OrderList(services).Do(ctx)
+	resp, createErr := func() (*futures.CreateBatchOrdersResponse, error) {
+		defer releasePrepared()
+		return b.client.NewCreateBatchOrdersService().OrderList(services).Do(ctx)
+	}()
 	if createErr != nil {
 		b.resolveUnknownBatchChunk(ctx, prepared, results, createErr)
 		return nil

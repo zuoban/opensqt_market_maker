@@ -15,6 +15,7 @@ import (
 	"opensqt/config"
 	"opensqt/exchange"
 	"opensqt/logger"
+	"opensqt/telemetry"
 )
 
 // IExchange 定义对账所需的交易所接口方法
@@ -78,6 +79,11 @@ type Reconciler struct {
 	healthMu     sync.RWMutex
 	healthChange func(healthy bool, err error)
 	reconcileMu  sync.Mutex
+	performance  atomic.Pointer[telemetry.Recorder]
+}
+
+func (r *Reconciler) SetTelemetry(recorder *telemetry.Recorder) {
+	r.performance.Store(recorder)
 }
 
 type pendingOrderResolver interface {
@@ -159,6 +165,9 @@ func (r *Reconciler) Start(ctx context.Context) {
 
 // Reconcile 执行对账（通用实现，支持所有交易所）
 func (r *Reconciler) Reconcile() (retErr error) {
+	performance := r.performance.Load()
+	started := performance.Start()
+	defer func() { performance.ObserveSince(telemetry.ReconcileTotal, started, retErr != nil) }()
 	r.reconcileMu.Lock()
 	defer r.reconcileMu.Unlock()
 	defer func() {
@@ -190,16 +199,11 @@ func (r *Reconciler) Reconcile() (retErr error) {
 		}
 	}
 
-	// 1. 查询交易所持仓信息（使用通用接口）
-	positionsRaw, err := r.exchange.GetPositions(ctx, symbol)
+	// 两个只读请求共享截止时间并行完成，避免正常对账串行消耗两次 RTT。
+	// 对账轮次及本地校验仍由 reconcileMu 和交易协调器串行化。
+	positionsRaw, openOrdersRaw, err := r.readRemoteState(ctx, symbol)
 	if err != nil {
-		return fmt.Errorf("查询持仓失败: %w", err)
-	}
-
-	// 2. 查询所有挂单（使用通用接口）
-	openOrdersRaw, err := r.exchange.GetOpenOrders(ctx, symbol)
-	if err != nil {
-		return fmt.Errorf("查询挂单失败: %w", err)
+		return err
 	}
 
 	// 3. 解析持仓和挂单信息（通用处理）
@@ -427,6 +431,45 @@ func (r *Reconciler) Reconcile() (retErr error) {
 	}
 	r.setHealthy(true, nil)
 	return nil
+}
+
+func (r *Reconciler) readRemoteState(ctx context.Context, symbol string) (positions, orders interface{}, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		positions bool
+		value     interface{}
+		err       error
+	}
+	// 即使另一个请求失败后调用方提前返回，完成的请求也不会阻塞发送。
+	results := make(chan result, 2)
+	go func() {
+		value, err := r.exchange.GetPositions(ctx, symbol)
+		results <- result{positions: true, value: value, err: err}
+	}()
+	go func() {
+		value, err := r.exchange.GetOpenOrders(ctx, symbol)
+		results <- result{value: value, err: err}
+	}()
+	for range 2 {
+		select {
+		case <-ctx.Done():
+			return nil, nil, fmt.Errorf("查询远端状态失败: %w", ctx.Err())
+		case item := <-results:
+			if item.err != nil {
+				if item.positions {
+					return nil, nil, fmt.Errorf("查询持仓失败: %w", item.err)
+				}
+				return nil, nil, fmt.Errorf("查询挂单失败: %w", item.err)
+			}
+			if item.positions {
+				positions = item.value
+			} else {
+				orders = item.value
+			}
+		}
+	}
+	return positions, orders, nil
 }
 
 func sumTypedPositions(raw interface{}, symbol string) (float64, bool, error) {
