@@ -17,10 +17,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
       - name: Verify dependencies and source
         run: |
           go mod verify
           go vet ./...
+      - name: Check production dependencies for vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 .
+      - name: Test release packaging
+        run: python3 -B -m unittest discover -s scripts -p 'test_package_release.py'
       - name: Test with race detection
         run: go test -race ./... -count=1
       - name: Test dashboard

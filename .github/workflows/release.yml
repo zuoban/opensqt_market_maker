@@ -47,6 +47,7 @@ jobs:
             echo "main.go 版本号 $VERSION 与 tag ${GITHUB_REF_NAME} 不一致" >&2
             exit 1
           fi
+          test -s "release-notes/${VERSION}.md"
 
       - name: Build release package
         shell: bash
@@ -67,6 +68,9 @@ jobs:
     needs: build-assets
 
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -81,17 +85,6 @@ jobs:
           name: ${{ github.ref_name }}
           fail_on_unmatched_files: true
           generate_release_notes: true
-          body: |
-            Automated release package for ${{ github.ref_name }}.
-
-            Included assets:
-            - Linux amd64 archive
-            - Windows amd64 archive
-            - MacOS arm64 archive
-            - SHA256 checksum files
-
-            Docker image (GitHub Packages):
-            - ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            - ghcr.io/${{ github.repository }}:latest
+          body_path: release-notes/${{ github.ref_name }}.md
           files: |
             release-assets/*

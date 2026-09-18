@@ -5,7 +5,7 @@
   
   **毫秒级高频加密货币做市商系统 | High-Frequency Crypto Market Maker**
 
-  [![Go Version](https://img.shields.io/badge/Go-1.25%2B-blue.svg)](https://golang.org/dl/)
+  [![Go Version](https://img.shields.io/badge/Go-1.27.1%2B-blue.svg)](https://golang.org/dl/)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 </div>
 
@@ -93,7 +93,7 @@ opensqt_platform/
 ## 🚀 快速开始 (Getting Started)
 
 ### 环境要求 (Prerequisites)
-- Go 1.25 或更高版本
+- Go 1.27.1 或更高版本
 - 网络环境需能访问 Binance API
 
 ### 安装 (Installation)

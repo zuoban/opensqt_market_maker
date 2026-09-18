@@ -7,11 +7,18 @@
 - GitHub Release 名称、Tag 名称、发行包文件名必须与该版本号保持一致。
 - [ARCHITECTURE.md](ARCHITECTURE.md) 顶部文档版本建议同步更新，避免文档和程序版本脱节。
 - 如果某个标签已经发布，后续改动必须递增补丁版本，不要重打已有标签。
+- 本地打包也以 `main.go` 为准；可传入同值 `VERSION`，但不允许通过环境变量改写发行版本。版本不一致或格式错误时，脚本会在编译及清理产物前退出。
+
+## 构建环境
+
+- 使用 Go 1.27.1 或更高的已修补版本；发布 CI 从 `go.mod` 选择版本，Docker 默认版本必须与其一致。
+- Windows ZIP 使用 Python 3 标准库生成，正确保留中文路径的 UTF-8 标记；本地交叉打包 Windows 前需安装 `python3`，不再依赖系统 `zip`。
+- 打包回归与主程序漏洞扫描均为共用 Checks 的发布门槛，失败时不发布附件或镜像。
 
 ## 发布流程
 
 1. 修改 [main.go](main.go#L21) 中的版本号。
-2. 如有必要，同步更新 [ARCHITECTURE.md](ARCHITECTURE.md) 中的版本说明。
+2. 同步更新 [ARCHITECTURE.md](ARCHITECTURE.md) 中的版本说明，并新增 `release-notes/<版本号>.md`，说明功能、兼容性及尚未实现的边界；工作流会将其用于 GitHub Release 正文。
 3. 验证模块、编译和回归测试：
 
 ```bash
@@ -20,6 +27,8 @@ go build ./...
 go vet ./...
 go test -race ./... -count=1
 node --test web/app_frontend_test.js
+python3 -B -m unittest discover -s scripts -p 'test_package_release.py'
+go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 .
 ```
 
 4. 提交代码并推送到主分支。
@@ -33,7 +42,7 @@ git push origin v3.4.3
 
 6. 推送标签后，GitHub Actions 会自动：
 
-- Release 与 Docker 工作流先通过共用的 Checks（依赖校验、静态检查、并发回归、前端测试），失败时不发布
+- Release 与 Docker 工作流先通过共用的 Checks（依赖校验、静态检查、漏洞扫描、打包回归、并发回归、前端测试），失败时不发布
 - 校验 [main.go](main.go#L21) 的版本号和 tag 一致
 - 构建 Linux amd64、Windows amd64、MacOS arm64 三个平台附件
 - 自动创建或更新 GitHub Release

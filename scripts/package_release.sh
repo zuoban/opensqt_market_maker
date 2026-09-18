@@ -42,7 +42,16 @@ normalize_goarch() {
   esac
 }
 
-VERSION="${VERSION:-$(extract_version)}"
+SOURCE_VERSION="$(extract_version || true)"
+if [[ ! "$SOURCE_VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "main.go 的 Version 必须为 v主版本.次版本.修订号，且各段不能包含多余的前导零" >&2
+  exit 1
+fi
+VERSION="${VERSION:-$SOURCE_VERSION}"
+if [[ "$VERSION" != "$SOURCE_VERSION" ]]; then
+  echo "指定版本 $VERSION 与 main.go 版本 $SOURCE_VERSION 不一致" >&2
+  exit 1
+fi
 TARGET_OS="${TARGET_OS:-${GOOS:-linux}}"
 TARGET_ARCH="${TARGET_ARCH:-${GOARCH:-amd64}}"
 GOOS="$(normalize_goos "$TARGET_OS")"
@@ -104,10 +113,7 @@ sha256_file() {
 create_archive() {
   case "$ARCHIVE_EXT" in
     zip)
-      (
-        cd "$DIST_DIR"
-        zip -qr "$ARCHIVE_PATH" "$PACKAGE_BASENAME"
-      )
+      python3 "$ROOT_DIR/scripts/package_zip.py" "$STAGE_DIR" "$ARCHIVE_PATH"
       ;;
     tar.gz)
       tar -C "$DIST_DIR" -czf "$ARCHIVE_PATH" "$PACKAGE_BASENAME"
@@ -124,8 +130,8 @@ ARCHIVE_PATH="$DIST_DIR/${PACKAGE_BASENAME}.${ARCHIVE_EXT}"
 CHECKSUM_PATH="$ARCHIVE_PATH.sha256"
 BIN_PATH="$STAGE_DIR/$(binary_name)"
 
-if [[ -z "$VERSION" ]]; then
-  echo "无法从 main.go 提取版本号" >&2
+if [[ "$ARCHIVE_EXT" == "zip" ]] && ! command -v python3 >/dev/null 2>&1; then
+  echo "Windows 发行包需要 Python 3，以正确写入中文路径的 UTF-8 标记" >&2
   exit 1
 fi
 

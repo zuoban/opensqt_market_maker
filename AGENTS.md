@@ -6,7 +6,7 @@
 
 OpenSQT 是 Go 写的 Binance 永续合约**单向做多网格做市**程序。行情和订单都走 WebSocket，不轮询价格。当前版本以 `main.go` 里的 `Version` 为准。
 
-模块路径：`opensqt`（Go 1.25）。
+模块路径：`opensqt`（Go 1.27.1）。
 
 ## 常用命令
 
