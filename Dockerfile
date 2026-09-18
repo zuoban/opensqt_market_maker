@@ -2,7 +2,7 @@
 
 ARG GO_VERSION=1.27.1
 
-FROM golang:${GO_VERSION}-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS builder
 
 WORKDIR /src
 
@@ -14,9 +14,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY . .
 
+ARG GO_VERSION
+ARG BUILDARCH
+ARG TARGETOS
+ARG TARGETARCH
+
 RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/opensqt_market_maker .
+    --mount=type=cache,id=opensqt-go-build-${GO_VERSION}-${BUILDARCH}-${TARGETOS}-${TARGETARCH},target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/opensqt_market_maker .
 
 FROM alpine:3.22
 
