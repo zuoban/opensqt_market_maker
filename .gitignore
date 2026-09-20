@@ -53,6 +53,10 @@ vendor/
 .DS_Store
 Thumbs.db
 
+# 浏览器抓取与本机私有直播页
+.playwright-mcp/
+/live_server/这里面留在自己电脑/
+
 # Rust build output and private runtime state (Cargo.lock is tracked).
 /rust/target/
 /rust/state/
