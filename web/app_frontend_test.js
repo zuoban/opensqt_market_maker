@@ -989,6 +989,12 @@ test("page title uses live price and symbol", () => {
     assert.match(html, /<title>OpenSQT 做市监控<\/title>/);
     assert.match(js, /document\.title !== pageTitle/);
     assert.match(js, /document\.title = pageTitle/);
+    const scheduled = js.slice(js.indexOf("function scheduleRender"), js.indexOf("function render("));
+    assert.match(scheduled, /applyPageTitle\(snapshot\)/);
+    assert.ok(
+        scheduled.indexOf("applyPageTitle(snapshot)") < scheduled.indexOf("requestAnimationFrame"),
+        "title must update before the animation-frame render, which background tabs pause"
+    );
 });
 
 test("estimated profit per trade is interval times order quantity at mark", () => {

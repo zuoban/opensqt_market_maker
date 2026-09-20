@@ -615,9 +615,25 @@
         return true;
     }
 
+    function applyPageTitle(snapshot) {
+        const app = snapshot && snapshot.app || {};
+        const pos = snapshot && snapshot.position || {};
+        const price = snapshot && snapshot.price || {};
+        const pageTitle = buildPageTitle({
+            lastText: price.lastText,
+            last: price.last,
+            decimals: pos.priceDecimals ?? 2,
+            symbol: app.symbol || pos.symbol || ""
+        });
+        if (document.title !== pageTitle) document.title = pageTitle;
+    }
+
     function scheduleRender(snapshot, receivedAt) {
         if (!snapshot) return;
         pendingSnapshot = { snapshot, receivedAt };
+        // Background tabs pause animation frames. The tab title must still
+        // track the latest price while the rest of the dashboard waits.
+        applyPageTitle(snapshot);
         if (renderFrame !== null) return;
         renderFrame = requestAnimationFrame(() => {
             renderFrame = null;
@@ -658,13 +674,7 @@
             }
             lastRenderedPrice = currentPrice;
         }
-        const pageTitle = buildPageTitle({
-            lastText: price.lastText,
-            last: currentPrice,
-            decimals: dec,
-            symbol: symbol
-        });
-        if (document.title !== pageTitle) document.title = pageTitle;
+        applyPageTitle(snapshot);
         const uptimeText = formatDuration(snapshot.uptimeSec);
         setText(
             $("version"),
