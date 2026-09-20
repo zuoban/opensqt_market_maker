@@ -244,7 +244,7 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	if snap.AnchorPrice > 0 && lastPrice > 0 {
 		grid := spm.findNearestGridPrice(lastPrice)
 		snap.GridPrice = grid
-		buyPrices := spm.calculateSlotPrices(grid, snap.BuyWindowSize, "down")
+		buyPrices := spm.buyWindowPrices(grid, snap.BuyWindowSize)
 		sellPrices := spm.calculateSlotPrices(grid, snap.SellWindowSize, "up")
 		snap.BuyWindowPrices = buyPrices
 		snap.SellWindowPrices = sellPrices

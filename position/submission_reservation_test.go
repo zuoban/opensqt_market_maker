@@ -171,7 +171,7 @@ func bindTerminalOrder(slot *InventorySlot, orderID int64, clientOrderID, side s
 
 func TestBuyReservationIsInvalidatedByTerminalFillBeforeSubmission(t *testing.T) {
 	cfg := testConfig()
-	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.BuyWindowSize = 1
 	cfg.Trading.SellWindowSize = 0
 
 	executor := &leaseAwareExecutor{}

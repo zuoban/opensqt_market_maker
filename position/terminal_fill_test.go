@@ -77,8 +77,7 @@ func TestAdjustOrdersDoesNotReviveTerminalBeforeRESTReturn(t *testing.T) {
 			t.Run(side+" execution", func(t *testing.T) {
 				cfg := testConfig()
 				if side == "BUY" {
-					// 向下窗口包含当前格，至少取 2 才会产生一个低于市价的买单。
-					cfg.Trading.BuyWindowSize = 2
+					cfg.Trading.BuyWindowSize = 1
 					cfg.Trading.SellWindowSize = 0
 				} else {
 					cfg.Trading.BuyWindowSize = 0

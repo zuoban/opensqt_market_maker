@@ -113,7 +113,7 @@ func TestOneBatchSchedulingThroughCoordinatorLoop(t *testing.T) {
 	defer executor.Shutdown()
 	cfg := &config.Config{}
 	cfg.Trading.Symbol, cfg.Trading.PriceInterval, cfg.Trading.OrderQuantity = "BTCUSDT", 1, 30
-	cfg.Trading.BuyWindowSize, cfg.Trading.SellWindowSize, cfg.Trading.OrderCleanupThreshold = 20, 20, 100
+	cfg.Trading.BuyWindowSize, cfg.Trading.SellWindowSize, cfg.Trading.OrderCleanupThreshold = 19, 20, 100
 	spm := position.NewSuperPositionManager(cfg, &exchangeExecutorAdapter{executor: executor}, nil, 2, 3)
 	runtime, _, _ := newHealthyTradingGateTestRuntime(t, spm)
 	performance := telemetry.New(time.Now())

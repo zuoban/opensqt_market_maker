@@ -192,6 +192,13 @@ func TestRestoredPositionDistributesExchangeEntryCost(t *testing.T) {
 	if mathAbs(cost-0.60*103.50) > 1e-9 {
 		t.Fatalf("restored cost = %v, want %v", cost, 0.60*103.50)
 	}
+	if spm.getOrCreateSlot(100).PositionStatus != PositionStatusFilled ||
+		spm.getOrCreateSlot(99).PositionStatus != PositionStatusFilled {
+		t.Fatal("restored inventory should occupy current grid and the next buy grid")
+	}
+	if spm.getOrCreateSlot(101).PositionQty != 0 {
+		t.Fatal("restored inventory occupied a slot above the market")
+	}
 }
 
 func TestFilledOrdersKeepNewestRecords(t *testing.T) {

@@ -144,7 +144,7 @@ func TestPassiveCatchUpUsesMakerCapAndActualPriceForFixedNotional(t *testing.T) 
 	executor := &makerPolicyExecutor{}
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3, 0.01)
 	spm.anchorPrice = 100
-	market := freshMarket(100, 94.90, 95.02, 1)
+	market := freshMarket(100, 84.90, 85.02, 1)
 	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
 
 	if err := spm.AdjustOrders(100); err != nil {
@@ -154,7 +154,7 @@ func TestPassiveCatchUpUsesMakerCapAndActualPriceForFixedNotional(t *testing.T) 
 		t.Fatalf("batches = %+v, want one catch-up request", executor.batches)
 	}
 	req := executor.batches[0][0]
-	if !req.CatchUp || req.LogicalPrice != 100 || req.Price != 95 {
+	if !req.CatchUp || req.LogicalPrice != 90 || req.Price != 85 {
 		t.Fatalf("catch-up request = %+v", req)
 	}
 	wantQty := spm.gridBuyQuantity(req.Price)
@@ -179,7 +179,7 @@ func TestPassiveCatchUpHonorsDistanceAndActiveLimits(t *testing.T) {
 		executor := &makerPolicyExecutor{}
 		spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3, 0.01)
 		spm.anchorPrice = 100
-		market := freshMarket(100, 94.89, 95.01, 1) // cap=94.99，距离 5.01 > 半格
+		market := freshMarket(100, 84.89, 85.01, 1) // 普通买格 90，cap=84.99，距离 5.01 > 半格
 		spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
 
 		if err := spm.AdjustOrders(100); err != nil {
@@ -202,16 +202,16 @@ func TestPassiveCatchUpHonorsDistanceAndActiveLimits(t *testing.T) {
 		spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3, 0.01)
 		spm.anchorPrice = 100
 
-		existing := spm.getOrCreateSlot(80)
+		existing := spm.getOrCreateSlot(70)
 		existing.OrderID = 88
-		existing.ClientOID = spm.generateClientOrderID(80, "BUY")
+		existing.ClientOID = spm.generateClientOrderID(70, "BUY")
 		existing.OrderSide = "BUY"
 		existing.OrderStatus = OrderStatusPlaced
-		existing.OrderPrice = 79
+		existing.OrderPrice = 69
 		existing.OrderQuantity = 0.1
 		existing.SlotStatus = SlotStatusLocked
 
-		market := freshMarket(100, 94.90, 95.02, 1)
+		market := freshMarket(100, 84.90, 85.02, 1)
 		spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
 		if err := spm.AdjustOrders(100); err != nil {
 			t.Fatalf("AdjustOrders() error = %v", err)

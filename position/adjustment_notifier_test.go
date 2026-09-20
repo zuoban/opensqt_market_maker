@@ -119,7 +119,7 @@ func TestDefinitePlacementFailureSchedulesCooldownAdjustment(t *testing.T) {
 
 func TestMarginErrorSchedulesSlotAndLockExpiryAdjustments(t *testing.T) {
 	cfg := testConfig()
-	cfg.Trading.BuyWindowSize = 2
+	cfg.Trading.BuyWindowSize = 1
 	cfg.Trading.SellWindowSize = 0
 	cfg.Trading.MarginLockDurationSec = 5
 	executor := &marginThenAcceptExecutor{}

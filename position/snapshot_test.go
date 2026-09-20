@@ -131,7 +131,7 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	if snap.RealizedPNL != 0.42 {
 		t.Fatalf("realized pnl = %v", snap.RealizedPNL)
 	}
-	if len(snap.Slots) != 2 {
+	if len(snap.Slots) != 3 {
 		t.Fatalf("slots = %d, want window/occupied only", len(snap.Slots))
 	}
 	if snap.Slots[0].Price < snap.Slots[1].Price {
@@ -147,8 +147,8 @@ func TestSnapshotCountsAndProfit(t *testing.T) {
 	if !byPrice[99].InBuyWindow {
 		t.Fatal("99 should be in buy window")
 	}
-	if _, ok := byPrice[98]; ok {
-		t.Fatal("idle slot outside the window should be omitted from the dashboard snapshot")
+	if !byPrice[98].InBuyWindow {
+		t.Fatal("98 should be in the buy window starting one grid below current")
 	}
 	foundOID := false
 	for _, sl := range snap.Slots {

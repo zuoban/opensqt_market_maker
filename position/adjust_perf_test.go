@@ -163,11 +163,11 @@ func TestAdjustOrdersCancelsBuysBeyondWindowHysteresis(t *testing.T) {
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3)
 	spm.anchorPrice = 100
 
-	stale := spm.getOrCreateSlot(97)
+	stale := spm.getOrCreateSlot(96)
 	stale.OrderSide = "BUY"
 	stale.OrderStatus = OrderStatusConfirmed
 	stale.OrderID = 7
-	stale.ClientOID = "stale-97"
+	stale.ClientOID = "stale-96"
 	stale.SlotStatus = SlotStatusLocked
 
 	inWindow := spm.getOrCreateSlot(99)
@@ -177,7 +177,7 @@ func TestAdjustOrdersCancelsBuysBeyondWindowHysteresis(t *testing.T) {
 	inWindow.ClientOID = "live-99"
 	inWindow.SlotStatus = SlotStatusLocked
 
-	partial := spm.getOrCreateSlot(96)
+	partial := spm.getOrCreateSlot(95)
 	partial.OrderSide = "BUY"
 	partial.OrderStatus = OrderStatusPartiallyFilled
 	partial.OrderID = 6
@@ -210,11 +210,11 @@ func TestAdjustOrdersFreesQuotaWhenCancellingOutOfWindowBuys(t *testing.T) {
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3)
 	spm.anchorPrice = 100
 
-	stale := spm.getOrCreateSlot(97)
+	stale := spm.getOrCreateSlot(96)
 	stale.OrderSide = "BUY"
 	stale.OrderStatus = OrderStatusPlaced
 	stale.OrderID = 7
-	stale.ClientOID = "stale-97"
+	stale.ClientOID = "stale-96"
 	stale.SlotStatus = SlotStatusLocked
 
 	if err := spm.AdjustOrders(100); err != nil {
@@ -261,11 +261,11 @@ func TestAdjustOrdersCancelsBuyPromotedFromPlacedToConfirmed(t *testing.T) {
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3)
 	spm.anchorPrice = 100
 
-	stale := spm.getOrCreateSlot(97)
+	stale := spm.getOrCreateSlot(96)
 	stale.OrderSide = "BUY"
 	stale.OrderStatus = OrderStatusPlaced
 	stale.OrderID = 7
-	stale.ClientOID = "stale-97"
+	stale.ClientOID = "stale-96"
 	stale.SlotStatus = SlotStatusLocked
 
 	spm.beforeCommitOutOfWindowBuys = func() {
@@ -303,17 +303,17 @@ func TestAdjustOrdersDoesNotSkipWhenOutOfWindowLiveBuyRemains(t *testing.T) {
 		t.Fatal("seed adjust did not set skip fingerprint")
 	}
 
-	stale := spm.getOrCreateSlot(97)
+	stale := spm.getOrCreateSlot(96)
 	stale.OrderSide = "BUY"
 	stale.OrderStatus = OrderStatusPlaced
 	stale.OrderID = 7
-	stale.ClientOID = "stale-97"
+	stale.ClientOID = "stale-96"
 	stale.SlotStatus = SlotStatusLocked
 
 	spm.beforeCommitOutOfWindowBuys = func() {
 		stale.mu.Lock()
 		stale.OrderID = 8
-		stale.ClientOID = "stale-97-new"
+		stale.ClientOID = "stale-96-new"
 		stale.OrderStatus = OrderStatusConfirmed
 		stale.mu.Unlock()
 	}
@@ -342,11 +342,11 @@ func TestAdjustOrdersDoesNotPlaceWhenOutOfWindowCancelFails(t *testing.T) {
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3)
 	spm.anchorPrice = 100
 
-	stale := spm.getOrCreateSlot(97)
+	stale := spm.getOrCreateSlot(96)
 	stale.OrderSide = "BUY"
 	stale.OrderStatus = OrderStatusConfirmed
 	stale.OrderID = 7
-	stale.ClientOID = "stale-97"
+	stale.ClientOID = "stale-96"
 	stale.SlotStatus = SlotStatusLocked
 
 	err := spm.AdjustOrders(100)

@@ -167,7 +167,7 @@ func TestAdjustmentBatchNearTouchBoundaries(t *testing.T) {
 func TestAdjustmentBatchReplansNearTouchWithFreshQuote(t *testing.T) {
 	e := &offlineBatchExecutor{}
 	spm := batchTestManager(&limitedOfflineExecutor{e})
-	market := freshMarket(100.2, 100.05, 100.1, 1)
+	market := freshMarket(100.2, 99.00, 99.10, 1)
 	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
 	if err := spm.AdjustOrders(100.2); err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestAdjustmentBatchReplansNearTouchWithFreshQuote(t *testing.T) {
 		t.Fatal("near-touch order did not get its own adjustment")
 	}
 	// 成交价不变，仅盘口下移；下一轮必须重新计算 Maker 边界和近盘口标记。
-	market = freshMarket(100.2, 99.05, 99.1, 2)
+	market = freshMarket(100.2, 98.00, 98.10, 2)
 	if err := spm.AdjustOrders(100.2); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestAdjustmentBatchReplansNearTouchWithFreshQuote(t *testing.T) {
 		t.Fatal("new near-touch boundary was not respected")
 	}
 	req := e.requests[1][0]
-	if req.QuoteVersion != 2 || req.Price != 99 || !req.NearTouch || !req.PostOnly {
+	if req.QuoteVersion != 2 || req.Price != 98 || !req.NearTouch || !req.PostOnly {
 		t.Fatalf("continuation used stale planning: %+v", req)
 	}
 	if err := spm.AdjustOrders(100.2); err != nil {
@@ -194,7 +194,7 @@ func TestAdjustmentBatchReplansNearTouchWithFreshQuote(t *testing.T) {
 		t.Fatal("deep continuation did not fill one batch")
 	}
 	for _, req := range e.requests[2] {
-		if req.QuoteVersion != 2 || req.NearTouch || req.Price >= 99.1 {
+		if req.QuoteVersion != 2 || req.NearTouch || req.Price >= 98.1 {
 			t.Fatalf("invalid deep request: %+v", req)
 		}
 	}

@@ -124,9 +124,14 @@ func TestGapStackRequiresObservedDownwardJump(t *testing.T) {
 				t.Fatalf("orders=%+v, want one BUY", executor.orders)
 			}
 			buy := executor.orders[0]
-			if buy.Side != "BUY" || buy.GapStack != tc.wantCount || buy.Quantity != tc.wantQty {
-				t.Fatalf("buy side=%s qty=%v count=%d, want BUY/%v/%d",
-					buy.Side, buy.Quantity, buy.GapStack, tc.wantQty, tc.wantCount)
+			wantPrice := 735.78
+			if tc.wantCount > 1 {
+				wantPrice = 736.78
+			}
+			if buy.Side != "BUY" || buy.GapStack != tc.wantCount || buy.Quantity != tc.wantQty ||
+				!sameGridPrice(buy.LogicalPrice, wantPrice) {
+				t.Fatalf("buy side=%s qty=%v count=%d price=%v, want BUY/%v/%d/%v",
+					buy.Side, buy.Quantity, buy.GapStack, buy.LogicalPrice, tc.wantQty, tc.wantCount, wantPrice)
 			}
 			if err := spm.AdjustOrders(736.78); err != nil {
 				t.Fatal(err)
@@ -251,17 +256,19 @@ func TestGapStackFillSplitsAndPlacesSellsAtSkippedGrids(t *testing.T) {
 	if err := spm.AdjustOrders(103.55); err != nil {
 		t.Fatal(err)
 	}
-	var rebought bool
 	for _, req := range executor.orders[before:] {
-		if req.Side == "BUY" && req.LogicalPrice == 103.55 {
-			rebought = true
-			if req.GapStack != 1 || req.Quantity != unit {
-				t.Fatalf("sold inventory caused repeated stacking: %+v", req)
-			}
+		if req.Side == "BUY" && req.GapStack > 1 {
+			t.Fatalf("sold inventory caused repeated stacking: %+v", req)
 		}
 	}
-	if !rebought {
-		t.Fatal("missing ordinary BUY after sells")
+	var ordinary *OrderRequest
+	for _, req := range executor.orders {
+		if req.Side == "BUY" && sameGridPrice(req.LogicalPrice, 103.45) && req.GapStack <= 1 {
+			ordinary = req
+		}
+	}
+	if ordinary == nil {
+		t.Fatal("missing ordinary BUY one grid below after sells")
 	}
 }
 
@@ -318,13 +325,13 @@ func TestGapStackDoesNotStackWhenUpperGridAlreadyFilled(t *testing.T) {
 	}
 	var buy *OrderRequest
 	for _, req := range executor.orders {
-		if req != nil && req.Side == "BUY" && sameGridPrice(req.LogicalPrice, 103.55) {
+		if req != nil && req.Side == "BUY" && sameGridPrice(req.LogicalPrice, 103.45) {
 			buy = req
 			break
 		}
 	}
 	if buy == nil {
-		t.Fatal("expected BUY at current grid")
+		t.Fatal("expected ordinary BUY one grid below current")
 	}
 	unit := spm.gridBuyQuantity(buy.Price)
 	if buy.GapStack > 1 || buy.Quantity != unit {
@@ -342,13 +349,13 @@ func TestGapStackDisabledWhenMaxSlotsZero(t *testing.T) {
 	}
 	var buy *OrderRequest
 	for _, req := range executor.orders {
-		if req != nil && req.Side == "BUY" && sameGridPrice(req.LogicalPrice, 103.55) {
+		if req != nil && req.Side == "BUY" && sameGridPrice(req.LogicalPrice, 103.45) {
 			buy = req
 			break
 		}
 	}
 	if buy == nil {
-		t.Fatal("expected BUY at current grid")
+		t.Fatal("expected ordinary BUY one grid below current")
 	}
 	if buy.GapStack > 1 {
 		t.Fatalf("disabled gap stack still merged: %+v", buy)

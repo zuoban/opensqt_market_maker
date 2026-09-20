@@ -585,8 +585,9 @@ func (spm *SuperPositionManager) Initialize(initialPrice float64, initialPriceSt
 	initialGridPrice := spm.anchorPrice
 	logger.Info("✅ 初始网格价格: %s (使用锚点价格)", formatPrice(initialGridPrice, spm.priceDecimals))
 
-	// 4. 使用统一的槽位价格计算方法创建初始槽位
-	slotPrices := spm.calculateSlotPrices(initialGridPrice, spm.config.Trading.BuyWindowSize, "down")
+	// 4. 使用统一的槽位价格计算方法创建初始槽位。
+	// 新开买单从当前格下一格开始，当前格本身不是普通买价。
+	slotPrices := spm.buyWindowPrices(initialGridPrice, spm.config.Trading.BuyWindowSize)
 	for _, price := range slotPrices {
 		spm.getOrCreateSlot(price)
 	}
@@ -1102,8 +1103,12 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 	spm.redistributeGapStackedInventory()
 	spm.ensureGapStackChildReservations()
 
-	// 计算当前网格价格下方buy_window_size个价格
-	slotPrices := spm.calculateSlotPrices(currentGridPrice, buyWindowSize, "down")
+	// 普通买单从当前格下一格开始。当前格只在跳格合并时作为父格下单。
+	ordinaryBuyPrices := spm.buyWindowPrices(currentGridPrice, buyWindowSize)
+	slotPrices := ordinaryBuyPrices
+	if currentGridPrice > 0 {
+		slotPrices = append([]float64{currentGridPrice}, ordinaryBuyPrices...)
+	}
 
 	adjustmentTime := time.Now()
 	var buyOrdersToPlace []*OrderRequest
@@ -1345,6 +1350,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 	buyOrdersToCreate := 0
 	catchUpOrdersToCreate := 0
 	buyMakerCap, hasMakerBuyCap := spm.makerBuyCap(market)
+	_, gapStackBlocked := spm.collectGapStackSlots(currentGridPrice, false)
 	catchUpMode := "exact_wait"
 	maxActiveCatchUp := 1
 	maxCatchUpPerAdjust := 1
@@ -1363,8 +1369,12 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			maxCatchUpDistanceRatio = spm.config.Execution.MaxCatchUpDistanceRatio
 		}
 	}
-	if hasMakerBuyCap && len(slotPrices) > 0 &&
-		!makerCapReachableByBuyWindow(slotPrices[len(slotPrices)-1], buyMakerCap, priceInterval, buyWindowSize) {
+	lowestBuy := 0.0
+	if len(ordinaryBuyPrices) > 0 {
+		lowestBuy = ordinaryBuyPrices[len(ordinaryBuyPrices)-1]
+	}
+	if hasMakerBuyCap && lowestBuy > 0 &&
+		!makerCapReachableByBuyWindow(lowestBuy, buyMakerCap, priceInterval, buyWindowSize) {
 		logger.Warn("⚠️ [Maker盘口] 买一/卖一 %s/%s 相对现价 %s 无法覆盖买单窗口（Maker上限 %s，模式 %s），改用成交价安全垫",
 			formatPrice(market.BestBid, spm.priceDecimals),
 			formatPrice(market.BestAsk, spm.priceDecimals),
@@ -1415,9 +1425,25 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			slot.SlotStatus == SlotStatusFree &&
 			slot.OrderID == 0 &&
 			slot.ClientOID == "" &&
-			buyOrdersToCreate < allowedNewBuyOrders
+			buyOrdersToCreate+activeBuyOrdersInWindow < allowedNewBuyOrders
 
 		if shouldCreateBuyOrder {
+			if gapStackBlocked && !sameGridPrice(price, currentGridPrice) {
+				slot.mu.Unlock()
+				continue
+			}
+			stackCount := 1
+			var stackChildren []float64
+			if sameGridPrice(price, currentGridPrice) {
+				children, blocked := spm.collectGapStackSlots(price, false)
+				if blocked || len(children) == 0 {
+					slot.mu.Unlock()
+					continue
+				}
+				stackCount = 1 + len(children)
+				stackChildren = children
+			}
+
 			orderPrice := price
 			catchUp := false
 			if hasMakerBuyCap {
@@ -1450,23 +1476,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 				slot.mu.Unlock()
 				continue
 			}
-
-			stackCount := 1
-			var stackChildren []float64
-			if sameGridPrice(price, currentGridPrice) {
-				children, blocked := spm.collectGapStackSlots(price, false)
-				if blocked {
-					slot.mu.Unlock()
-					continue
-				}
-				if len(children) > 0 {
-					stackCount = 1 + len(children)
-					stackChildren = children
-					quantity = roundPrice(quantity*float64(stackCount), spm.quantityDecimals)
-					logger.Info("📦 [跳格合并] 当前格 %s，已确认跨过且漏买 %d 格，按 %d 倍金额在 %s 下一单",
-						formatPrice(price, spm.priceDecimals), len(children), stackCount,
-						formatPrice(orderPrice, spm.priceDecimals))
-				}
+			if stackCount > 1 {
+				quantity = roundPrice(quantity*float64(stackCount), spm.quantityDecimals)
+				logger.Info("📦 [跳格合并] 当前格 %s，已确认跨过且漏买 %d 格，按 %d 倍金额在 %s 下一单",
+					formatPrice(price, spm.priceDecimals), len(stackChildren), stackCount,
+					formatPrice(orderPrice, spm.priceDecimals))
 			}
 
 			// 生成 ClientOrderID
@@ -1510,7 +1524,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 		slot.mu.Unlock()
 	}
 	if len(buyOrdersToPlace) == 0 && allowedNewBuyOrders > 0 && !buyPlacementPaused && !batch.deferred {
-		spm.logEmptyBuyWindow(currentPrice, currentGridPrice, slotPrices, market, buyMakerCap, hasMakerBuyCap, catchUpMode)
+		spm.logEmptyBuyWindow(currentPrice, currentGridPrice, ordinaryBuyPrices, market, buyMakerCap, hasMakerBuyCap, catchUpMode)
 	}
 
 	// ReduceOnly SELL 先进入执行边界；批次中后续请求失败时，
@@ -1838,7 +1852,10 @@ func (spm *SuperPositionManager) sameGridPlacementBoundsUnchanged(lastPrice, cur
 	}
 	safety := interval * 0.1
 	grid := spm.findNearestGridPrice(currentPrice)
-	for _, price := range spm.calculateSlotPrices(grid, spm.config.Trading.BuyWindowSize, "down") {
+	if (grid >= lastPrice-safety) != (grid >= currentPrice-safety) {
+		return false
+	}
+	for _, price := range spm.buyWindowPrices(grid, spm.config.Trading.BuyWindowSize) {
 		if (price >= lastPrice-safety) != (price >= currentPrice-safety) {
 			return false
 		}
@@ -2333,6 +2350,38 @@ func (spm *SuperPositionManager) calculateSlotPrices(gridPrice float64, count in
 	return prices
 }
 
+// buyWindowPrices 返回普通买单窗口。当前网格是标记线，窗口从下一格向下取 count 个价位。
+func (spm *SuperPositionManager) buyWindowPrices(gridPrice float64, count int) []float64 {
+	if spm == nil || spm.config == nil || count <= 0 || gridPrice <= 0 {
+		return nil
+	}
+	interval := spm.config.Trading.PriceInterval
+	if interval <= 0 {
+		return nil
+	}
+	start := roundPrice(gridPrice-interval, spm.priceDecimals)
+	if start <= 0 || start >= gridPrice-fillQtyTolerance {
+		return nil
+	}
+	return spm.calculateSlotPrices(start, count, "down")
+}
+
+func (spm *SuperPositionManager) restoredInventoryHighestGrid(entryPrice float64) float64 {
+	currentGrid := spm.anchorPrice
+	if last, ok := spm.lastMarketPrice.Load().(float64); ok && last > 0 {
+		if grid := spm.findNearestGridPrice(last); grid > 0 {
+			currentGrid = grid
+		}
+	}
+	highest := currentGrid
+	if entryPrice > 0 {
+		if entryGrid := spm.findNearestGridPrice(entryPrice); entryGrid > 0 && entryGrid < highest {
+			highest = entryGrid
+		}
+	}
+	return highest
+}
+
 // ===== IPositionManager 接口实现（供 safety.Reconciler 使用）=====
 // 注意：以下方法是 safety/reconciler.go 中 IPositionManager 接口的实现，
 // 被 Reconciler 对账器调用，不可删除或修改签名
@@ -2572,19 +2621,22 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 		sellWindowSize = spm.config.Trading.BuyWindowSize // 默认与买单窗口相同
 	}
 
-	// 4. 计算卖单槽位价格（从锚点价格 + 价格间隔开始）
-	// 卖单最低价 = 锚点价格 + 价格间隔（避免与买单最高价冲突）
-	sellStartPrice := spm.anchorPrice + spm.config.Trading.PriceInterval
-	sellPrices := spm.calculateSlotPrices(sellStartPrice, totalSlotsNeeded, "up")
+	// 4. 把已有仓位填回当前价下方的买格：最高格 = min(当前网格, 均价格)。
+	// 卖单仍按槽位价 + 间隔生成，避免重启后把当前买窗当成空仓再买一遍。
+	highestBuy := spm.restoredInventoryHighestGrid(entryPrice)
+	if highestBuy <= 0 || math.IsNaN(highestBuy) || math.IsInf(highestBuy, 0) {
+		return fmt.Errorf("恢复持仓网格无效: %v", highestBuy)
+	}
+	restoredPrices := spm.calculateSlotPrices(highestBuy, totalSlotsNeeded, "down")
 
-	logger.Info("🔄 [持仓恢复] 从价格 %s 向上创建 %d 个槽位（前 %d 个将挂卖单）",
-		formatPrice(sellStartPrice, spm.priceDecimals), totalSlotsNeeded, sellWindowSize)
+	logger.Info("🔄 [持仓恢复] 从价格 %s 向下创建 %d 个买格（前 %d 个靠近现价，可挂卖单）",
+		formatPrice(highestBuy, spm.priceDecimals), totalSlotsNeeded, sellWindowSize)
 
 	// 5. 先计算所有槽位的理论数量总和（固定金额模式）
 	var totalTheoryQty float64
-	theoryQtys := make([]float64, len(sellPrices))
-	for i, price := range sellPrices {
-		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) || (i > 0 && price <= sellPrices[i-1]) {
+	theoryQtys := make([]float64, len(restoredPrices))
+	for i, price := range restoredPrices {
+		if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) || (i > 0 && price >= restoredPrices[i-1]) {
 			return fmt.Errorf("恢复槽位价格无效: %v", price)
 		}
 		theoryQty := spm.gridBuyQuantity(price)
@@ -2604,10 +2656,10 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 	// 6. 按比例分配实际持仓到各个槽位
 	var allocatedQty float64
 
-	for i, price := range sellPrices {
+	for i, price := range restoredPrices {
 		// 计算这个槽位应该分配的数量
 		var slotQty float64
-		if i == len(sellPrices)-1 {
+		if i == len(restoredPrices)-1 {
 			// 最后一个槽位：分配剩余的所有持仓（避免舍入误差）
 			slotQty = totalPosition - allocatedQty
 		} else {
@@ -2649,7 +2701,7 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 		allocatedQty += slotQty
 
 		// 日志标记：是否在窗口内（只打印前10个和最后10个）
-		if i < 10 || i >= len(sellPrices)-10 {
+		if i < 10 || i >= len(restoredPrices)-10 {
 			inWindow := ""
 			if i < sellWindowSize {
 				inWindow = " [可挂单]"
@@ -2659,7 +2711,7 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 			logger.Info("✅ [持仓恢复] 槽位 %s: 分配持仓 %.4f (理论: %.4f)%s",
 				formatPrice(price, spm.priceDecimals), slotQty, theoryQtys[i], inWindow)
 		} else if i == 10 {
-			logger.Info("... （省略中间 %d 个槽位）", len(sellPrices)-20)
+			logger.Info("... （省略中间 %d 个槽位）", len(restoredPrices)-20)
 		}
 	}
 
@@ -2668,7 +2720,11 @@ func (spm *SuperPositionManager) initializeSellSlotsFromPosition(totalPosition, 
 
 	// 8. 提示用户后续会自动下卖单
 	logger.Info("💡 [持仓恢复] 前 %d 个槽位的卖单将在价格调整时自动创建", sellWindowSize)
-	logger.Info("💡 [持仓恢复] 其余 %d 个槽位保持有仓状态，价格接近时自动挂单", totalSlotsNeeded-sellWindowSize)
+	remaining := totalSlotsNeeded - sellWindowSize
+	if remaining < 0 {
+		remaining = 0
+	}
+	logger.Info("💡 [持仓恢复] 其余 %d 个槽位保持有仓状态，价格接近时自动挂单", remaining)
 	return nil
 }
 
@@ -2797,9 +2853,9 @@ func (spm *SuperPositionManager) PrintPositions() {
 	currentGridPrice := spm.findNearestGridPrice(lastPrice)
 	logger.Info("当前网格价格: %s", formatPrice(currentGridPrice, spm.priceDecimals))
 
-	// 计算买单窗口范围（当前网格价格下方的买单窗口）
+	// 计算买单窗口范围（当前网格下一格向下）
 	buyWindowSize := spm.config.Trading.BuyWindowSize
-	buyWindowPrices := spm.calculateSlotPrices(currentGridPrice, buyWindowSize, "down")
+	buyWindowPrices := spm.buyWindowPrices(currentGridPrice, buyWindowSize)
 
 	// 创建价格查找表
 	buyWindowPriceMap := make(map[string]bool)
@@ -2808,7 +2864,7 @@ func (spm *SuperPositionManager) PrintPositions() {
 	}
 
 	// 打印买单窗口内的所有槽位
-	logger.Info("买单窗口大小: %d 个槽位 (当前网格价格下方)", buyWindowSize)
+	logger.Info("买单窗口大小: %d 个槽位 (当前网格下一格向下)", buyWindowSize)
 	buyOrderCount := 0
 	emptySlotCount := 0
 	filledSlotCount := 0

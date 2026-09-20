@@ -35,7 +35,7 @@ func confirmationTestManager(t *testing.T, ex *confirmationBoundaryExchange) *po
 	t.Cleanup(executor.Shutdown)
 	cfg := &config.Config{}
 	cfg.Trading.Symbol, cfg.Trading.PriceInterval, cfg.Trading.OrderQuantity = "ETHUSDT", 1, 30
-	cfg.Trading.BuyWindowSize, cfg.Trading.OrderCleanupThreshold = 2, 100
+	cfg.Trading.BuyWindowSize, cfg.Trading.OrderCleanupThreshold = 1, 100
 	return position.NewSuperPositionManager(cfg, &exchangeExecutorAdapter{executor: executor}, nil, 2, 3)
 }
 

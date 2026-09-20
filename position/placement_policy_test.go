@@ -193,12 +193,12 @@ func TestMarginLockKeepsExistingBuysAndStillPlacesReduceOnlySells(t *testing.T) 
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 2, 3)
 	spm.anchorPrice = 100
 
-	existingBuy := spm.getOrCreateSlot(99)
+	existingBuy := spm.getOrCreateSlot(98)
 	existingBuy.OrderID = 77
-	existingBuy.ClientOID = spm.generateClientOrderID(99, "BUY")
+	existingBuy.ClientOID = spm.generateClientOrderID(98, "BUY")
 	existingBuy.OrderSide = "BUY"
 	existingBuy.OrderStatus = OrderStatusPlaced
-	existingBuy.OrderPrice = 99
+	existingBuy.OrderPrice = 98
 	existingBuy.OrderQuantity = 0.3
 	existingBuy.SlotStatus = SlotStatusLocked
 
