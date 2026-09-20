@@ -489,12 +489,18 @@ func TestRealTransitionLedgerCrashChild(t *testing.T) {
 	}
 	r := restoreReplay(t, s)
 	phase := os.Getenv("OPENSQT_TEST_REPLAY_CRASH_PHASE")
+	event := buyReplay("FILLED", "0.25", "25", 200)
+	if raw := os.Getenv("OPENSQT_TEST_REPLAY_CRASH_EVENT"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &event); err != nil {
+			t.Fatal(err)
+		}
+	}
 	r.hook = func(at string) {
 		if at == phase {
 			os.Exit(39)
 		}
 	}
-	if err := r.process(buyReplay("FILLED", "0.25", "25", 200)); err != nil {
+	if err := r.process(event); err != nil {
 		t.Fatal(err)
 	}
 	t.Fatal("child did not exit")
