@@ -54,7 +54,7 @@ docker compose up -d --build    # 需挂载 config.yaml；dashboard.listen 用 0
 | `monitor/` | 唯一价格流；面板用的 5m K 线缓存 |
 | `order/` | 下单执行（限流、严格 PostOnly、重试） |
 | `position/` | 超级槽位、成交记录、小时汇总 |
-| `safety/` | 启动检查、主动风控、对账、订单清理 |
+| `safety/` | 启动检查、保证金守卫、对账、订单清理 |
 | `web/` | 只读监控（Go embed `web/static/`） |
 | `logger/` | 控制台 + DEBUG 文件日志 |
 | `live_server/` | 独立演示页，**不是**主程序依赖 |
@@ -76,7 +76,7 @@ Binance 实现在 `exchange/binance/`，经 `wrapper_binance*.go` 接到 `IExcha
 - 前端单测：`node --test web/app_frontend_test.js`（`app.js` 在 Node 下只导出 `buildKlineGridModel` / `buildHourlyFillModel`）。
 - 成交**列表**最多 20 条（`position.maxRecentFilledOrders`）。
 - 成交**汇总图**用快照里的 `filledHourly`（后端按本地整点累计，固定 24 小时，含空小时）。不要改回用这 20 条明细在前端加总。
-- 面板 K 线为 **5m × 60 根**（约 5 小时）。缓存硬上限仍是 `monitor.maxVisibleCandles`（500），与汇总图无关。风控 K 线仍用配置里的 `risk_control.interval`（默认 1m），不要和面板周期混用。
+- 面板 K 线为 **5m × 60 根**（约 5 小时）。缓存硬上限仍是 `monitor.maxVisibleCandles`（500），与汇总图无关。
 - 可视化夹具：`WEB_VISUAL=1 go test ./web -run TestVisualFixture -count=1`，监听 `127.0.0.1:18789`。
 
 ## 发版

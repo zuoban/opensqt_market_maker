@@ -31,7 +31,6 @@
     --surface-tooltip: rgba(12, 17, 25, 0.96);
     --surface-log: rgba(7, 10, 15, 0.45);
     --surface-maker: rgba(11, 15, 22, 0.75);
-    --surface-risk: rgba(8, 12, 18, 0.55);
     --surface-legend: rgba(10, 14, 21, 0.65);
     --surface-capacity-from: rgba(15, 21, 30, 0.95);
     --surface-capacity-to: rgba(9, 13, 19, 0.96);
@@ -118,7 +117,6 @@ html[data-theme="light"] {
     --surface-tooltip: rgba(255, 255, 255, 0.98);
     --surface-log: rgba(241, 245, 249, 0.65);
     --surface-maker: rgba(255, 255, 255, 0.9);
-    --surface-risk: rgba(248, 250, 252, 0.85);
     --surface-legend: rgba(255, 255, 255, 0.88);
     --surface-capacity-from: rgba(255, 255, 255, 0.98);
     --surface-capacity-to: rgba(244, 247, 250, 0.96);
@@ -647,19 +645,19 @@ summary,
     box-shadow: 0 0 8px color-mix(in srgb, var(--danger) 80%, transparent);
 }
 
-.pill.risk.ok {
+.pill.margin.ok {
     color: var(--positive);
     border-color: color-mix(in srgb, var(--positive) 32%, transparent);
     background: color-mix(in srgb, var(--positive) 7%, transparent);
 }
 
-.pill.risk.ok i {
+.pill.margin.ok i {
     background: var(--positive);
     box-shadow: 0 0 8px color-mix(in srgb, var(--positive) 75%, transparent);
     animation: live-breathe 2.4s ease-in-out infinite;
 }
 
-.pill.risk.hot {
+.pill.margin.hot {
     color: var(--danger);
     border-color: var(--danger);
     background: color-mix(in srgb, var(--danger) 10%, transparent);
@@ -1861,89 +1859,12 @@ main { display: block; }
 }
 
 /* ==========================================================================
-   RISK SENTINEL & MAKER EXECUTION
+   MAKER EXECUTION
    ========================================================================== */
 .status-strip { min-width: 0; }
-.status-strip.risk-off { display: none; }
-.risk-panel[hidden] { display: none; }
-.risk-panel::before { background: var(--warn); }
 .log-panel::before { background: var(--cyan); }
 
-.risk-msg {
-    margin: 12px 16px 10px;
-    padding-left: 10px;
-    border-left: 3px solid var(--warn);
-    color: var(--muted);
-    font-size: 12px;
-}
-
-.risk-list {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
-    gap: 8px;
-    padding: 0 16px 14px;
-}
-
-.risk-item {
-    position: relative;
-    padding: 12px 14px;
-    overflow: hidden;
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    background: var(--surface-risk);
-    box-shadow: inset 0 1px 0 var(--hairline-soft);
-}
-
-.risk-item::before {
-    content: "";
-    position: absolute;
-    inset: 10px auto 10px 0;
-    width: 3px;
-    border-radius: 0 2px 2px 0;
-    background: var(--muted-soft);
-}
-
-.risk-item .top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    color: var(--ink-strong);
-    font-size: 13px;
-    font-weight: 700;
-}
-
-.risk-item .status::before {
-    content: "";
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    margin-right: 6px;
-    border-radius: 50%;
-    background: currentColor;
-    box-shadow: 0 0 6px currentColor;
-}
-
-.risk-item .meta {
-    margin-top: 6px;
-    color: var(--muted);
-    font-family: var(--font-mono);
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
-    line-height: 1.55;
-}
-
-.risk-item.bad { border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
-.risk-item.ok { border-color: color-mix(in srgb, var(--positive) 30%, transparent); }
-.risk-item.warn { border-color: color-mix(in srgb, var(--warn) 42%, transparent); }
-.risk-item.bad::before { background: var(--danger); }
-.risk-item.ok::before { background: var(--positive); }
-.risk-item.warn::before { background: var(--warn); }
-.risk-item.bad .status { color: var(--danger); }
-.risk-item.ok .status { color: var(--positive); }
-.risk-item.warn .status { color: var(--warn); }
-
-.maker-panel { margin-top: 14px; }
+.maker-panel { margin-top: 0; }
 .maker-panel::before { background: var(--primary); }
 
 .maker-status {
@@ -2897,7 +2818,6 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .strategy-kpis { grid-template-columns: 1fr 1fr; }
 
     .board { margin-top: 16px; }
-    .risk-list { grid-template-columns: 1fr; }
     .maker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .panel { border-radius: 12px; }
     .panel-head { min-height: 54px; padding: 10px 14px; }
@@ -3162,7 +3082,6 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .fill-hourly-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .chart-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .grid-status { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-    .risk-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 900px) and (max-height: 500px) {
@@ -3188,12 +3107,10 @@ td { overflow-wrap: anywhere; color: var(--ink); }
     .kpi,
     .mast,
     .margin-capacity,
-    .margin-track,
-    .risk-item { border: 1px solid CanvasText; }
+    .margin-track { border: 1px solid CanvasText; }
 
     .pill i,
     .lg::before,
     .margin-capacity-status i,
-    .margin-limit::after,
-    .risk-item::before { forced-color-adjust: none; }
+    .margin-limit::after { forced-color-adjust: none; }
 }

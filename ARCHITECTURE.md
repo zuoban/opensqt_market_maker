@@ -28,7 +28,7 @@ OpenSQT 是一个 WebSocket 驱动的加密货币永续合约**单向做多网�
 - ✅ 基于网格的自动做市策略
 - ✅ WebSocket 实时价格和订单流
 - ✅ 智能仓位管理（超级槽位系统）
-- ✅ 主动风控监控（成交量异常检测）
+- ✅ 保证金占用硬限制
 - ✅ 订单清理与对账机制
 - ✅ 持仓安全性检查
 
@@ -125,9 +125,9 @@ opensqt_platform/
 ├── position/                  # 仓位管理（核心）
 │   └── super_position_manager.go  # 超级槽位管理器
 │
-├── safety/                    # 安全与风控
+├── safety/                    # 安全与守卫
 │   ├── safety.go              # 启动前安全检查
-│   ├── risk_monitor.go        # 主动风控（K线监控）
+│   ├── margin_monitor.go      # 保证金占用硬限制
 │   ├── reconciler.go          # 持仓对账
 │   └── order_cleaner.go       # 订单清理
 │
@@ -175,17 +175,12 @@ opensqt_platform/
    ↓
 8. 同步执行首次完整对账
    ↓
-9. 同步启动主动风控
-   ├── 加载足量已完结历史 K 线
-   ├── 启动实时 K 线流
-   └── 所有监控交易对收到实时数据后进入 READY
-   ↓
-10. 启动统一交易门禁 (tradingGateRuntime)
-    ├── 订单流、风控、对账、价格新鲜度全部健康才放行
+9. 启动统一交易门禁 (tradingGateRuntime)
+    ├── 订单流、对账、价格新鲜度与保证金守卫全部健康才放行
     ├── 首次放行立即执行 AdjustOrders
     └── 任一条件恶化立即停新单、撤买单，恢复前强制对账
     ↓
-11. 启动订单清理、只读面板与状态日志
+10. 启动订单清理、只读面板与状态日志
 ```
 
 ### 退出流程
@@ -199,7 +194,7 @@ cancel_on_exit=true ? 全撤并反复查询直至远端挂单为空 : 明确保�
    ↓
 Shutdown 订单执行器，取消后台上下文
    ↓
-停止价格流、订单流、风控 K 线流和只读面板
+停止价格流、订单流和只读面板
 ```
 
 ### 价格流
@@ -216,7 +211,7 @@ priceChangeCh (channel)
     ↓
 tradingGateRuntime 串行协调器
     ↓
-联合健康检查（订单流 / 风控 / 对账 / 成交价与盘口新鲜度）
+联合健康检查（订单流 / 对账 / 成交价与盘口新鲜度 / 保证金守卫）
     ├── ❌ 任一异常 → 停新单、撤买单、等待恢复对账
     └── ✅ 全部健康 → SuperPositionManager.AdjustOrders()
 ```
@@ -543,7 +538,7 @@ if len(parts) == 2 {
 
 ---
 
-### 4. Safety（安全与风控）
+### 4. Safety（安全与守卫）
 
 #### 核心安全机制
 
@@ -572,42 +567,12 @@ CheckAccountSafety(
 最大持仓数 = 最大可用保证金 / 每仓成本
 ```
 
-##### 4.2 主动风控监控 (risk_monitor.go)
-```go
-type RiskMonitor struct {
-    cfg           *config.Config
-    exchange      exchange.IExchange
-    symbolDataMap map[string]*SymbolData  // K线缓存
-    triggered     bool                    // 是否触发风控
-}
-```
-
-**监控逻辑**:
-1. 启动时为每个监控交易对加载足量已完结历史 K 线
-2. 实时监听多个币种的 K 线（如 BTC、ETH），按时间戳去重更新
-3. 计算成交量移动平均并检测异常倍数
-4. 历史数据不足、实时流未握手或数据陈旧时保持 fail-closed
-5. 触发风控 → 统一门禁停新单并撤销所有买单
-6. 达到恢复阈值后仍需通过完整对账，才可恢复交易
-
-**配置示例**:
-```yaml
-risk_control:
-  enabled: true
-  monitor_symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT"]
-  interval: "1m"
-  volume_multiplier: 3.0
-  average_window: 20
-  recovery_threshold: 3
-```
-
-##### 4.3 持仓对账 (reconciler.go)
+##### 4.2 持仓对账 (reconciler.go)
 ```go
 type Reconciler struct {
     cfg              *config.Config
     exchange         IExchange
     positionManager  *SuperPositionManager
-    pauseChecker     func() bool  // 风控暂停检查
 }
 ```
 
@@ -623,9 +588,8 @@ type Reconciler struct {
 - 默认每 60 秒（可配置）
 - 启动放行前同步执行一次
 - 订单流异常恢复后强制执行一次
-- 风控期间仍继续对账，仅降低普通日志噪声
 
-##### 4.4 订单清理 (order_cleaner.go)
+##### 4.3 订单清理 (order_cleaner.go)
 ```go
 type OrderCleaner struct {
     cfg       *config.Config
@@ -640,12 +604,11 @@ type OrderCleaner struct {
 3. 批量撤销最旧的订单（默认10个/批）
 4. 重置对应槽位状态
 
-##### 4.5 统一交易门禁 (trading_gate.go)
+##### 4.4 统一交易门禁 (trading_gate.go)
 
 新单只有在以下条件同时成立时才允许提交：
 
 - 订单流为 READY
-- 风控数据已就绪且未触发
 - 最近一次完整对账健康
 - 唯一价格流已有正价格且更新时间未陈旧
 - 保证金占用比例硬限制未锁存触发
@@ -737,7 +700,7 @@ main.go
   ├── position (仓位管理)
   │     ├── order.OrderExecutor (接口适配)
   │     └── IExchange (子集接口)
-  └── safety (安全风控)
+  └── safety (安全守卫)
         ├── exchange.IExchange
         └── position.SuperPositionManager
 ```
@@ -810,11 +773,10 @@ ex.StartOrderStream(ctx, func(update exchange.OrderUpdate) {
 主要后台任务:
 1. PriceMonitor                 # 唯一价格 WebSocket + 定期价格事件
 2. Exchange OrderStream Manager # 私有订单流、连接代际、保活与重连
-3. RiskMonitor                  # 风控 K 线流、陈旧检测与报告
-4. tradingGateRuntime           # 健康观察、价格调整、周期/恢复对账
-5. OrderCleaner                 # 定期清理旧订单
-6. Dashboard                    # 只读监控（启用时）
-7. 定期状态日志
+3. tradingGateRuntime           # 健康观察、价格调整、周期/恢复对账
+4. OrderCleaner                 # 定期清理旧订单
+5. Dashboard                    # 只读监控（启用时）
+6. 定期状态日志
 ```
 
 ### Channel 列表
@@ -896,45 +858,37 @@ ex.StartOrderStream(ctx, func(update exchange.OrderUpdate) {
   ├── 实际 Maker 手续费率验证
   └── Binance 账户/合约规格校验
 
-第2层: 主动风控 (RiskMonitor)
-  ├── 历史/实时 K 线完整性与陈旧检测
-  ├── K线成交量异常检测
-  ├── 多币种联动监控
-  └── 自动撤销买单
-
-第3层: 统一交易门禁 (tradingGateRuntime)
-  ├── 订单流 / 风控 / 对账 / 价格联合判定
+第2层: 统一交易门禁 (tradingGateRuntime)
+  ├── 订单流 / 对账 / 价格 / 保证金联合监视
   ├── 异常立即停止新单并撤买单
   └── 恢复前强制对账
 
-第4层: 订单执行安全 (ExchangeOrderExecutor + BinanceAdapter)
+第3层: 订单执行安全 (ExchangeOrderExecutor + BinanceAdapter)
   ├── 严格 PostOnly、限流与有界请求
   ├── UNKNOWN 结果按原 ClientOrderID 确认
   └── 不盲重试、不提前释放槽位
 
-第5层: 订单清理 (OrderCleaner)
+第4层: 订单清理 (OrderCleaner)
   ├── 未完成订单数量限制
   └── 定期清理旧订单
 
-第6层: 持仓与挂单对账 (Reconciler)
+第5层: 持仓与挂单对账 (Reconciler)
   ├── 本地 vs 交易所持仓
   └── 本地 vs 交易所策略挂单 ID
 
-第7层: 优雅停机
+第6层: 优雅停机
   ├── 先永久关闭新单门禁
   ├── cancel_on_exit=true 时全撤并确认远端为空
   └── 停执行器后再停止各 WebSocket
 
-第8层: 人工干预
+第7层: 人工干预
   ├── SIGINT/SIGTERM 优雅退出
   └── cancel_on_exit 配置
 ```
 
-### 风控触发流程
+### 健康条件恶化流程
 ```
-成交量异常检测
-    ↓
-RiskMonitor.IsTriggered() = true
+订单流 / 对账 / 价格新鲜度异常
     ↓
 tradingGateRuntime 健康观察器检测
     ↓
@@ -944,9 +898,7 @@ superPositionManager.CancelAllBuyOrders()
     ↓
 Reconciler.Invalidate()
     ↓
-等待恢复条件满足
-    ↓
-RiskMonitor.IsTriggered() = false
+等待健康条件恢复
     ↓
 同步完整对账通过
     ↓
@@ -1033,14 +985,6 @@ system:
   log_level: "INFO"
   cancel_on_exit: true  # 默认全撤并确认；false 会显式保留远端挂单
 
-risk_control:
-  enabled: true
-  monitor_symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-  interval: "1m"
-  volume_multiplier: 3.0
-  average_window: 20
-  recovery_threshold: 3
-
 timing:
   websocket_reconnect_delay: 5
   websocket_write_wait: 10
@@ -1092,8 +1036,7 @@ WebSocket: 10连接/IP
 2025-12-24 10:00:04 [INFO] ✅ 持仓安全性检查通过：可以安全持有至少 100 仓
 2025-12-24 10:00:05 [INFO] ✅ [Binance] 订单流已启动
 2025-12-24 10:00:06 [INFO] 📊 [SuperPositionManager] 初始化成功，锚点价格: 42156.78
-2025-12-24 10:00:07 [INFO] 🛡️ 启动主动安全风控监控 (周期: 1m, 倍数: 3.0)
-2025-12-24 10:00:08 [INFO] ✅ 系统启动完成，开始自动交易
+2025-12-24 10:00:07 [INFO] ✅ 系统启动完成，开始自动交易
 ```
 
 ---
@@ -1104,7 +1047,7 @@ OpenSQT是一个设计合理但有改进空间的做市商系统。核心架构�
 - **接口抽象** + **Binance 适配器**
 - **WebSocket驱动** + **事件回调**（实时性）
 - **细粒度锁** + **原子操作**（并发安全）
-- **多层风控** + **状态机**（安全性）
+- **交易门禁** + **状态机**（安全性）
 
 **官网**:
 - Website: www.OpenSQT.com

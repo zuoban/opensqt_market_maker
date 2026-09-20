@@ -127,26 +127,6 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 
-	r := &cfg.RiskControl
-	if err := setBool(&r.Enabled, "OPENSQT_RISK_CONTROL_ENABLED"); err != nil {
-		return err
-	}
-	if err := setStringSlice(&r.MonitorSymbols, "OPENSQT_RISK_CONTROL_MONITOR_SYMBOLS"); err != nil {
-		return err
-	}
-	if err := setString(&r.Interval, "OPENSQT_RISK_CONTROL_INTERVAL"); err != nil {
-		return err
-	}
-	if err := setFloat(&r.VolumeMultiplier, "OPENSQT_RISK_CONTROL_VOLUME_MULTIPLIER"); err != nil {
-		return err
-	}
-	if err := setInt(&r.AverageWindow, "OPENSQT_RISK_CONTROL_AVERAGE_WINDOW"); err != nil {
-		return err
-	}
-	if err := setInt(&r.RecoveryThreshold, "OPENSQT_RISK_CONTROL_RECOVERY_THRESHOLD"); err != nil {
-		return err
-	}
-
 	tm := &cfg.Timing
 	if err := setInt(&tm.WebSocketReconnectDelay, "OPENSQT_TIMING_WEBSOCKET_RECONNECT_DELAY"); err != nil {
 		return err
@@ -288,23 +268,6 @@ func setBool(dst *bool, key string) error {
 		return fmt.Errorf("%s 不是有效布尔值: %q", key, v)
 	}
 	*dst = b
-	return nil
-}
-
-func setStringSlice(dst *[]string, key string) error {
-	v, ok := lookupEnv(key)
-	if !ok {
-		return nil
-	}
-	parts := strings.Split(v, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	*dst = out
 	return nil
 }
 

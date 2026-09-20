@@ -74,7 +74,6 @@ type Reconciler struct {
 	cfg          *config.Config
 	exchange     IExchange
 	pm           IPositionManager
-	pauseChecker func() bool
 	healthy      atomic.Bool
 	healthMu     sync.RWMutex
 	healthChange func(healthy bool, err error)
@@ -97,11 +96,6 @@ func NewReconciler(cfg *config.Config, exchange IExchange, pm IPositionManager) 
 		exchange: exchange,
 		pm:       pm,
 	}
-}
-
-// SetPauseChecker 设置暂停检查函数（用于风控暂停）
-func (r *Reconciler) SetPauseChecker(checker func() bool) {
-	r.pauseChecker = checker
 }
 
 // SetHealthHandler 注册对账健康状态变化回调。回调不得阻塞。
@@ -176,12 +170,7 @@ func (r *Reconciler) Reconcile() (retErr error) {
 		}
 	}()
 
-	// 风控期间仍必须继续核对真实订单；仅降低普通日志噪声。
-	quiet := r.pauseChecker != nil && r.pauseChecker()
-
-	if !quiet {
-		logger.Debugln("🔍 ===== 开始持仓对账 =====")
-	}
+	logger.Debugln("🔍 ===== 开始持仓对账 =====")
 
 	symbol := r.pm.GetSymbol()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -413,10 +402,8 @@ func (r *Reconciler) Reconcile() (retErr error) {
 
 	// 5. 输出对账统计（从交易所接口获取基础币种，支持U本位和币本位合约）
 	baseCurrency := r.exchange.GetBaseAsset()
-	if !quiet {
-		logger.Info("✅ [对账完成] 远端/本地持仓: %.4f %s, 挂单卖单: %d 个 (%.4f), 挂单买单: %d 个",
-			localTotal, baseCurrency, activeSellOrders, localPendingSellQty, activeBuyOrders)
-	}
+	logger.Info("✅ [对账完成] 远端/本地持仓: %.4f %s, 挂单卖单: %d 个 (%.4f), 挂单买单: %d 个",
+		localTotal, baseCurrency, activeSellOrders, localPendingSellQty, activeBuyOrders)
 
 	r.pm.UpdateLastReconcileTime(time.Now())
 
@@ -424,11 +411,9 @@ func (r *Reconciler) Reconcile() (retErr error) {
 	totalSellQty := r.pm.GetTotalSellQty()
 	priceInterval := r.pm.GetPriceInterval()
 	estimatedProfit := totalSellQty * priceInterval
-	if !quiet {
-		logger.Info("📊 [统计] 对账次数: %d, 累计买入: %.2f, 累计卖出: %.2f, 预计盈利: %.2f U",
-			r.pm.GetReconcileCount(), totalBuyQty, totalSellQty, estimatedProfit)
-		logger.Debugln("🔍 ===== 对账完成 =====")
-	}
+	logger.Info("📊 [统计] 对账次数: %d, 累计买入: %.2f, 累计卖出: %.2f, 预计盈利: %.2f U",
+		r.pm.GetReconcileCount(), totalBuyQty, totalSellQty, estimatedProfit)
+	logger.Debugln("🔍 ===== 对账完成 =====")
 	r.setHealthy(true, nil)
 	return nil
 }

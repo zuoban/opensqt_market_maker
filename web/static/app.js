@@ -650,7 +650,6 @@
 
         const app = snapshot.app || {};
         const pos = snapshot.position || {};
-        const risk = snapshot.risk || {};
         const acc = snapshot.account || {};
         const margin = snapshot.margin || {};
         const exchangeRate = snapshot.exchangeRate || {};
@@ -681,14 +680,13 @@
             (snapshot.version || "") + (uptimeText === "—" ? "" : " · 已运行 " + uptimeText)
         );
 
-        const triggered = Boolean(risk.triggered);
         const marginTriggered = marginModel.triggered;
-        const riskPill = $("riskPill");
-        setText(riskPill.querySelector("span") || riskPill, marginTriggered
-            ? (triggered ? "双重限制 · 已停单" : "保证金限制 · 已停单")
-            : (!risk.enabled ? "市场风控关闭" : (triggered ? "风控已触发 · 暂停买单" : "风控正常")));
-        riskPill.classList.toggle("hot", triggered || marginTriggered);
-        riskPill.classList.toggle("ok", Boolean(risk.enabled) && !triggered && !marginTriggered);
+        const marginPill = $("marginPill");
+        setText(marginPill.querySelector("span") || marginPill, marginTriggered
+            ? "保证金限制 · 已停单"
+            : "保证金正常");
+        marginPill.classList.toggle("hot", marginTriggered);
+        marginPill.classList.toggle("ok", !marginTriggered);
 
         const realized = pos.realizedPnl != null ? pos.realizedPnl : 0;
         const mark = Number(price.last || pos.lastPrice);
@@ -818,7 +816,6 @@
             orderQuantity: pos.orderQuantity,
             showOutside
         }, () => renderKlineChart(snapshot.kline || {}, pos));
-        updateSection("risk", risk, () => renderRisk(risk));
         updateSection("logs", snapshot.logs || [], () => renderLogs(snapshot.logs || []));
         updateSection("tables", {
             filledOrders: pos.filledOrders || [],
@@ -2165,47 +2162,6 @@
         } : {
             hour: "2-digit", minute: "2-digit", hour12: false
         });
-    }
-
-    function renderRisk(risk) {
-        const panel = $("riskPanel");
-        const statusStrip = document.querySelector(".status-strip");
-        const enabled = Boolean(risk.enabled);
-        if (panel) {
-            panel.hidden = !enabled;
-            panel.setAttribute("aria-hidden", enabled ? "false" : "true");
-        }
-        if (statusStrip) statusStrip.classList.toggle("risk-off", !enabled);
-        if (!enabled) return;
-
-        $("riskMsg").textContent = risk.lastMsg || "等待风控读数";
-        const list = $("riskList");
-        const symbols = risk.symbols || [];
-        if (!symbols.length) {
-            replaceChildren(list, [element("div", "empty", "暂无监控币种数据")]);
-            return;
-        }
-
-        const items = symbols.map((item) => {
-            const bad = Boolean(item.abnormal || (risk.triggered && item.priceBelowMA));
-            const warn = !bad && Boolean(item.status) && item.status !== "正常";
-            const card = element("div", "risk-item " + (bad ? "bad" : (warn ? "warn" : "ok")));
-            const top = element("div", "top");
-            top.append(
-                element("strong", "", item.symbol || "—"),
-                element("span", "status", item.status || (bad ? "异常" : "正常"))
-            );
-            const meta = element(
-                "div",
-                "meta",
-                "价 " + fmt(item.currentPrice, 4) +
-                " / 均 " + fmt(item.avgPrice, 4) +
-                " (" + fmt(item.priceDeviation, 2) + "%) · 量比 ×" + fmt(item.volumeRatio, 2)
-            );
-            card.append(top, meta);
-            return card;
-        });
-        replaceChildren(list, items);
     }
 
     function renderLogs(logs) {

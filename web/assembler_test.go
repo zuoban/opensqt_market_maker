@@ -37,9 +37,7 @@ func TestSafeAppViewOmitsSecrets(t *testing.T) {
 		SecretKey: "SUPERSECRET_XYZ",
 		FeeRate:   0.0002,
 	}
-	cfg.RiskControl.Enabled = true
 	cfg.Telegram = config.TelegramConfig{Enabled: true, BotToken: "TELEGRAM_SECRET", ChatID: "PRIVATE_CHAT_ID"}
-	cfg.RiskControl.MonitorSymbols = []string{"BTCUSDT"}
 	cfg.Dashboard.PushIntervalMS = 400
 	cfg.Execution.MakerGuardTicks = 2
 	cfg.Execution.QuoteStaleMS = 1500

@@ -70,8 +70,8 @@
                     <div class="pill connecting" id="wsPill" role="status" aria-live="polite">
                         <i aria-hidden="true"></i><span>连接中</span>
                     </div>
-                    <div class="pill risk" id="riskPill" role="status" aria-live="polite">
-                        <i aria-hidden="true"></i><span>风控 —</span>
+                    <div class="pill margin" id="marginPill" role="status" aria-live="polite">
+                        <i aria-hidden="true"></i><span>保证金 —</span>
                     </div>
                 </div>
                 <div class="ver" id="version"></div>
@@ -151,7 +151,7 @@
                 </details>
             </section>
 
-            <section class="board" aria-label="行情与风控">
+            <section class="board" aria-label="行情与执行">
                 <section class="panel ladder-wrap market-chart-panel" id="section-market">
                     <div class="panel-head">
                         <div class="panel-title">
@@ -253,22 +253,11 @@
                     </div>
                 </section>
 
-                <aside class="status-strip" id="section-status" aria-label="风险与运行状态">
-                    <section class="panel risk-panel" id="riskPanel">
-                        <div class="panel-head">
-                            <div class="panel-title">
-                                <span>02 / RISK SENTINEL</span>
-                                <h2>主动风控</h2>
-                            </div>
-                        </div>
-                        <p class="risk-msg" id="riskMsg">等待风控读数</p>
-                        <div id="riskList" class="risk-list"></div>
-                    </section>
-
+                <aside class="status-strip" id="section-status" aria-label="运行状态">
 					<section class="panel maker-panel is-waiting" id="makerPanel" aria-labelledby="makerTitle">
 						<div class="panel-head">
 							<div class="panel-title">
-								<span>03 / MAKER EXECUTION</span>
+								<span>02 / MAKER EXECUTION</span>
 								<h2 id="makerTitle">Maker 执行健康</h2>
 							</div>
 							<div class="maker-status" id="makerStatus" role="status" aria-live="polite">

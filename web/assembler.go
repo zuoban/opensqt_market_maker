@@ -28,7 +28,6 @@ type Snapshot struct {
 	PositionReady     bool                      `json:"positionReady"`
 	PositionUpdatedAt time.Time                 `json:"positionUpdatedAt"`
 	PositionAgeMs     int64                     `json:"positionAgeMs"`
-	Risk              safety.RiskSnapshot       `json:"risk"`
 	Margin            safety.MarginSnapshot     `json:"margin"`
 	Account           AccountView               `json:"account"`
 	ExchangeRate      ExchangeRateView          `json:"exchangeRate"`
@@ -76,7 +75,6 @@ type assembler struct {
 	price        *monitor.PriceMonitor
 	position     *PositionCache
 	pos          *position.SuperPositionManager
-	risk         *safety.RiskMonitor
 	margin       *safety.MarginMonitor
 	account      *AccountCache
 	exchangeRate *ExchangeRateCache
@@ -121,9 +119,6 @@ func (a *assembler) Build() *Snapshot {
 		snap.Position = a.pos.Snapshot()
 		snap.PositionReady = true
 		snap.PositionUpdatedAt = time.Now()
-	}
-	if a.risk != nil {
-		snap.Risk = a.risk.Snapshot()
 	}
 	if a.margin != nil {
 		snap.Margin = a.margin.Snapshot()

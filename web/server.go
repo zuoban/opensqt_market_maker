@@ -30,7 +30,6 @@ type Options struct {
 	StartedAt   time.Time
 	Price       *monitor.PriceMonitor
 	Position    *position.SuperPositionManager
-	Risk        *safety.RiskMonitor
 	Margin      *safety.MarginMonitor
 	Exchange    exchange.IExchange
 	Performance *telemetry.Recorder
@@ -132,7 +131,6 @@ func New(opt Options) *Server {
 			price:        opt.Price,
 			position:     positionCache,
 			pos:          opt.Position,
-			risk:         opt.Risk,
 			margin:       opt.Margin,
 			account:      cache,
 			exchangeRate: exchangeRate,

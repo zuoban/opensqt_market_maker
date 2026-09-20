@@ -124,19 +124,6 @@ func visualFixtureSnapshot() map[string]interface{} {
 				"catchUpOrders": 7, "catchUpAbandoned": 1, "activeCatchUp": 1,
 			},
 		},
-		"risk": map[string]interface{}{
-			"enabled": true, "triggered": false, "lastMsg": "监控正常 · 量价均在阈值内",
-			"symbols": []interface{}{
-				map[string]interface{}{
-					"symbol": "ETHUSDT", "status": "正常", "abnormal": false,
-					"currentPrice": 4222.02, "avgPrice": 4216.4, "priceDeviation": 0.13, "volumeRatio": 1.08,
-				},
-				map[string]interface{}{
-					"symbol": "BTCUSDT", "status": "关注", "abnormal": false,
-					"currentPrice": 67420.5, "avgPrice": 67110.0, "priceDeviation": 0.46, "volumeRatio": 1.62,
-				},
-			},
-		},
 		"margin": map[string]interface{}{
 			"ready": true, "triggered": false, "usagePercent": 42.32, "limitPercent": 60.0,
 			"usedMargin": 854.25, "marginBalance": 2018.47, "availableBalance": 1164.22,
@@ -153,7 +140,7 @@ func visualFixtureSnapshot() map[string]interface{} {
 		"logs": []map[string]interface{}{
 			{"time": time.Now().Add(-18 * time.Minute), "level": "INFO", "message": "账户缓存已同步 · 可用 1,864.22 USDT"},
 			{"time": time.Now().Add(-9 * time.Minute), "level": "INFO", "message": "K 线与网格执行图已连接实时行情"},
-			{"time": time.Now().Add(-4 * time.Minute), "level": "WARN", "message": "BTCUSDT 量比升至 1.62 · 继续观察"},
+			{"time": time.Now().Add(-4 * time.Minute), "level": "WARN", "message": "盘口报价短暂陈旧 · 等待新鲜行情"},
 			{"time": time.Now(), "level": "INFO", "message": "ETHUSDT 买单已确认 · 4,214.00 × 0.0071"},
 		},
 	}

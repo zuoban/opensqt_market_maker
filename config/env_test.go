@@ -318,19 +318,11 @@ func TestLoadConfigMissingYAMLWithoutEnvFails(t *testing.T) {
 	}
 }
 
-func TestRiskSymbolsAndBoolFromEnv(t *testing.T) {
-	t.Setenv("OPENSQT_RISK_CONTROL_ENABLED", "false")
-	t.Setenv("OPENSQT_RISK_CONTROL_MONITOR_SYMBOLS", "BTCUSDT, ETHUSDT")
+func TestDashboardBoolFromEnv(t *testing.T) {
 	t.Setenv("OPENSQT_DASHBOARD_ENABLED", "0")
 	cfg, err := LoadConfig(writeTempYAML(t, envTestYAML))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if cfg.RiskControl.Enabled {
-		t.Fatal("risk should be off")
-	}
-	if len(cfg.RiskControl.MonitorSymbols) != 2 || cfg.RiskControl.MonitorSymbols[0] != "BTCUSDT" {
-		t.Fatalf("symbols = %#v", cfg.RiskControl.MonitorSymbols)
 	}
 	if cfg.DashboardEnabled() {
 		t.Fatal("dashboard should be off")

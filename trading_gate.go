@@ -35,8 +35,6 @@ var errTradingGateShuttingDown = errors.New("交易门禁正在关闭")
 type tradingGateHealth struct {
 	OrderStreamReady bool
 	OrderStreamState string
-	RiskReady        bool
-	RiskTriggered    bool
 	MarginReady      bool
 	MarginTriggered  bool
 	ReconcilerReady  bool
@@ -44,24 +42,17 @@ type tradingGateHealth struct {
 }
 
 func (h tradingGateHealth) CanTrade() bool {
-	return h.OrderStreamReady && h.RiskReady && !h.RiskTriggered && h.MarginReady &&
-		!h.MarginTriggered && h.ReconcilerReady && h.PriceFresh
+	return h.OrderStreamReady && h.MarginReady && !h.MarginTriggered && h.ReconcilerReady && h.PriceFresh
 }
 
 func (h tradingGateHealth) Reasons() []string {
-	reasons := make([]string, 0, 7)
+	reasons := make([]string, 0, 5)
 	if !h.OrderStreamReady {
 		state := h.OrderStreamState
 		if state == "" {
 			state = "UNKNOWN"
 		}
 		reasons = append(reasons, "订单流="+state)
-	}
-	if !h.RiskReady {
-		reasons = append(reasons, "风控未就绪")
-	}
-	if h.RiskTriggered {
-		reasons = append(reasons, "风控已触发")
 	}
 	if !h.MarginReady {
 		reasons = append(reasons, "保证金守卫未就绪")
@@ -225,7 +216,6 @@ type tradingGateRuntime struct {
 	gate       *serializedOrderGate
 	exchange   exchange.IExchange
 	price      *monitor.PriceMonitor
-	risk       *safety.RiskMonitor
 	margin     marginGateMonitor
 	reconciler *safety.Reconciler
 	position   tradingPositionManager
@@ -261,7 +251,6 @@ func newTradingGateRuntime(
 	gate *serializedOrderGate,
 	ex exchange.IExchange,
 	price *monitor.PriceMonitor,
-	risk *safety.RiskMonitor,
 	margin marginGateMonitor,
 	reconciler *safety.Reconciler,
 	positionManager tradingPositionManager,
@@ -278,7 +267,6 @@ func newTradingGateRuntime(
 		gate:            gate,
 		exchange:        ex,
 		price:           price,
-		risk:            risk,
 		margin:          margin,
 		reconciler:      reconciler,
 		position:        positionManager,
@@ -489,8 +477,6 @@ func (r *tradingGateRuntime) snapshot() tradingGateHealth {
 	return tradingGateHealth{
 		OrderStreamReady: orderReady,
 		OrderStreamState: orderState,
-		RiskReady:        r.risk.IsReady(),
-		RiskTriggered:    r.risk.IsTriggered(),
 		MarginReady:      marginReady,
 		MarginTriggered:  marginTriggered,
 		ReconcilerReady:  r.reconciler.IsHealthy(),

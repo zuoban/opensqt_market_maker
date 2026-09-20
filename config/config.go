@@ -81,16 +81,6 @@ type Config struct {
 		CancelOnExit bool   `yaml:"cancel_on_exit"`
 	} `yaml:"system"`
 
-	// 主动安全风控配置
-	RiskControl struct {
-		Enabled           bool     `yaml:"enabled"`            // 是否启用风控，默认true
-		MonitorSymbols    []string `yaml:"monitor_symbols"`    // 监控币种，如 ["BTCUSDT", "ETHUSDT"]
-		Interval          string   `yaml:"interval"`           // K线周期，如 "1m", "3m", "5m"
-		VolumeMultiplier  float64  `yaml:"volume_multiplier"`  // 成交量倍数阈值，默认3.0
-		AverageWindow     int      `yaml:"average_window"`     // 移动平均窗口大小，默认20
-		RecoveryThreshold int      `yaml:"recovery_threshold"` // 恢复交易所需的正常币种数量，默认3
-	} `yaml:"risk_control"`
-
 	// 时间间隔配置（单位：秒，除非特别说明）
 	Timing struct {
 		// WebSocket相关
@@ -329,30 +319,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Execution.MaxGapStackSlots > 10 {
 		return fmt.Errorf("execution.max_gap_stack_slots 不能大于 10")
-	}
-
-	// 验证风控配置并设置默认值
-	if c.RiskControl.Interval == "" {
-		c.RiskControl.Interval = "1m" // 默认1分钟
-	}
-	if c.RiskControl.VolumeMultiplier <= 0 {
-		c.RiskControl.VolumeMultiplier = 3.0 // 默认3倍
-	}
-	if c.RiskControl.AverageWindow <= 0 {
-		c.RiskControl.AverageWindow = 20 // 默认20根K线
-	}
-	if len(c.RiskControl.MonitorSymbols) == 0 {
-		c.RiskControl.MonitorSymbols = []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"}
-	}
-
-	// 验证恢复阈值配置
-	monitorCount := len(c.RiskControl.MonitorSymbols)
-	if c.RiskControl.RecoveryThreshold <= 0 {
-		c.RiskControl.RecoveryThreshold = 3 // 默认3个币种
-	} else if c.RiskControl.RecoveryThreshold < 1 {
-		c.RiskControl.RecoveryThreshold = 1 // 最小1个
-	} else if c.RiskControl.RecoveryThreshold > monitorCount {
-		c.RiskControl.RecoveryThreshold = monitorCount // 最大为监控币种数量
 	}
 
 	if err := c.applyDashboardDefaults(); err != nil {

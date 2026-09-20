@@ -193,16 +193,9 @@ func main() {
 	superPositionManager.SetTelemetry(performance)
 	performance.SetStateProvider(superPositionManager.TelemetryStateCounts)
 
-	// === 新增：初始化风控监视器 ===
-	riskMonitor := safety.NewRiskMonitor(cfg, ex)
-
-	// === 创建对账器（从仓位管理器剖离） ===
+	// === 创建对账器（从仓位管理器剥离） ===
 	reconciler := safety.NewReconciler(cfg, exchangeAdapter, superPositionManager)
 	reconciler.SetTelemetry(performance)
-	// 将风控状态注入到对账器，用于暂停对账日志
-	reconciler.SetPauseChecker(func() bool {
-		return riskMonitor.IsTriggered()
-	})
 
 	// 9. 启动组件
 	ctx, cancel := context.WithCancel(context.Background())
@@ -263,14 +256,6 @@ func main() {
 		logger.Fatalf("❌ 首次持仓对账未达到健康状态，已拒绝启动交易")
 	}
 
-	// 风控必须同步完成历史数据加载、实时流握手并进入 READY。
-	if err := riskMonitor.Start(ctx); err != nil {
-		logger.Fatalf("❌ 启动主动风控失败，已拒绝启动交易: %v", err)
-	}
-	if !riskMonitor.IsReady() {
-		logger.Fatalf("❌ 主动风控未就绪，已拒绝启动交易")
-	}
-
 	// 从保证金守卫启动前就接管退出信号。这样启动首读已经超限、正在执行
 	// 安全全撤时收到 SIGINT/SIGTERM，也不会被默认信号处理直接打断。
 	sigChan := make(chan os.Signal, 1)
@@ -290,7 +275,6 @@ func main() {
 		orderGate,
 		ex,
 		priceMonitor,
-		riskMonitor,
 		marginMonitor,
 		reconciler,
 		superPositionManager,
@@ -325,7 +309,6 @@ func main() {
 				StartedAt:   programStartedAt,
 				Price:       priceMonitor,
 				Position:    superPositionManager,
-				Risk:        riskMonitor,
 				Margin:      marginMonitor,
 				Exchange:    ex,
 			})
@@ -346,10 +329,7 @@ func main() {
 					return
 				case <-ticker.C:
 					logPerformance(performance.Snapshot())
-					// 风控触发时不打印状态
-					if !riskMonitor.IsTriggered() {
-						superPositionManager.PrintPositions()
-					}
+					superPositionManager.PrintPositions()
 				}
 			}
 		}()
@@ -402,9 +382,6 @@ func main() {
 	if err := ex.StopOrderStream(); err != nil {
 		logger.Error("❌ 停止订单流失败: %v", err)
 	}
-
-	logger.Info("⏹️ 正在停止风控监视器...")
-	riskMonitor.Stop()
 
 	if dash != nil {
 		logger.Info("⏹️ 正在停止监控面板...")

@@ -17,19 +17,17 @@ import (
 )
 
 func TestTradingGateHealthCanTradeTruthTable(t *testing.T) {
-	for mask := 0; mask < 128; mask++ {
+	for mask := 0; mask < 32; mask++ {
 		health := tradingGateHealth{
 			OrderStreamReady: mask&(1<<0) != 0,
-			RiskReady:        mask&(1<<1) != 0,
-			RiskTriggered:    mask&(1<<2) != 0,
-			MarginReady:      mask&(1<<3) != 0,
-			MarginTriggered:  mask&(1<<4) != 0,
-			ReconcilerReady:  mask&(1<<5) != 0,
-			PriceFresh:       mask&(1<<6) != 0,
+			MarginReady:      mask&(1<<1) != 0,
+			MarginTriggered:  mask&(1<<2) != 0,
+			ReconcilerReady:  mask&(1<<3) != 0,
+			PriceFresh:       mask&(1<<4) != 0,
 		}
-		want := health.OrderStreamReady && health.RiskReady && !health.RiskTriggered &&
-			health.MarginReady && !health.MarginTriggered && health.ReconcilerReady && health.PriceFresh
-		t.Run(fmt.Sprintf("mask_%07b", mask), func(t *testing.T) {
+		want := health.OrderStreamReady && health.MarginReady && !health.MarginTriggered &&
+			health.ReconcilerReady && health.PriceFresh
+		t.Run(fmt.Sprintf("mask_%05b", mask), func(t *testing.T) {
 			if got := health.CanTrade(); got != want {
 				t.Fatalf("CanTrade() = %v, want %v, health=%+v", got, want, health)
 			}
@@ -40,9 +38,8 @@ func TestTradingGateHealthCanTradeTruthTable(t *testing.T) {
 func TestTradingGateHealthReasons(t *testing.T) {
 	health := tradingGateHealth{
 		OrderStreamState: "DEGRADED",
-		RiskTriggered:    true,
 	}
-	want := []string{"订单流=DEGRADED", "风控未就绪", "风控已触发", "保证金守卫未就绪", "对账不健康", "价格流陈旧"}
+	want := []string{"订单流=DEGRADED", "保证金守卫未就绪", "对账不健康", "价格流陈旧"}
 	if got := health.Reasons(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("Reasons() = %v, want %v", got, want)
 	}
@@ -216,7 +213,6 @@ func TestNewTradingGateRuntimeInstallsSubmissionHealthGuard(t *testing.T) {
 		nil,
 		nil,
 		nil,
-		nil,
 		&safety.Reconciler{},
 		nil,
 		time.Second,
@@ -231,7 +227,6 @@ func TestSubmissionHealthErrorFailsClosedForEveryCondition(t *testing.T) {
 	healthy := tradingGateHealth{
 		OrderStreamReady: true,
 		OrderStreamState: "READY",
-		RiskReady:        true,
 		MarginReady:      true,
 		ReconcilerReady:  true,
 		PriceFresh:       true,
@@ -247,8 +242,6 @@ func TestSubmissionHealthErrorFailsClosedForEveryCondition(t *testing.T) {
 		want           string
 	}{
 		{name: "order stream", mutate: func(h *tradingGateHealth) { h.OrderStreamReady = false }, want: "订单流"},
-		{name: "risk not ready", mutate: func(h *tradingGateHealth) { h.RiskReady = false }, want: "风控未就绪"},
-		{name: "risk triggered", mutate: func(h *tradingGateHealth) { h.RiskTriggered = true }, want: "风控已触发"},
 		{name: "margin not ready", mutate: func(h *tradingGateHealth) { h.MarginReady = false }, want: "保证金守卫未就绪"},
 		{name: "margin triggered", mutate: func(h *tradingGateHealth) { h.MarginTriggered = true }, want: "保证金限制已触发"},
 		{name: "reconciler", mutate: func(h *tradingGateHealth) { h.ReconcilerReady = false }, want: "对账不健康"},
@@ -283,7 +276,6 @@ func TestSubmissionHealthGuardSynchronouslyEntersRecoveryState(t *testing.T) {
 
 	health := tradingGateHealth{
 		OrderStreamState: "DEGRADED",
-		RiskReady:        true,
 		MarginReady:      true,
 		ReconcilerReady:  true,
 		PriceFresh:       true,
@@ -311,7 +303,6 @@ func TestSubmissionHealthGuardSynchronouslyEntersRecoveryState(t *testing.T) {
 	recovered := tradingGateHealth{
 		OrderStreamReady: true,
 		OrderStreamState: "READY",
-		RiskReady:        true,
 		MarginReady:      true,
 		ReconcilerReady:  true,
 		PriceFresh:       true,
@@ -991,17 +982,11 @@ func newHealthyTradingGateTestRuntime(
 	t.Cleanup(priceMonitor.Stop)
 
 	cfg := &config.Config{}
-	riskMonitor := safety.NewRiskMonitor(cfg, ex)
-	if err := riskMonitor.Start(context.Background()); err != nil {
-		t.Fatalf("risk monitor Start() error = %v", err)
-	}
-
 	reconciler := safety.NewReconciler(
 		cfg,
 		&emptyTradingGateReconcileExchange{},
 		&emptyTradingGateReconcilePosition{},
 	)
-	reconciler.SetPauseChecker(func() bool { return true })
 	if err := reconciler.Reconcile(); err != nil {
 		t.Fatalf("initial Reconcile() error = %v", err)
 	}
@@ -1012,7 +997,6 @@ func newHealthyTradingGateTestRuntime(
 		gate,
 		ex,
 		priceMonitor,
-		riskMonitor,
 		&staticMarginGateMonitor{ready: true},
 		reconciler,
 		positionManager,
@@ -1452,7 +1436,6 @@ func TestNewTradingGateRuntimeConnectsOptionalAdjustmentNotifier(t *testing.T) {
 	positionManager := &adjustmentNotifierTradingPosition{}
 	runtime := newTradingGateRuntime(
 		newSerializedOrderGate(&recordingNewOrderGate{}),
-		nil,
 		nil,
 		nil,
 		nil,

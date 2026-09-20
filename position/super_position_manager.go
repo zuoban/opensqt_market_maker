@@ -2500,7 +2500,6 @@ func (spm *SuperPositionManager) CancelAllBuyOrders() error {
 
 // ===== 对账功能已迁移到 safety.Reconciler =====
 // StartReconciliation 和 Reconcile 方法已移至 safety/reconciler.go
-// SetPauseChecker 也已移至 Reconciler
 
 // CancelAllOrders 撤销所有订单（退出时使用）
 // 委托给交易所适配器实现具体逻辑
