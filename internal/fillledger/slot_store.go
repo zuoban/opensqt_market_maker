@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"math/big"
-	"reflect"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -16,6 +15,9 @@ var (
 	progressBucket   = []byte("orders")
 	slotHeadKey      = []byte("slot-head")
 	ErrOrderConflict = errors.New("order identity or progress conflicts with durable state")
+	// Returning this exact sentinel from Update aborts an unchanged transaction.
+	// It must never be matched with errors.Is: a joined I/O error is still a fault.
+	errSlotReplay = errors.New("slot transaction already durable")
 )
 
 // SlotStore is the incompatible v2 transaction prototype. It is intentionally
@@ -96,19 +98,21 @@ func validateSlotDB(db *bolt.DB, path string, scope Scope) error {
 			return err
 		}
 		var slots, orders, filled, maxRevision uint64
-		if err := tx.Bucket(slotBucket).ForEach(func(k, v []byte) error {
+		slotRows := tx.Bucket(slotBucket)
+		if err := slotRows.ForEach(func(k, v []byte) error {
 			_, err := readSlotRecord(k, v, head.Revision)
 			slots++
 			return err
 		}); err != nil {
 			return err
 		}
+		var decoder sealedDecoder
+		var o OrderRecord
 		if err := tx.Bucket(progressBucket).ForEach(func(k, v []byte) error {
-			o, err := readOrderRecord(k, v, head.Revision)
-			if err != nil {
+			if err := decoder.readOrderRecord(k, v, head.Revision, &o); err != nil {
 				return err
 			}
-			if tx.Bucket(slotBucket).Get([]byte(o.SlotKey)) == nil {
+			if slotRows.Get([]byte(o.SlotKey)) == nil {
 				return ErrCorrupt
 			}
 			orders++
@@ -156,15 +160,33 @@ func readSlotRecord(key, value []byte, revision uint64) (SlotRecord, error) {
 }
 
 func readOrderRecord(key, value []byte, revision uint64) (OrderRecord, error) {
+	var decoder sealedDecoder
+	return decoder.orderRecord(key, value, revision)
+}
+
+func (d *sealedDecoder) orderRecord(key, value []byte, revision uint64) (OrderRecord, error) {
 	var r OrderRecord
-	if err := readSealed(value, &r); err != nil {
+	if err := d.readOrderRecord(key, value, revision, &r); err != nil {
 		return OrderRecord{}, err
 	}
-	canonical, err := canonicalOrder(r.OrderCheckpoint)
-	if err != nil || !reflect.DeepEqual(canonical, r.OrderCheckpoint) || !bytes.Equal(key, orderKey(r.OrderID)) || r.Revision == 0 || r.Revision > revision || r.TransitionHash == ([32]byte{}) {
-		return OrderRecord{}, ErrCorrupt
-	}
 	return r, nil
+}
+
+// Startup scans discard each decoded row and may reuse this destination. Its
+// fields are reset before decoding; only zero-length State capacity is reused,
+// so an absent/empty State cannot inherit a previously valid row. Public reads
+// use a fresh destination through orderRecord and return independent ownership.
+func (d *sealedDecoder) readOrderRecord(key, value []byte, revision uint64, r *OrderRecord) error {
+	*r = OrderRecord{OrderCheckpoint: OrderCheckpoint{State: r.State[:0]}}
+	if err := d.read(value, r); err != nil {
+		return err
+	}
+	// JSON decoding already owns State. Validate without cloning it a second time.
+	canonical, err := canonicalOrderFields(r.OrderCheckpoint)
+	if err != nil || !equalOrderCheckpoint(canonical, r.OrderCheckpoint) || !bytes.Equal(key, orderKey(r.OrderID)) || r.Revision == 0 || r.Revision > revision || r.TransitionHash == ([32]byte{}) {
+		return ErrCorrupt
+	}
+	return nil
 }
 
 func readSlotView(tx *bolt.Tx, head slotHead, keys []string, ids []int64) (SlotView, error) {
@@ -236,6 +258,7 @@ func (s *SlotStore) Read(keys []string, ids []int64) (SlotView, error) {
 // Commit writes only affected slots, one order's progress, and totals. Global
 // revision CAS prevents stale cross-slot calculations from replacing new state.
 // Exact last-transaction replay returns CURRENT rows, even at a stale revision.
+// It rolls back the unchanged database transaction without writing or syncing.
 // Older events must be read/reduced again by the caller after a revision conflict.
 // Errors never return publishable state; I/O uncertainty latches the instance.
 func (s *SlotStore) Commit(input SlotTransaction) (SlotCommitResult, error) {
@@ -272,8 +295,11 @@ func (s *SlotStore) Commit(input SlotTransaction) (SlotCommitResult, error) {
 			}
 			if previous.TransitionHash == hash {
 				result.View, err = readSlotView(tx, head, keys, []int64{in.Order.OrderID})
+				if err != nil {
+					return err
+				}
 				result.Duplicate = true
-				return err
+				return errSlotReplay
 			}
 		}
 		if in.ExpectedRevision != head.Revision || head.Revision == math.MaxUint64 {
@@ -297,7 +323,7 @@ func (s *SlotStore) Commit(input SlotTransaction) (SlotCommitResult, error) {
 			if in.Order.UpdateTime < previous.UpdateTime {
 				return ErrOrderConflict
 			}
-			if reflect.DeepEqual(previous.OrderCheckpoint, in.Order) {
+			if equalOrderCheckpoint(previous.OrderCheckpoint, in.Order) {
 				return ErrOrderConflict
 			}
 		}
@@ -362,6 +388,9 @@ func (s *SlotStore) Commit(input SlotTransaction) (SlotCommitResult, error) {
 		result.View, err = readSlotView(tx, head, keys, []int64{in.Order.OrderID})
 		return err
 	})
+	if err == errSlotReplay {
+		return result, nil
+	}
 	if err != nil {
 		if errors.Is(err, ErrRevisionConflict) {
 			return SlotCommitResult{}, err

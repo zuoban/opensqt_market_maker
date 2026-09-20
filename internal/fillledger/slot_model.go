@@ -96,6 +96,7 @@ func canonicalAmount(value string, signed bool) (string, error) {
 	if len(value) == 0 || len(value) > 80 {
 		return "", fmt.Errorf("%w: amount length", ErrInvalid)
 	}
+	original := value
 	negative := strings.HasPrefix(value, "-")
 	if negative {
 		if !signed {
@@ -103,11 +104,13 @@ func canonicalAmount(value string, signed bool) (string, error) {
 		}
 		value = value[1:]
 	}
-	parts := strings.Split(value, ".")
-	if len(parts) > 2 {
-		return "", ErrInvalid
+	integer, fraction, decimal := strings.Cut(value, ".")
+	parts := [2]string{integer, fraction}
+	count := 1
+	if decimal {
+		count = 2
 	}
-	for _, part := range parts {
+	for _, part := range parts[:count] {
 		if part == "" {
 			return "", ErrInvalid
 		}
@@ -117,14 +120,18 @@ func canonicalAmount(value string, signed bool) (string, error) {
 			}
 		}
 	}
-	whole := strings.TrimLeft(parts[0], "0")
+	whole := strings.TrimLeft(integer, "0")
 	if whole == "" {
 		whole = "0"
 	}
-	if len(parts) == 2 {
-		if fraction := strings.TrimRight(parts[1], "0"); fraction != "" {
-			whole += "." + fraction
-		}
+	trimmedFraction := strings.TrimRight(fraction, "0")
+	// Canonical persisted amounts need validation, not a freshly allocated string.
+	if whole == integer && (!decimal || trimmedFraction != "" && trimmedFraction == fraction) &&
+		(!negative || whole != "0" || trimmedFraction != "") {
+		return original, nil
+	}
+	if trimmedFraction != "" {
+		whole += "." + trimmedFraction
 	}
 	if negative && whole != "0" {
 		whole = "-" + whole
@@ -165,6 +172,17 @@ func canonicalAccounting(a Accounting) (Accounting, error) {
 func terminalStatus(s string) bool { return s == "CANCELED" || s == "EXPIRED" || s == "REJECTED" }
 
 func canonicalOrder(o OrderCheckpoint) (OrderCheckpoint, error) {
+	next, err := canonicalOrderFields(o)
+	if err != nil {
+		return OrderCheckpoint{}, err
+	}
+	next.State = bytes.Clone(next.State)
+	return next, nil
+}
+
+// Normalizes/validates scalar fields without copying the caller-owned State.
+// Input transactions use canonicalOrder to take ownership; decoded rows don't.
+func canonicalOrderFields(o OrderCheckpoint) (OrderCheckpoint, error) {
 	// Reuse the established exchange/client identity validation, allowing zero
 	// cumulative execution for NEW/rejected orders in this format.
 	identity, err := (Completion{OrderID: o.OrderID, ClientOrderID: o.ClientOrderID, Side: o.Side, ExecutedQty: "1", ExecutedQuote: "1"}).canonical()
@@ -193,8 +211,14 @@ func canonicalOrder(o OrderCheckpoint) (OrderCheckpoint, error) {
 	if len(o.State) == 0 || len(o.State) > MaxSlotStateBytes {
 		return OrderCheckpoint{}, ErrInvalid
 	}
-	o.State = bytes.Clone(o.State)
 	return o, nil
+}
+
+func equalOrderCheckpoint(a, b OrderCheckpoint) bool {
+	return a.OrderID == b.OrderID && a.ClientOrderID == b.ClientOrderID &&
+		a.Side == b.Side && a.SlotKey == b.SlotKey && a.Status == b.Status &&
+		a.ExecutedQty == b.ExecutedQty && a.ExecutedQuote == b.ExecutedQuote &&
+		a.UpdateTime == b.UpdateTime && bytes.Equal(a.State, b.State)
 }
 
 func canonicalSlots(slots []SlotWrite) ([]SlotWrite, error) {

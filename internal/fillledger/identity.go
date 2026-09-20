@@ -74,35 +74,12 @@ func (f Completion) canonical() (Completion, error) {
 }
 
 func positiveDecimal(value string) (string, error) {
-	if len(value) == 0 || len(value) > 80 {
-		return "", fmt.Errorf("%w: decimal length", ErrInvalid)
+	canonical, err := canonicalAmount(value, false)
+	if err != nil {
+		return "", err
 	}
-	parts := strings.Split(value, ".")
-	if len(parts) > 2 {
-		return "", fmt.Errorf("%w: decimal format", ErrInvalid)
-	}
-	for _, part := range parts {
-		if part == "" {
-			return "", fmt.Errorf("%w: decimal format", ErrInvalid)
-		}
-		for _, c := range part {
-			if c < '0' || c > '9' {
-				return "", fmt.Errorf("%w: decimal digits", ErrInvalid)
-			}
-		}
-	}
-	whole := strings.TrimLeft(parts[0], "0")
-	if whole == "" {
-		whole = "0"
-	}
-	if len(parts) == 2 {
-		fraction := strings.TrimRight(parts[1], "0")
-		if fraction != "" {
-			return whole + "." + fraction, nil
-		}
-	}
-	if whole == "0" {
+	if canonical == "0" {
 		return "", fmt.Errorf("%w: execution must be positive", ErrInvalid)
 	}
-	return whole, nil
+	return canonical, nil
 }

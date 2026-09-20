@@ -354,18 +354,28 @@ func putSealed(bucket *bolt.Bucket, key []byte, value any) error {
 	return bucket.Put(key, encoded)
 }
 
+// A decoder may be reused while scanning records. RawMessage copies into its
+// reusable buffer; decoded records still own their strings and byte slices.
+// Reset every envelope field so absent/null data cannot inherit a previous row.
+type sealedDecoder struct{ envelope sealed }
+
 func readSealed(value []byte, result any) error {
+	var decoder sealedDecoder
+	return decoder.read(value, result)
+}
+
+func (d *sealedDecoder) read(value []byte, result any) error {
 	if len(value) == 0 || len(value) > 2*MaxStateBytes {
 		return fmt.Errorf("%w: record size", ErrCorrupt)
 	}
-	var envelope sealed
-	if err := json.Unmarshal(value, &envelope); err != nil {
+	d.envelope = sealed{Payload: d.envelope.Payload[:0]}
+	if err := json.Unmarshal(value, &d.envelope); err != nil {
 		return fmt.Errorf("%w: record encoding", ErrCorrupt)
 	}
-	if sha256.Sum256(envelope.Payload) != envelope.SHA256 {
+	if sha256.Sum256(d.envelope.Payload) != d.envelope.SHA256 {
 		return fmt.Errorf("%w: record checksum", ErrCorrupt)
 	}
-	if err := json.Unmarshal(envelope.Payload, result); err != nil {
+	if err := json.Unmarshal(d.envelope.Payload, result); err != nil {
 		return fmt.Errorf("%w: record payload", ErrCorrupt)
 	}
 	return nil
