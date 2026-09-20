@@ -14,6 +14,25 @@
         return systemTheme === "light" ? "light" : "dark";
     }
 
+    const DEFAULT_PAGE_TITLE = "OpenSQT 做市监控";
+
+    function compactPriceText(lastText, last, decimals) {
+        const text = String(lastText == null ? "" : lastText).trim();
+        if (text && text !== "—") return text;
+        const value = Number(last);
+        if (!Number.isFinite(value) || value <= 0) return "";
+        const digits = Number.isInteger(decimals) && decimals >= 0 ? Math.min(decimals, 12) : 2;
+        return value.toFixed(digits);
+    }
+
+    function buildPageTitle(source) {
+        const input = source || {};
+        const price = compactPriceText(input.lastText, input.last, input.decimals);
+        const symbol = String(input.symbol == null ? "" : input.symbol).trim();
+        if (!price || !symbol || symbol === "—") return DEFAULT_PAGE_TITLE;
+        return price + " | " + symbol;
+    }
+
     if (typeof module !== "undefined" && module.exports) {
         module.exports = {
             buildKlineGridModel,
@@ -33,7 +52,9 @@
             formatCandleChange,
             candleDetail,
             normalizeThemePref,
-            resolveTheme
+            resolveTheme,
+            buildPageTitle,
+            DEFAULT_PAGE_TITLE
         };
         return;
     }
@@ -623,7 +644,8 @@
         const marginModel = buildMarginUsageModel(margin, quote);
 		const makerModel = buildMakerExecutionModel(price, pos, app);
 
-        setText($("pair"), (app.exchange || "—") + " · " + (app.symbol || pos.symbol || "—"));
+        const symbol = app.symbol || pos.symbol || "";
+        setText($("pair"), (app.exchange || "—") + " · " + (symbol || "—"));
         const priceNode = $("lastPrice");
         const priceText = price.lastText || fmt(price.last, dec);
         const currentPrice = Number(price.last);
@@ -636,6 +658,13 @@
             }
             lastRenderedPrice = currentPrice;
         }
+        const pageTitle = buildPageTitle({
+            lastText: price.lastText,
+            last: currentPrice,
+            decimals: dec,
+            symbol: symbol
+        });
+        if (document.title !== pageTitle) document.title = pageTitle;
         const uptimeText = formatDuration(snapshot.uptimeSec);
         setText(
             $("version"),

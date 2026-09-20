@@ -20,7 +20,9 @@ const {
     formatCandleChange,
     candleDetail,
     normalizeThemePref,
-    resolveTheme
+    resolveTheme,
+    buildPageTitle,
+    DEFAULT_PAGE_TITLE
 } = require("./static/app.js");
 
 test("maker execution model reports quote health and strict-maker outcomes", () => {
@@ -970,6 +972,23 @@ test("grid status model exposes only the current slot state", () => {
     assert.equal(waiting.found, false);
     assert.equal(waiting.priceText, "");
     assert.equal(waiting.summary, "等待网格定位");
+});
+
+test("page title uses live price and symbol", () => {
+    assert.equal(buildPageTitle({ lastText: "108.24", symbol: "SOLUSDC" }), "108.24 | SOLUSDC");
+    assert.equal(buildPageTitle({ last: 108.24, decimals: 2, symbol: "SOLUSDC" }), "108.24 | SOLUSDC");
+    assert.equal(buildPageTitle({ lastText: " 108.240 ", symbol: " SOLUSDC " }), "108.240 | SOLUSDC");
+    assert.equal(buildPageTitle({ lastText: "—", last: 108.24, decimals: 2, symbol: "SOLUSDC" }), "108.24 | SOLUSDC");
+    assert.equal(buildPageTitle({ lastText: "108.24", symbol: "" }), DEFAULT_PAGE_TITLE);
+    assert.equal(buildPageTitle({ lastText: "108.24", symbol: "—" }), DEFAULT_PAGE_TITLE);
+    assert.equal(buildPageTitle({ last: 0, symbol: "SOLUSDC" }), DEFAULT_PAGE_TITLE);
+    assert.equal(buildPageTitle({}), DEFAULT_PAGE_TITLE);
+
+    const js = fs.readFileSync(__dirname + "/static/app.js", "utf8");
+    const html = fs.readFileSync(__dirname + "/static/index.html", "utf8");
+    assert.match(html, /<title>OpenSQT 做市监控<\/title>/);
+    assert.match(js, /document\.title !== pageTitle/);
+    assert.match(js, /document\.title = pageTitle/);
 });
 
 test("estimated profit per trade is interval times order quantity at mark", () => {
