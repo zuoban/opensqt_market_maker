@@ -237,9 +237,6 @@ func (r *ledgerReplay) process(event replayEvent) error {
 		return err
 	}
 	if published {
-		if next.ReleaseStackCount > 1 {
-			r.spm.releaseGapStackChildren(100, next.ReleaseStackCount)
-		}
 		if next.Adjust {
 			r.spm.notifyAdjustment(0)
 		}

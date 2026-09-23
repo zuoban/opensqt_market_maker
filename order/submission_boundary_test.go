@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"opensqt/exchange"
 )
@@ -29,18 +28,15 @@ func (e *boundaryTestExchange) PlaceOrderBatch(ctx context.Context, reqs []*exch
 
 func TestSubmissionBoundaryReleasesConfirmationAndRechecksRetry(t *testing.T) {
 	for _, native := range []bool{false, true} {
-		for _, scenario := range []string{"success", "reservation", "health", "maker", "stopped", "reopened", "canceled", "limiter"} {
+		for _, scenario := range []string{"success", "reservation", "health", "stopped", "reopened", "canceled", "limiter"} {
 			t.Run(fmtTelemetryCase(native, false)+"/"+scenario, func(t *testing.T) {
 				held, valid, healthy := false, true, true
 				acquired, released, starts, posts, unknowns := 0, 0, 0, 0, 0
-				market := exchange.MarketSnapshot{Symbol: "ETHUSDT", LastPrice: 100, BestBid: 99.9, BestAsk: 100.1,
-					Ready: true, QuoteReceivedAt: time.Now(), ReceivedAt: time.Now(), QuoteVersion: 1, StreamEpoch: 1}
 				ex := &boundaryTestExchange{}
 				oe := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
 				defer oe.Shutdown()
 				waiter := &hookWaiter{}
 				oe.rateLimiter = waiter
-				oe.SetMakerGuard(func() exchange.MarketSnapshot { return market }, .01, 2, time.Second)
 				oe.SetSubmissionHealthGuard(func() error {
 					if !held {
 						t.Error("health guard ran outside lease")
@@ -92,8 +88,6 @@ func TestSubmissionBoundaryReleasesConfirmationAndRechecksRetry(t *testing.T) {
 						valid = false
 					case "health":
 						healthy = false
-					case "maker":
-						market.BestAsk, market.BestBid, market.QuoteVersion = 98.1, 98, 2
 					case "stopped":
 						oe.StopNewOrders()
 					case "reopened":

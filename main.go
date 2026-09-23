@@ -24,7 +24,7 @@ import (
 )
 
 // Version 版本号
-var Version = "v3.5.26"
+var Version = "v3.5.27"
 
 func main() {
 	programStartedAt := time.Now()
@@ -169,12 +169,6 @@ func main() {
 		cfg.Timing.OrderRetryDelay,
 	)
 	exchangeExecutor.SetTelemetry(performance)
-	exchangeExecutor.SetMakerGuard(
-		priceMonitor.GetMarketSnapshot,
-		priceTickSize,
-		cfg.Execution.MakerGuardTicks,
-		time.Duration(cfg.Execution.QuoteStaleMS)*time.Millisecond,
-	)
 	// 所有启动健康条件通过前，执行器必须保持 fail-closed。
 	exchangeExecutor.StopNewOrders()
 	executorAdapter := &exchangeExecutorAdapter{executor: exchangeExecutor}
@@ -598,7 +592,6 @@ func (a *exchangeExecutorAdapter) PlaceOrder(req *position.OrderRequest) (*posit
 		ReduceOnly:             req.ReduceOnly,
 		PostOnly:               req.PostOnly,      // 传递 PostOnly 参数
 		ClientOrderID:          req.ClientOrderID, // 传递 ClientOrderID
-		NearTouch:              req.NearTouch,
 		AcquireSubmissionLease: req.AcquireSubmissionLease,
 		OnSubmissionStarted:    req.OnSubmissionStarted,
 		OnSubmissionUnknown:    req.MarkSubmissionUncertain,
@@ -638,7 +631,6 @@ func (a *exchangeExecutorAdapter) BatchPlaceOrders(orders []*position.OrderReque
 			ReduceOnly:             req.ReduceOnly,
 			PostOnly:               req.PostOnly,      // 传递 PostOnly 参数
 			ClientOrderID:          req.ClientOrderID, // 传递 ClientOrderID
-			NearTouch:              req.NearTouch,
 			AcquireSubmissionLease: req.AcquireSubmissionLease,
 			OnSubmissionStarted:    req.OnSubmissionStarted,
 			OnSubmissionUnknown:    req.MarkSubmissionUncertain,

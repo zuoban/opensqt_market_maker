@@ -23,10 +23,8 @@ type SlotSnapshot struct {
 	OrderCreatedAt             time.Time `json:"orderCreatedAt"`
 	SlotStatus                 string    `json:"slotStatus"`
 	PostOnlyFailCount          int       `json:"postOnlyFailCount"`
-	MakerGuardSkipCount        int       `json:"makerGuardSkipCount"`
 	TotalPostOnlyRejects       int       `json:"totalPostOnlyRejects"`
 	ConsecutivePostOnlyRejects int       `json:"consecutivePostOnlyRejects"`
-	CatchUp                    bool      `json:"catchUp"`
 	InBuyWindow                bool      `json:"inBuyWindow"`
 	InSellWindow               bool      `json:"inSellWindow"`
 	WaitState                  string    `json:"waitState"`
@@ -45,13 +43,9 @@ const (
 )
 
 type MakerExecutionSnapshot struct {
-	Attempts         uint64 `json:"attempts"`
-	Accepted         uint64 `json:"accepted"`
-	GuardSkips       uint64 `json:"guardSkips"`
-	PostOnlyRejects  uint64 `json:"postOnlyRejects"`
-	CatchUpOrders    uint64 `json:"catchUpOrders"`
-	CatchUpAbandoned uint64 `json:"catchUpAbandoned"`
-	ActiveCatchUp    int    `json:"activeCatchUp"`
+	Attempts        uint64 `json:"attempts"`
+	Accepted        uint64 `json:"accepted"`
+	PostOnlyRejects uint64 `json:"postOnlyRejects"`
 }
 
 // PositionSnapshot 仓位管理器只读快照
@@ -234,10 +228,7 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 	snap.LastReconcileTime = spm.GetLastReconcileTime()
 	snap.MakerExecution.Attempts = spm.makerAttempts.Load()
 	snap.MakerExecution.Accepted = spm.makerAccepted.Load()
-	snap.MakerExecution.GuardSkips = spm.makerGuardSkips.Load()
 	snap.MakerExecution.PostOnlyRejects = spm.postOnlyRejects.Load()
-	snap.MakerExecution.CatchUpOrders = spm.catchUpOrders.Load()
-	snap.MakerExecution.CatchUpAbandoned = spm.catchUpAbandoned.Load()
 
 	var buyWindow map[float64]bool
 	var sellWindow map[float64]bool
@@ -280,13 +271,10 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 			OrderCreatedAt:             slot.OrderCreatedAt,
 			SlotStatus:                 slot.SlotStatus,
 			PostOnlyFailCount:          slot.PostOnlyFailCount,
-			MakerGuardSkipCount:        slot.MakerGuardSkipCount,
 			TotalPostOnlyRejects:       slot.TotalPostOnlyRejects,
 			ConsecutivePostOnlyRejects: slot.ConsecutivePostOnlyRejects,
 			WaitState:                  waitState,
 			RetryNotBefore:             slot.placementRetryNotBefore,
-			CatchUp: slot.OrderSide == "BUY" && slot.OrderPrice > 0 &&
-				slot.OrderPrice < price-fillQtyTolerance,
 		}
 		if !slot.placementRetryNotBefore.IsZero() && now.Before(slot.placementRetryNotBefore) {
 			item.RetryRemainingS = slot.placementRetryNotBefore.Sub(now).Seconds()
@@ -306,9 +294,6 @@ func (spm *SuperPositionManager) Snapshot() PositionSnapshot {
 			switch item.OrderSide {
 			case "BUY":
 				snap.ActiveBuyOrders++
-				if item.CatchUp {
-					snap.MakerExecution.ActiveCatchUp++
-				}
 			case "SELL":
 				snap.ActiveSellOrders++
 			}

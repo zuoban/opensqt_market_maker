@@ -7,8 +7,8 @@ type placementBatchSizer interface {
 }
 
 type adjustmentBatch struct {
-	limit, count     int
-	closed, deferred bool
+	limit, count int
+	deferred     bool
 }
 
 func newAdjustmentBatch(executor OrderExecutorInterface) adjustmentBatch {
@@ -18,17 +18,15 @@ func newAdjustmentBatch(executor OrderExecutorInterface) adjustmentBatch {
 	return adjustmentBatch{}
 }
 
-func (b *adjustmentBatch) accept(req *OrderRequest) bool {
+func (b *adjustmentBatch) accept() bool {
 	if b.limit == 0 {
 		return true
 	}
-	// 与执行器原生分批规则相同：近盘口请求独占一批，深度批次遇到它
-	// 时先结束；下一轮会按最新盘口重新规划。
-	if b.closed || b.count >= b.limit || b.count > 0 && req.NearTouch {
-		b.closed, b.deferred = true, true
+	// 每轮只保留交易所原生批量上限；下一轮重新检查健康与库存。
+	if b.count >= b.limit {
+		b.deferred = true
 		return false
 	}
 	b.count++
-	b.closed = req.NearTouch
 	return true
 }

@@ -240,17 +240,16 @@ func TestPureIgnoredIdentityAndReplayPreserveEntireSlot(t *testing.T) {
 	}
 }
 
-func TestPureRejectComputesCooldownAndGapRelease(t *testing.T) {
+func TestPureRejectComputesCooldown(t *testing.T) {
 	before := transitionSlot("BUY", 0, 0)
-	before.GapStackCount = 3
 	in := transitionInput("BUY", "REJECTED", 0, 0)
 	next := reduceOrderUpdate(before, in)
-	if next.ReleaseStackCount != 3 || next.Slot.GapStackCount != 0 || next.AdjustmentNotBefore != in.Now.Add(placementRetryCooldown) || next.Slot.PlacementRetryNotBefore != next.AdjustmentNotBefore {
+	if next.AdjustmentNotBefore != in.Now.Add(placementRetryCooldown) || next.Slot.PlacementRetryNotBefore != next.AdjustmentNotBefore {
 		t.Fatalf("rejection intent=%+v", next)
 	}
 	in.TerminalSeen, in.Terminal = true, next.Terminal
 	replay := reduceOrderUpdate(next.Slot, in)
-	if replay.Adjust || replay.ReleaseStackCount != 0 || replay.Slot != next.Slot {
+	if replay.Adjust || replay.Slot != next.Slot {
 		t.Fatal("duplicate rejection repeated side effects")
 	}
 	// A late BUY fill reverses direction and clears the earlier same-side delay.
@@ -264,10 +263,9 @@ func TestPureRejectComputesCooldownAndGapRelease(t *testing.T) {
 func TestOrderTransitionPreservesUnrelatedSlotFields(t *testing.T) {
 	spm, slot, oid := setupOrderSlot(t, "BUY", 0)
 	slot.OrderCreatedAt = time.Unix(123, 0)
-	slot.MakerGuardSkipCount, slot.TotalPostOnlyRejects, slot.ConsecutivePostOnlyRejects = 3, 4, 5
-	slot.LastTriedQuoteVersion, slot.makerRetryQuoteVersion, slot.stackedParentPrice = 6, 7, 99
+	slot.TotalPostOnlyRejects, slot.ConsecutivePostOnlyRejects = 4, 5
 	spm.OnOrderUpdate(OrderUpdate{OrderID: 123, ClientOrderID: oid, Status: OrderStatusFilled, ExecutedQty: .1, AvgPrice: 100})
-	if slot.OrderCreatedAt != time.Unix(123, 0) || slot.MakerGuardSkipCount != 3 || slot.TotalPostOnlyRejects != 4 || slot.ConsecutivePostOnlyRejects != 5 || slot.LastTriedQuoteVersion != 6 || slot.makerRetryQuoteVersion != 7 || slot.stackedParentPrice != 99 {
+	if slot.OrderCreatedAt != time.Unix(123, 0) || slot.TotalPostOnlyRejects != 4 || slot.ConsecutivePostOnlyRejects != 5 {
 		t.Fatal("publication changed unrelated maker/binding metadata")
 	}
 }

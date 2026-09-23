@@ -30,7 +30,6 @@ type orderSlotState struct {
 	OrderFilledQuote        float64
 	OrderReleasedCost       float64
 	OrderAccumulatedGridPNL float64
-	GapStackCount           int
 	OppositeFillAt          time.Time
 	OppositeSubmitSide      string
 }
@@ -94,7 +93,6 @@ type orderTransition struct {
 	Fill                FilledOrderRecord
 	Adjust              bool
 	AdjustmentNotBefore time.Time
-	ReleaseStackCount   int
 }
 
 func reduceOrderUpdate(before orderSlotState, in orderUpdateInput) orderTransition {
@@ -201,9 +199,6 @@ func reduceOrderUpdate(before orderSlotState, in orderUpdateInput) orderTransiti
 				slot.PositionStatus = PositionStatusFilled
 			} else {
 				slot.PositionStatus = PositionStatusEmpty
-				if slot.GapStackCount > 1 {
-					next.ReleaseStackCount, slot.GapStackCount = slot.GapStackCount, 0
-				}
 			}
 		} else if side == "SELL" {
 			if slot.PositionQty > 0 {

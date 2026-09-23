@@ -17,7 +17,7 @@ func readOrderSlotState(slot *InventorySlot) orderSlotState {
 		PlacementRetryNotBefore: slot.placementRetryNotBefore, PendingLookupMisses: slot.pendingLookupMisses, PendingLastLookup: slot.pendingLastLookup,
 		OrderReportedPNL: slot.orderReportedPNL, OrderAccumulatedPNL: slot.orderAccumulatedPNL,
 		OrderFilledQuote: slot.orderFilledQuote, OrderReleasedCost: slot.orderReleasedCost, OrderAccumulatedGridPNL: slot.orderAccumulatedGridPNL,
-		GapStackCount: slot.gapStackCount, OppositeFillAt: slot.oppositeFillAt, OppositeSubmitSide: slot.oppositeSubmitSide,
+		OppositeFillAt: slot.oppositeFillAt, OppositeSubmitSide: slot.oppositeSubmitSide,
 	}
 }
 
@@ -30,7 +30,7 @@ func applyOrderSlotState(slot *InventorySlot, next orderSlotState) {
 	slot.placementRetryNotBefore, slot.pendingLookupMisses, slot.pendingLastLookup = next.PlacementRetryNotBefore, next.PendingLookupMisses, next.PendingLastLookup
 	slot.orderReportedPNL, slot.orderAccumulatedPNL = next.OrderReportedPNL, next.OrderAccumulatedPNL
 	slot.orderFilledQuote, slot.orderReleasedCost, slot.orderAccumulatedGridPNL = next.OrderFilledQuote, next.OrderReleasedCost, next.OrderAccumulatedGridPNL
-	slot.gapStackCount, slot.oppositeFillAt, slot.oppositeSubmitSide = next.GapStackCount, next.OppositeFillAt, next.OppositeSubmitSide
+	slot.oppositeFillAt, slot.oppositeSubmitSide = next.OppositeFillAt, next.OppositeSubmitSide
 }
 
 func (spm *SuperPositionManager) orderUpdateFacts(update OrderUpdate, side string, price float64, now time.Time) orderUpdateInput {

@@ -101,20 +101,6 @@ func TestTelemetryZeroExecutionDoesNotStartOppositeTimer(t *testing.T) {
 	}
 }
 
-func TestTelemetryGapStackPropagatesFillOrigin(t *testing.T) {
-	spm, parent, oid := setupOrderSlot(t, "BUY", 0)
-	spm.SetTelemetry(telemetry.New(time.Now()))
-	spm.OnOrderUpdate(OrderUpdate{OrderID: 123, ClientOrderID: oid, Status: "FILLED", ExecutedQty: .6, Quantity: .6, AvgPrice: 100})
-	spm.splitGapStackedSlot(100, 2)
-	child := spm.getOrCreateSlot(101)
-	if child.PositionQty != .3 || child.oppositeFillAt != parent.oppositeFillAt || child.oppositeSubmitSide != "SELL" {
-		t.Fatal("split inventory lost originating fill")
-	}
-	if child.oppositePending.Load() != parent.oppositePending.Load() || spm.TelemetryStateCounts().PendingOppositeSells != 2 {
-		t.Fatal("split lost pending opposite-order observation")
-	}
-}
-
 func TestTelemetryOrderUpdateIncludesSlotLockWait(t *testing.T) {
 	spm, slot, oid := setupOrderSlot(t, "BUY", 0)
 	r := telemetry.New(time.Now())

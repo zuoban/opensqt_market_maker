@@ -1,6 +1,7 @@
 package position
 
 import (
+	"math"
 	"testing"
 
 	"opensqt/exchange"
@@ -142,4 +143,8 @@ func hasBuyAt(orders []*OrderRequest, price float64) bool {
 		}
 	}
 	return false
+}
+
+func sameGridPrice(a, b float64) bool {
+	return math.Abs(a-b) <= fillQtyTolerance
 }

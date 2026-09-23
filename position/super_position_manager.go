@@ -124,10 +124,6 @@ type OrderRequest struct {
 	PostOnly      bool   // 是否只做 Maker（Post Only）
 	ClientOrderID string // 自定义订单ID
 	LogicalPrice  float64
-	QuoteVersion  uint64
-	CatchUp       bool
-	GapStack      int
-	NearTouch     bool
 	PlannedAt     time.Time
 
 	// AcquireSubmissionLease 在每次真正调用交易所下单接口前执行。成功时返回的
@@ -243,11 +239,8 @@ type InventorySlot struct {
 
 	// 历史字段：卖单撤销/拒绝计数（仅用于诊断，不会降级为普通单）
 	PostOnlyFailCount          int
-	MakerGuardSkipCount        int
 	TotalPostOnlyRejects       int
 	ConsecutivePostOnlyRejects int
-	LastTriedQuoteVersion      uint64
-	makerRetryQuoteVersion     uint64
 
 	// 明确未提交成功的 reservation 短暂退避。结果不确定的
 	// reservation 仍保持 PENDING，不使用此冷却代替对账。
@@ -266,11 +259,6 @@ type InventorySlot struct {
 	orderFilledQuote        float64
 	orderReleasedCost       float64
 	orderAccumulatedGridPNL float64
-
-	// gapStackCount>1 表示本槽买单合并了上方被跳过的空格。
-	// 成交后按格拆到 stackedParentPrice 指向本槽的子槽，分别挂卖。
-	gapStackCount      int
-	stackedParentPrice float64
 
 	// 只读性能关联数据，受 mu 保护，不参与下单决策或槽位回收判断。
 	oppositeFillAt     time.Time
@@ -331,28 +319,19 @@ type SuperPositionManager struct {
 	slots     sync.Map // map[float64]*InventorySlot
 	slotIndex slotPriceIndex
 
-	// 最近一次完成规划的网格价与现价。同格抖动可 skip；现价越过买单安全垫或 maker 下界时不能 skip。
+	// 最近一次完成规划的网格价与现价。同格抖动可 skip；卖单窗口边界变化时仍需重新规划。
 	lastAdjustedGridPrice atomic.Value // float64
 	lastAdjustedPrice     atomic.Value // float64
 	lastAdjustedMarket    atomic.Pointer[exchange.MarketSnapshot]
-	quoteRetryPending     atomic.Bool
-
-	// 仅在 adjustMu 下访问，独立于可被重试清空的规划指纹。
-	gapWindow gapStackWindow
 
 	// 规划期之外只有订单更新会新增/改写远端卖价。版本和在途计数让同一轮
 	// 规划复用占价扫描；回调正在修改或已经修改时仍执行完整复查。
 	orderUpdateVersion atomic.Uint64
 	orderUpdatesActive atomic.Int64
 
-	makerAttempts    atomic.Uint64
-	makerAccepted    atomic.Uint64
-	makerGuardSkips  atomic.Uint64
-	postOnlyRejects  atomic.Uint64
-	catchUpOrders    atomic.Uint64
-	catchUpAbandoned atomic.Uint64
-	lastQuoteSkipLog atomic.Int64
-	lastEmptyBuyLog  atomic.Int64
+	makerAttempts   atomic.Uint64
+	makerAccepted   atomic.Uint64
+	postOnlyRejects atomic.Uint64
 
 	// 仅测试：扫描窗口外买单之后、提交撤销之前调用。
 	beforeCommitOutOfWindowBuys func()
@@ -495,63 +474,6 @@ func (spm *SuperPositionManager) marketSnapshot(currentPrice float64) exchange.M
 	return snapshot
 }
 
-func (spm *SuperPositionManager) hasMarketSnapshotProvider() bool {
-	if spm == nil {
-		return false
-	}
-	spm.marketProviderMu.RLock()
-	configured := spm.marketProvider != nil
-	spm.marketProviderMu.RUnlock()
-	return configured
-}
-
-func (spm *SuperPositionManager) quoteStaleAfter() time.Duration {
-	if spm != nil && spm.config != nil && spm.config.Execution.QuoteStaleMS > 0 {
-		return time.Duration(spm.config.Execution.QuoteStaleMS) * time.Millisecond
-	}
-	return 30 * time.Second
-}
-
-func (spm *SuperPositionManager) marketQuoteUsable(snapshot exchange.MarketSnapshot, now time.Time) bool {
-	return snapshot.MakerBookUsable(now, spm.quoteStaleAfter())
-}
-
-func (spm *SuperPositionManager) logUnusableQuote(snapshot exchange.MarketSnapshot, now time.Time) {
-	last := spm.lastQuoteSkipLog.Load()
-	if last != 0 && now.UnixNano()-last < int64(5*time.Second) {
-		return
-	}
-	if !spm.lastQuoteSkipLog.CompareAndSwap(last, now.UnixNano()) {
-		return
-	}
-	if !snapshot.Ready || snapshot.BestBid <= 0 || snapshot.BestAsk <= snapshot.BestBid ||
-		snapshot.QuoteReceivedAt.IsZero() {
-		logger.Warn("⚠️ [Maker盘口] 完整盘口尚未就绪，暂停本轮新单")
-		return
-	}
-	streamAge := time.Duration(0)
-	if lastEvent := snapshot.LastEventAt(); !lastEvent.IsZero() && !now.Before(lastEvent) {
-		streamAge = now.Sub(lastEvent)
-	}
-	quoteAge := time.Duration(0)
-	if !snapshot.QuoteReceivedAt.IsZero() && !now.Before(snapshot.QuoteReceivedAt) {
-		quoteAge = now.Sub(snapshot.QuoteReceivedAt)
-	}
-	logger.Warn("⚠️ [Maker盘口] 市场数据流已静默 %s（bookTicker %s 前），暂停本轮新单",
-		streamAge.Round(time.Millisecond), quoteAge.Round(time.Millisecond))
-}
-
-func makerRetryReadyForQuoteLocked(slot *InventorySlot, quoteVersion uint64) bool {
-	if slot == nil || slot.makerRetryQuoteVersion == 0 || quoteVersion == 0 {
-		return true
-	}
-	if slot.makerRetryQuoteVersion == quoteVersion {
-		return false
-	}
-	slot.makerRetryQuoteVersion = 0
-	return true
-}
-
 // Initialize 初始化管理器（设置价格锚点并创建初始槽位）
 func (spm *SuperPositionManager) Initialize(initialPrice float64, initialPriceStr string) error {
 	spm.mu.Lock()
@@ -667,40 +589,24 @@ func (spm *SuperPositionManager) reserveOrderLocked(slot *InventorySlot, req *Or
 	slot.orderFilledQuote = 0
 	slot.orderReleasedCost = 0
 	slot.orderAccumulatedGridPNL = 0
-	slot.gapStackCount = 1
-	if req.GapStack > 1 {
-		slot.gapStackCount = req.GapStack
-	}
 	slot.SlotStatus = SlotStatusPending
-	if req.QuoteVersion > 0 {
-		slot.LastTriedQuoteVersion = req.QuoteVersion
-	}
 
 	req.AcquireSubmissionLease = func() (func(), bool) {
 		slot.mu.Lock()
 		valid := spm.matchesReservationLocked(slot, req) && spm.reservationStillValidLocked(slot, req)
-		var releaseChildren func()
-		if valid && req.GapStack > 1 {
-			releaseChildren, valid = spm.acquireGapStackChildrenLease(slot.Price, req.GapStack)
-		}
 		if !valid {
 			// 首次提交前的失效可直接清理；创建边界已经进入后，这也可能是
 			// UNKNOWN 确认后的同 ID 重试。此时必须等最终提交结果决定，
-			// 不能在复检阶段释放旧请求的 reservation 与跳格子槽。
+			// 不能在复检阶段释放旧请求的 reservation。
 			if !req.submissionStarted.Load() && spm.matchesReservationLocked(slot, req) {
-				parentPrice, stackCount := slot.Price, slot.gapStackCount
 				spm.clearReservationLocked(slot)
 				slot.mu.Unlock()
-				spm.releaseGapStackChildren(parentPrice, stackCount)
 				return nil, false
 			}
 			slot.mu.Unlock()
 			return nil, false
 		}
 		return func() {
-			if releaseChildren != nil {
-				releaseChildren()
-			}
 			slot.mu.Unlock()
 		}, true
 	}
@@ -872,7 +778,6 @@ func (spm *SuperPositionManager) clearReservationLocked(slot *InventorySlot) {
 	slot.placementRetryNotBefore = time.Time{}
 	slot.pendingLookupMisses = 0
 	slot.pendingLastLookup = time.Time{}
-	slot.gapStackCount = 0
 	slot.SlotStatus = SlotStatusFree
 }
 
@@ -913,34 +818,15 @@ func (spm *SuperPositionManager) releaseFailedReservation(req *OrderRequest) tim
 	}
 	slot := spm.getOrCreateSlot(price)
 	var retryAt time.Time
-	var stackedParent float64
-	var stackedCount int
 	slot.mu.Lock()
 	if spm.matchesReservationLocked(slot, req) {
-		stackedParent, stackedCount = slot.Price, slot.gapStackCount
 		spm.clearReservationLocked(slot)
 		retryDelay := placementRetryCooldown
-		switch req.rejectionKind() {
-		case "maker_quote_moved":
-			slot.MakerGuardSkipCount++
-			spm.makerGuardSkips.Add(1)
-			slot.makerRetryQuoteVersion = req.QuoteVersion
-			retryDelay = 0
-		case "post_only":
+		if req.rejectionKind() == "post_only" {
 			slot.PostOnlyFailCount++
 			slot.TotalPostOnlyRejects++
 			slot.ConsecutivePostOnlyRejects++
-			slot.makerRetryQuoteVersion = req.QuoteVersion
 			spm.postOnlyRejects.Add(1)
-			retryDelay = spm.postOnlyRetryDelay(slot.ConsecutivePostOnlyRejects)
-		case "market_data_stale":
-			slot.makerRetryQuoteVersion = req.QuoteVersion
-			retryDelay = spm.postOnlyRetryMinDelay()
-		default:
-			slot.makerRetryQuoteVersion = 0
-		}
-		if slot.makerRetryQuoteVersion != 0 {
-			spm.quoteRetryPending.Store(true)
 		}
 		retryAt = time.Now().Add(retryDelay)
 		slot.placementRetryNotBefore = retryAt
@@ -948,46 +834,7 @@ func (spm *SuperPositionManager) releaseFailedReservation(req *OrderRequest) tim
 			formatPrice(price, spm.priceDecimals), req.ClientOrderID)
 	}
 	slot.mu.Unlock()
-	spm.releaseGapStackChildren(stackedParent, stackedCount)
 	return retryAt
-}
-
-func (spm *SuperPositionManager) postOnlyRetryMinDelay() time.Duration {
-	ms := 50
-	if spm != nil && spm.config != nil && spm.config.Execution.PostOnlyRetryMinMS > 0 {
-		ms = spm.config.Execution.PostOnlyRetryMinMS
-	}
-	return time.Duration(ms) * time.Millisecond
-}
-
-func (spm *SuperPositionManager) postOnlyRetryDelay(consecutive int) time.Duration {
-	minDelay := spm.postOnlyRetryMinDelay()
-	maxDelay := 500 * time.Millisecond
-	burst := 5
-	if spm != nil && spm.config != nil {
-		if spm.config.Execution.PostOnlyRetryMaxMS > 0 {
-			maxDelay = time.Duration(spm.config.Execution.PostOnlyRetryMaxMS) * time.Millisecond
-		}
-		if spm.config.Execution.PostOnlyRetryBurst > 0 {
-			burst = spm.config.Execution.PostOnlyRetryBurst
-		}
-	}
-	if consecutive < 1 {
-		consecutive = 1
-	}
-	delay := minDelay
-	for i := 1; i < consecutive && delay < maxDelay; i++ {
-		delay *= 2
-		if delay > maxDelay {
-			delay = maxDelay
-		}
-	}
-	// burst 表示允许走指数退避的连续次数；超过该次数后至少暂停 1 秒，
-	// 这样默认配置仍完整覆盖 50/100/200/400/500ms 五档退避。
-	if consecutive > burst && delay < time.Second {
-		delay = time.Second
-	}
-	return delay
 }
 
 // placeInitialBuyOrders 设定初始槽位（并恢复持仓槽位）
@@ -1040,14 +887,6 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 	if market.LastPrice > 0 {
 		currentPrice = market.LastPrice
 	}
-	if spm.hasMarketSnapshotProvider() && !spm.marketQuoteUsable(market, time.Now()) {
-		// 行情连接或盘口尚未完成新 epoch 初始化时不创建 reservation。
-		// 下一次盘口或成交事件会主动唤醒协调器，禁止对陈旧快照做定时热循环。
-		spm.logUnusableQuote(market, time.Now())
-		spm.gapWindow = gapStackWindow{}
-		return nil
-	}
-
 	// 验证价格有效性
 	if currentPrice <= 0 {
 		logger.Warn("⚠️ 收到无效价格: %.2f，跳过订单调整", currentPrice)
@@ -1094,21 +933,12 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 
 	// 动态计算网格价格
 	currentGridPrice := spm.findNearestGridPrice(currentPrice)
-	spm.observeGapStackGrid(currentGridPrice, market.StreamEpoch)
 	// logger.Debug("🔄 [实时调整] 当前价格: %s, 网格价格: %s, 买单窗口: %d, 卖单窗口: %d",
 	// 	formatPrice(currentPrice, spm.priceDecimals), formatPrice(currentGridPrice, spm.priceDecimals), buyWindowSize, sellWindowSize)
 
-	// 跳格合并买单成交后先拆到被跳过的空格，再收集卖单候选，
-	// 以便本轮就能在更高网格挂出卖单。
-	spm.redistributeGapStackedInventory()
-	spm.ensureGapStackChildReservations()
-
-	// 普通买单从当前格下一格开始。当前格只在跳格合并时作为父格下单。
+	// 普通买单从当前格下一格向下，所有订单只对应一个槽位。
 	ordinaryBuyPrices := spm.buyWindowPrices(currentGridPrice, buyWindowSize)
 	slotPrices := ordinaryBuyPrices
-	if currentGridPrice > 0 {
-		slotPrices = append([]float64{currentGridPrice}, ordinaryBuyPrices...)
-	}
 
 	adjustmentTime := time.Now()
 	var buyOrdersToPlace []*OrderRequest
@@ -1119,7 +949,6 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 	var currentOrderCount int
 	var currentBuyOrderCount int
 	var currentSellOrderCount int
-	var activeCatchUpOrders int
 	occupiedSellPriceTicks := make(map[int64]struct{})
 	sellWindowMaxPrice := currentPrice + float64(sellWindowSize)*priceInterval
 	sellWindowMaxPrice = roundPrice(sellWindowMaxPrice, spm.priceDecimals)
@@ -1132,8 +961,10 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 	var sellCandidates []sellCandidate
 	// 活跃买单在目标窗口下沿多保留一格滞回带。行情在相邻网格的中点附近
 	// 来回抖动时，最远端低价买单不会被反复撤销、重挂；只有越过第二格才撤销。
-	// 上沿不保留，避免旧买单高于当前窗口时干扰跳格合并与追价逻辑。
-	retainedBuyWindowPrices := make(map[float64]struct{}, len(slotPrices)+buyWindowHysteresisSlots)
+	// 上沿不保留，避免旧买单高于当前窗口。
+	retainedBuyWindowPrices := make(map[float64]struct{}, len(slotPrices)+buyWindowHysteresisSlots+1)
+	// 已挂到当前格的买单仍可等待成交，但不在当前格新增买单。
+	retainedBuyWindowPrices[currentGridPrice] = struct{}{}
 	for _, price := range slotPrices {
 		retainedBuyWindowPrices[price] = struct{}{}
 	}
@@ -1146,18 +977,13 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 	}
 	var outOfWindowBuys []outOfWindowBuy
 	occupiedVersion := spm.orderUpdateVersion.Load()
-	quoteRetryPending := false
 
 	spm.forEachSlot(func(slotPrice float64, slot *InventorySlot) bool {
 		slot.mu.RLock()
-		quoteRetryPending = quoteRetryPending || slot.makerRetryQuoteVersion != 0
 		if orderMayExistLocked(slot) {
 			currentOrderCount++
 			if slot.OrderSide == "BUY" {
 				currentBuyOrderCount++
-				if slot.OrderPrice > 0 && slot.OrderPrice < slotPrice-fillQtyTolerance {
-					activeCatchUpOrders++
-				}
 			} else if slot.OrderSide == "SELL" {
 				currentSellOrderCount++
 			}
@@ -1198,24 +1024,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 		}
 		return true
 	})
-	spm.quoteRetryPending.Store(quoteRetryPending)
 	if spm.afterSellCandidateScan != nil {
 		spm.afterSellCandidateScan()
 	}
 
 	cancelIDs, leftoverOutOfWindowBuys, committedCancels := spm.commitOutOfWindowBuyCancels(outOfWindowBuys)
-
-	// 已证明被跨过的上方买单进入 CANCEL_REQUESTED 后，可一起撤掉当前格
-	// 金额不足的买单；合并新单仍必须等所有被合并买单确认撤销且未成交。
-	if buy, ok := spm.undersizedGapStackBuy(currentGridPrice); ok {
-		moreIDs, moreLeftover, moreCommitted := spm.commitOutOfWindowBuyCancels([]outOfWindowBuy{buy})
-		cancelIDs = append(cancelIDs, moreIDs...)
-		if len(moreIDs) > 0 {
-			sort.Slice(cancelIDs, func(i, j int) bool { return cancelIDs[i] < cancelIDs[j] })
-		}
-		leftoverOutOfWindowBuys = leftoverOutOfWindowBuys || moreLeftover
-		committedCancels = append(committedCancels, moreCommitted...)
-	}
 
 	// 计算允许创建的订单数量上限
 	threshold := spm.config.Trading.OrderCleanupThreshold
@@ -1245,30 +1058,15 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 
 	// 生成卖单请求
 	sellOrdersToCreate := 0
-	sellMakerFloor := 0.0
-	if market.Ready {
-		sellMakerFloor = market.BestBid + spm.makerGuardPrice()
-	}
 	if allowedNewSellOrders > 0 {
 		for i := 0; i < len(sellCandidates) && sellOrdersToCreate < allowedNewSellOrders; i++ {
 			candidate := sellCandidates[i]
 			// 订单流不受 spm.mu 阻塞，候选收集后可能又绑定新的
 			// 远端 SELL。每次分配前合并最新占价，将快照窗口压缩到最小。
 			spm.refreshOccupiedSellPriceTicks(occupiedSellPriceTicks, &occupiedVersion)
-			var sellPrice float64
-			var sellPriceTick int64
-			var ok bool
-			if sellMakerFloor > 0 {
-				sellPrice, sellPriceTick, ok = spm.allocateMakerSafeSellPriceFromFloor(
-					candidate.TargetSellPrice, sellMakerFloor, priceInterval, occupiedSellPriceTicks,
-				)
-			} else {
-				sellPrice, sellPriceTick, ok = spm.allocateMakerSafeSellPrice(
-					candidate.TargetSellPrice, currentPrice, priceInterval, occupiedSellPriceTicks,
-				)
-			}
+			sellPrice, sellPriceTick, ok := spm.exactSellPrice(candidate.TargetSellPrice, occupiedSellPriceTicks)
 			if !ok {
-				logger.Warn("⚠️ [跳过卖单] 槽位 %s 无法分配合法唯一卖价",
+				logger.Warn("⚠️ [跳过卖单] 槽位 %s 原网格卖价无效或已被占用",
 					formatPrice(candidate.SlotPrice, spm.priceDecimals))
 				continue
 			}
@@ -1280,10 +1078,6 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			// 候选收集后订单流可能已绑定这个槽位。最终复检必须
 			// 包含 OrderID/ClientOID/重试冷却，避免 reserveOrderLocked 覆盖远端订单。
 			if !sellCandidateEligibleLocked(slot, adjustmentTime) {
-				slot.mu.Unlock()
-				continue
-			}
-			if !makerRetryReadyForQuoteLocked(slot, market.QuoteVersion) {
 				slot.mu.Unlock()
 				continue
 			}
@@ -1312,12 +1106,9 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 				PostOnly:      true,
 				ClientOrderID: clientOID, // 🔥
 				LogicalPrice:  candidate.SlotPrice,
-				QuoteVersion:  market.QuoteVersion,
-				NearTouch: market.Ready && sellPrice-market.BestBid <=
-					priceInterval*spm.nearTouchRatio()+fillQtyTolerance,
-				PlannedAt: adjustmentTime,
+				PlannedAt:     adjustmentTime,
 			}
-			if !batch.accept(req) {
+			if !batch.accept() {
 				slot.mu.Unlock()
 				break
 			}
@@ -1348,40 +1139,6 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 		len(sellCandidates), allowedNewSellOrders, sellOrdersToCreate, allowedNewBuyOrders)
 
 	buyOrdersToCreate := 0
-	catchUpOrdersToCreate := 0
-	buyMakerCap, hasMakerBuyCap := spm.makerBuyCap(market)
-	_, gapStackBlocked := spm.collectGapStackSlots(currentGridPrice, false)
-	catchUpMode := "exact_wait"
-	maxActiveCatchUp := 1
-	maxCatchUpPerAdjust := 1
-	maxCatchUpDistanceRatio := 0.5
-	if spm.config != nil {
-		if spm.config.Execution.CatchUpMode != "" {
-			catchUpMode = spm.config.Execution.CatchUpMode
-		}
-		if spm.config.Execution.MaxActiveCatchUpSlots > 0 {
-			maxActiveCatchUp = spm.config.Execution.MaxActiveCatchUpSlots
-		}
-		if spm.config.Execution.MaxCatchUpSlotsPerAdjust > 0 {
-			maxCatchUpPerAdjust = spm.config.Execution.MaxCatchUpSlotsPerAdjust
-		}
-		if spm.config.Execution.MaxCatchUpDistanceRatio > 0 {
-			maxCatchUpDistanceRatio = spm.config.Execution.MaxCatchUpDistanceRatio
-		}
-	}
-	lowestBuy := 0.0
-	if len(ordinaryBuyPrices) > 0 {
-		lowestBuy = ordinaryBuyPrices[len(ordinaryBuyPrices)-1]
-	}
-	if hasMakerBuyCap && lowestBuy > 0 &&
-		!makerCapReachableByBuyWindow(lowestBuy, buyMakerCap, priceInterval, buyWindowSize) {
-		logger.Warn("⚠️ [Maker盘口] 买一/卖一 %s/%s 相对现价 %s 无法覆盖买单窗口（Maker上限 %s，模式 %s），改用成交价安全垫",
-			formatPrice(market.BestBid, spm.priceDecimals),
-			formatPrice(market.BestAsk, spm.priceDecimals),
-			formatPrice(currentPrice, spm.priceDecimals),
-			formatPrice(buyMakerCap, spm.priceDecimals), catchUpMode)
-		hasMakerBuyCap = false
-	}
 	for _, price := range slotPrices {
 		slot := spm.getOrCreateSlot(price)
 		slot.mu.Lock()
@@ -1391,15 +1148,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			slot.mu.Unlock()
 			continue
 		}
-		if slot.stackedParentPrice > 0 {
-			slot.mu.Unlock()
-			continue
-		}
 		if !placementRetryReadyLocked(slot, adjustmentTime) {
-			slot.mu.Unlock()
-			continue
-		}
-		if !makerRetryReadyForQuoteLocked(slot, market.QuoteVersion) {
 			slot.mu.Unlock()
 			continue
 		}
@@ -1428,61 +1177,12 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			buyOrdersToCreate+activeBuyOrdersInWindow < allowedNewBuyOrders
 
 		if shouldCreateBuyOrder {
-			if gapStackBlocked && !sameGridPrice(price, currentGridPrice) {
-				slot.mu.Unlock()
-				continue
-			}
-			stackCount := 1
-			var stackChildren []float64
-			if sameGridPrice(price, currentGridPrice) {
-				children, blocked := spm.collectGapStackSlots(price, false)
-				if blocked || len(children) == 0 {
-					slot.mu.Unlock()
-					continue
-				}
-				stackCount = 1 + len(children)
-				stackChildren = children
-			}
-
 			orderPrice := price
-			catchUp := false
-			if hasMakerBuyCap {
-				if price > buyMakerCap+fillQtyTolerance {
-					if catchUpMode != "passive" ||
-						activeCatchUpOrders+catchUpOrdersToCreate >= maxActiveCatchUp ||
-						catchUpOrdersToCreate >= maxCatchUpPerAdjust {
-						slot.mu.Unlock()
-						continue
-					}
-					if price-buyMakerCap > priceInterval*maxCatchUpDistanceRatio+fillQtyTolerance {
-						spm.catchUpAbandoned.Add(1)
-						slot.mu.Unlock()
-						continue
-					}
-					orderPrice = buyMakerCap
-					catchUp = true
-				}
-			} else {
-				// 无盘口 provider 的测试/兼容路径保留旧成交价安全垫。
-				safetyBuffer := spm.config.Trading.PriceInterval * 0.1
-				if price >= currentPrice-safetyBuffer {
-					slot.mu.Unlock()
-					continue
-				}
-			}
-
 			quantity := spm.gridBuyQuantity(orderPrice)
 			if quantity <= 0 {
 				slot.mu.Unlock()
 				continue
 			}
-			if stackCount > 1 {
-				quantity = roundPrice(quantity*float64(stackCount), spm.quantityDecimals)
-				logger.Info("📦 [跳格合并] 当前格 %s，已确认跨过且漏买 %d 格，按 %d 倍金额在 %s 下一单",
-					formatPrice(price, spm.priceDecimals), len(stackChildren), stackCount,
-					formatPrice(orderPrice, spm.priceDecimals))
-			}
-
 			// 生成 ClientOrderID
 			clientOID := spm.generateClientOrderID(price, "BUY")
 
@@ -1495,14 +1195,9 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 				PostOnly:      true,
 				ClientOrderID: clientOID,
 				LogicalPrice:  price,
-				QuoteVersion:  market.QuoteVersion,
-				CatchUp:       catchUp,
-				GapStack:      stackCount,
-				NearTouch: market.Ready && market.BestAsk-orderPrice <=
-					priceInterval*spm.nearTouchRatio()+fillQtyTolerance,
-				PlannedAt: adjustmentTime,
+				PlannedAt:     adjustmentTime,
 			}
-			if !batch.accept(req) {
+			if !batch.accept() {
 				slot.mu.Unlock()
 				break
 			}
@@ -1510,21 +1205,11 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			spm.makerAttempts.Add(1)
 			buyOrdersToPlace = append(buyOrdersToPlace, req)
 			buyOrdersToCreate++
-			if catchUp {
-				catchUpOrdersToCreate++
-				spm.catchUpOrders.Add(1)
-			}
 			slot.mu.Unlock()
-			if len(stackChildren) > 0 {
-				spm.reserveGapStackChildren(price, stackChildren)
-			}
 			continue
 		}
 
 		slot.mu.Unlock()
-	}
-	if len(buyOrdersToPlace) == 0 && allowedNewBuyOrders > 0 && !buyPlacementPaused && !batch.deferred {
-		spm.logEmptyBuyWindow(currentPrice, currentGridPrice, ordinaryBuyPrices, market, buyMakerCap, hasMakerBuyCap, catchUpMode)
 	}
 
 	// ReduceOnly SELL 先进入执行边界；批次中后续请求失败时，
@@ -1639,7 +1324,6 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 			slot.mu.Lock()
 			spm.makerAccepted.Add(1)
 			slot.ConsecutivePostOnlyRejects = 0
-			slot.makerRetryQuoteVersion = 0
 
 			// 用户数据流可能在 REST 下单返回前就推送取消类终态。此时槽位已经
 			// 被终态处理释放，绝不能再用迟到的 REST 回包把旧订单复活为 LOCKED。
@@ -1793,8 +1477,7 @@ func (spm *SuperPositionManager) AdjustOrders(currentPrice float64) (retErr erro
 
 // ShouldSkipUnchangedGrid 在最近网格价未变时允许交易门禁跳过价格抖动触发的
 // AdjustOrders。成交、撤单、冷却到期仍通过 RequestAdjustOrders 强制调整。
-// 同格内现价越过买单安全垫、卖单窗口上界或 maker 下界时必须再规划，
-// 否则最近一档会空着。
+// 同格内现价越过卖单窗口上界时必须再规划，否则可能漏挂减仓单。
 func (spm *SuperPositionManager) ShouldSkipUnchangedGrid(currentPrice float64) bool {
 	if spm == nil || currentPrice <= 0 {
 		return false
@@ -1807,11 +1490,6 @@ func (spm *SuperPositionManager) ShouldSkipUnchangedGrid(currentPrice float64) b
 	if lastMarket := spm.lastAdjustedMarket.Load(); lastMarket != nil {
 		if market.Ready != lastMarket.Ready || market.StreamEpoch != lastMarket.StreamEpoch ||
 			market.BestBid != lastMarket.BestBid || market.BestAsk != lastMarket.BestAsk {
-			return false
-		}
-		// 数量变化也会推进交易所的 QuoteVersion，但不会改变 Maker 价格边界。
-		// 只有仍有等待新 quote 的拒单时才为相同 bid/ask 重新规划。
-		if market.QuoteVersion != lastMarket.QuoteVersion && spm.quoteRetryPending.Load() {
 			return false
 		}
 	}
@@ -1850,16 +1528,6 @@ func (spm *SuperPositionManager) sameGridPlacementBoundsUnchanged(lastPrice, cur
 	if interval <= 0 {
 		return false
 	}
-	safety := interval * 0.1
-	grid := spm.findNearestGridPrice(currentPrice)
-	if (grid >= lastPrice-safety) != (grid >= currentPrice-safety) {
-		return false
-	}
-	for _, price := range spm.buyWindowPrices(grid, spm.config.Trading.BuyWindowSize) {
-		if (price >= lastPrice-safety) != (price >= currentPrice-safety) {
-			return false
-		}
-	}
 	lastSellMax := roundPrice(
 		lastPrice+float64(spm.config.Trading.SellWindowSize)*interval,
 		spm.priceDecimals,
@@ -1874,9 +1542,7 @@ func (spm *SuperPositionManager) sameGridPlacementBoundsUnchanged(lastPrice, cur
 	) {
 		return false
 	}
-	lastMaker, lastOK := spm.alignedMakerFloorPrice(lastPrice, interval)
-	currMaker, currOK := spm.alignedMakerFloorPrice(currentPrice, interval)
-	return lastOK && currOK && lastMaker == currMaker
+	return true
 }
 
 func (spm *SuperPositionManager) recycleIdleSlots(buyWindowPrices []float64) {
@@ -2015,9 +1681,6 @@ func slotIsRecyclableLocked(slot *InventorySlot) bool {
 	if !slot.placementRetryNotBefore.IsZero() && time.Now().Before(slot.placementRetryNotBefore) {
 		return false
 	}
-	if slot.stackedParentPrice > 0 {
-		return false
-	}
 	return true
 }
 
@@ -2065,9 +1728,6 @@ func (spm *SuperPositionManager) OnOrderUpdate(update OrderUpdate) {
 	defer func() {
 		// 协调器可能立即重入 AdjustOrders；释放槽位锁后才能通知补单。
 		slot.mu.Unlock()
-		if transition.ReleaseStackCount > 1 {
-			spm.releaseGapStackChildren(price, transition.ReleaseStackCount)
-		}
 		if transition.Adjust {
 			delay := time.Duration(0)
 			if !transition.AdjustmentNotBefore.IsZero() {
@@ -2987,27 +2647,6 @@ func priceTickIndexUp(price, tickSize float64) (int64, bool) {
 	return int64(math.Ceil(ratio)), true
 }
 
-// priceTickIndexDown 将买价向下量化，保证浮点格式化后不会越过 Maker 上限。
-func priceTickIndexDown(price, tickSize float64) (int64, bool) {
-	if price <= 0 || tickSize <= 0 || math.IsNaN(price) || math.IsInf(price, 0) ||
-		math.IsNaN(tickSize) || math.IsInf(tickSize, 0) {
-		return 0, false
-	}
-	ratio := price / tickSize
-	if math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio > float64(math.MaxInt64-1) {
-		return 0, false
-	}
-	nearest := math.Round(ratio)
-	tolerance, ok := tickRatioTolerance(ratio)
-	if !ok || nearest < 1 || nearest > float64(math.MaxInt64-1) {
-		return 0, false
-	}
-	if math.Abs(ratio-nearest) <= tolerance {
-		return int64(nearest), true
-	}
-	return int64(math.Floor(ratio)), true
-}
-
 func priceTickIndexNearest(price, tickSize float64) (int64, bool) {
 	if price <= 0 || tickSize <= 0 || math.IsNaN(price) || math.IsInf(price, 0) ||
 		math.IsNaN(tickSize) || math.IsInf(tickSize, 0) {
@@ -3078,201 +2717,6 @@ func ValidateGridPriceInterval(priceInterval, tickSize float64) error {
 	}
 	return fmt.Errorf("网格价格间隔 %g 必须是交易所价格步长 %g 的正整数倍",
 		priceInterval, tickSize)
-}
-
-// alignedMakerFloorPrice 只用于同网格行情跳过指纹：在没有实时盘口版本的
-// 兼容路径里，以整格边界判断是否需要重新规划。成交/撤单通知仍会强制调整。
-func (spm *SuperPositionManager) alignedMakerFloorPrice(currentPrice, priceInterval float64) (float64, bool) {
-	if spm == nil {
-		return 0, false
-	}
-	tickSize := spm.priceTickSize
-	intervalTicks, ok := gridIntervalTickCount(priceInterval, tickSize)
-	if !ok {
-		return 0, false
-	}
-	anchorTick, ok := priceTickIndexNearest(spm.anchorPrice, tickSize)
-	if !ok {
-		return 0, false
-	}
-	currentTick, ok := priceTickIndexUp(currentPrice, tickSize)
-	if !ok {
-		return 0, false
-	}
-	safetyTicks := intervalTicks / 10
-	if intervalTicks%10 != 0 {
-		safetyTicks++
-	}
-	if safetyTicks < 1 {
-		safetyTicks = 1
-	}
-	if currentTick > math.MaxInt64-safetyTicks {
-		return 0, false
-	}
-	priceTick := currentTick + safetyTicks
-	remainder := (priceTick - anchorTick) % intervalTicks
-	if remainder < 0 {
-		remainder += intervalTicks
-	}
-	if remainder != 0 {
-		advance := intervalTicks - remainder
-		if priceTick > math.MaxInt64-advance {
-			return 0, false
-		}
-		priceTick += advance
-	}
-	return roundPrice(float64(priceTick)*tickSize, spm.priceDecimals), true
-}
-
-func (spm *SuperPositionManager) fallbackMakerSellFloorPrice(currentPrice, priceInterval float64) (float64, bool) {
-	if spm == nil {
-		return 0, false
-	}
-	tickSize := spm.priceTickSize
-	intervalTicks, ok := gridIntervalTickCount(priceInterval, tickSize)
-	if !ok {
-		return 0, false
-	}
-	currentTick, ok := priceTickIndexUp(currentPrice, tickSize)
-	if !ok {
-		return 0, false
-	}
-	safetyTicks := intervalTicks / 10
-	if intervalTicks%10 != 0 {
-		safetyTicks++
-	}
-	if safetyTicks < 1 {
-		safetyTicks = 1
-	}
-	if currentTick > math.MaxInt64-safetyTicks {
-		return 0, false
-	}
-	priceTick := currentTick + safetyTicks
-	return roundPrice(float64(priceTick)*tickSize, spm.priceDecimals), true
-}
-
-func (spm *SuperPositionManager) makerGuardPrice() float64 {
-	ticks := 2
-	if spm != nil && spm.config != nil && spm.config.Execution.MakerGuardTicks > 0 {
-		ticks = spm.config.Execution.MakerGuardTicks
-	}
-	return float64(ticks) * spm.priceTickSize
-}
-
-func (spm *SuperPositionManager) nearTouchRatio() float64 {
-	if spm != nil && spm.config != nil && spm.config.Execution.NearTouchSingleOrderRatio > 0 {
-		return spm.config.Execution.NearTouchSingleOrderRatio
-	}
-	return 0.15
-}
-
-func (spm *SuperPositionManager) makerBuyCap(snapshot exchange.MarketSnapshot) (float64, bool) {
-	if spm == nil || !snapshot.Ready || snapshot.BestAsk <= 0 {
-		return 0, false
-	}
-	tick, ok := priceTickIndexDown(snapshot.BestAsk-spm.makerGuardPrice(), spm.priceTickSize)
-	if !ok || tick < 1 {
-		return 0, false
-	}
-	return roundPrice(float64(tick)*spm.priceTickSize, spm.priceDecimals), true
-}
-
-func makerCapReachableByBuyWindow(lowest, cap, interval float64, windowSlots int) bool {
-	if cap <= 0 || lowest <= 0 {
-		return false
-	}
-	if lowest <= cap+fillQtyTolerance {
-		return true
-	}
-	if interval <= 0 {
-		return false
-	}
-	if windowSlots < 1 {
-		windowSlots = 1
-	}
-	return lowest-cap <= interval*float64(windowSlots)+fillQtyTolerance
-}
-
-func (spm *SuperPositionManager) logEmptyBuyWindow(
-	currentPrice, gridPrice float64,
-	slotPrices []float64,
-	market exchange.MarketSnapshot,
-	buyMakerCap float64,
-	hasMakerBuyCap bool,
-	catchUpMode string,
-) {
-	nowNano := time.Now().UnixNano()
-	last := spm.lastEmptyBuyLog.Load()
-	if last != 0 && nowNano-last < int64(5*time.Second) {
-		return
-	}
-	if !spm.lastEmptyBuyLog.CompareAndSwap(last, nowNano) {
-		return
-	}
-	lowest := 0.0
-	if len(slotPrices) > 0 {
-		lowest = slotPrices[len(slotPrices)-1]
-	}
-	capText := "无"
-	if hasMakerBuyCap {
-		capText = formatPrice(buyMakerCap, spm.priceDecimals)
-	}
-	logger.Warn("⚠️ [跳过买单] 空窗口未生成买单: 现价 %s 网格 %s 最低格 %s 买一/卖一 %s/%s Maker上限 %s 模式 %s",
-		formatPrice(currentPrice, spm.priceDecimals),
-		formatPrice(gridPrice, spm.priceDecimals),
-		formatPrice(lowest, spm.priceDecimals),
-		formatPrice(market.BestBid, spm.priceDecimals),
-		formatPrice(market.BestAsk, spm.priceDecimals),
-		capText, catchUpMode)
-}
-
-func (spm *SuperPositionManager) allocateMakerSafeSellPriceFromFloor(
-	targetPrice, makerFloor, priceInterval float64,
-	occupied map[int64]struct{},
-) (float64, int64, bool) {
-	tickSize := spm.priceTickSize
-	if _, ok := gridIntervalTickCount(priceInterval, tickSize); !ok {
-		return 0, 0, false
-	}
-	targetTick, ok := priceTickIndexUp(targetPrice, tickSize)
-	if !ok {
-		return 0, 0, false
-	}
-	floorTick, ok := priceTickIndexUp(makerFloor, tickSize)
-	if !ok {
-		return 0, 0, false
-	}
-	lowerBoundTick := floorTick
-	if targetTick > lowerBoundTick {
-		lowerBoundTick = targetTick
-	}
-	priceTick := lowerBoundTick
-	for {
-		if !sellPriceTickConflicts(priceTick, occupied) {
-			price := roundPrice(float64(priceTick)*tickSize, spm.priceDecimals)
-			if price+fillQtyTolerance >= makerFloor && price+fillQtyTolerance >= targetPrice {
-				return price, priceTick, true
-			}
-		}
-		if priceTick >= math.MaxInt64-1 {
-			return 0, 0, false
-		}
-		priceTick++
-	}
-}
-
-// allocateMakerSafeSellPrice 保留原网格盈利目标和 Maker 安全价作为下限。
-// 目标已被行情穿过时，从 Maker 下限开始按交易所 tickSize 向上寻找最近的
-// 未占用价格，避免为了保持网格相位而把止盈单额外抬高一整个 priceInterval。
-func (spm *SuperPositionManager) allocateMakerSafeSellPrice(
-	targetPrice, currentPrice, priceInterval float64,
-	occupied map[int64]struct{},
-) (float64, int64, bool) {
-	makerFloor, ok := spm.fallbackMakerSellFloorPrice(currentPrice, priceInterval)
-	if !ok {
-		return 0, 0, false
-	}
-	return spm.allocateMakerSafeSellPriceFromFloor(targetPrice, makerFloor, priceInterval, occupied)
 }
 
 func (spm *SuperPositionManager) minOrderNotional() float64 {
@@ -3356,4 +2800,16 @@ func formatPrice(price float64, decimals int) string {
 		decimals = 0
 	}
 	return strconv.FormatFloat(price, 'f', decimals, 64)
+}
+
+// exactSellPrice 只使用槽位原目标价；遇到占价等待原订单收敛，不挪价。
+func (spm *SuperPositionManager) exactSellPrice(target float64, occupied map[int64]struct{}) (float64, int64, bool) {
+	if _, ok := gridIntervalTickCount(spm.config.Trading.PriceInterval, spm.priceTickSize); !ok {
+		return 0, 0, false
+	}
+	tick, ok := priceTickIndexUp(target, spm.priceTickSize)
+	if !ok || sellPriceTickConflicts(tick, occupied) {
+		return 0, 0, false
+	}
+	return roundPrice(float64(tick)*spm.priceTickSize, spm.priceDecimals), tick, true
 }

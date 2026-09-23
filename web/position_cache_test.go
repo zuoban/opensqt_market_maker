@@ -110,7 +110,7 @@ func TestPositionCacheViewIsImmutable(t *testing.T) {
 		Slots:            []position.SlotSnapshot{{Price: 101}},
 		FilledOrders:     []position.FilledOrderRecord{{OrderID: 7}},
 		FilledHourly:     []position.HourlyFillBucket{{Buy: 1}},
-		MakerExecution:   position.MakerExecutionSnapshot{Attempts: 9, Accepted: 8, ActiveCatchUp: 1},
+		MakerExecution:   position.MakerExecutionSnapshot{Attempts: 9, Accepted: 8},
 	}}
 	cache := newPositionCache(source, time.Second)
 	cache.refresh()
@@ -136,8 +136,7 @@ func TestPositionCacheViewIsImmutable(t *testing.T) {
 	}
 	if second.BuyWindowPrices[0] != 101 || second.SellWindowPrices[0] != 102 || second.Slots[0].Price != 101 ||
 		second.FilledOrders[0].OrderID != 7 || second.FilledHourly[0].Buy != 1 ||
-		second.MakerExecution.Attempts != 9 || second.MakerExecution.Accepted != 8 ||
-		second.MakerExecution.ActiveCatchUp != 1 {
+		second.MakerExecution.Attempts != 9 || second.MakerExecution.Accepted != 8 {
 		t.Fatalf("cached snapshot was mutated: %+v", second)
 	}
 }

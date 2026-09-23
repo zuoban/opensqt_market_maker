@@ -314,7 +314,7 @@ func (pm *PriceMonitor) Subscribe() <-chan PriceChange {
 				}
 				// Reset 和纯盘口变化也必须唤醒交易协调器。Reset 的
 				// NewPrice 会是 0，但它需要立即使交易门禁 fail-closed；
-				// bookTicker 变化则负责驱动同 QuoteVersion 去重后的重试。
+				// bookTicker 变化则更新盘口与连接健康快照。
 				if change.NewPrice <= 0 && !change.QuoteChanged && !change.Reset {
 					continue
 				}

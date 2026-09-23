@@ -2,12 +2,11 @@ package order
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync/atomic"
 )
 
-// 首次 lease 已由执行器获取，原生批次也已通过同一盘口复检。适配器
+// 首次 lease 已由执行器获取，原生批次也已通过交易健康复检。适配器
 // 接管它的释放时机；后续同 ID POST 必须独立限流并重新获取/复检。
 // 只读确认的独立 context 不得用于提交，原新单代际始终参与门禁检查。
 func (oe *ExchangeOrderExecutor) submissionBoundary(req *OrderRequest, initialRelease func(), generationCtx context.Context) func(context.Context) (func(), error) {
@@ -79,14 +78,6 @@ func (oe *ExchangeOrderExecutor) acquireGuardedSubmission(ctx context.Context, r
 	if err := oe.submissionContextError(ctx); err != nil {
 		release()
 		return nil, err
-	}
-	if makerErr := oe.checkMakerGuard(req); makerErr != nil {
-		release()
-		var rejected *OrderRejectedError
-		if errors.As(makerErr, &rejected) {
-			noteDefiniteRejection(req, rejected.Kind)
-		}
-		return nil, makerErr
 	}
 	return release, nil
 }

@@ -7,8 +7,8 @@ import (
 	"opensqt/exchange"
 )
 
-func TestUnchangedQuotePricesSkipOnlyWithoutPendingMakerRetry(t *testing.T) {
-	for _, rejection := range []string{"", "maker_quote_moved", "post_only", "market_data_stale"} {
+func TestUnchangedQuoteDoesNotBypassRejectionCooldown(t *testing.T) {
+	for _, rejection := range []string{"", "post_only", "exchange_rejected"} {
 		t.Run("rejection="+rejection, func(t *testing.T) {
 			cfg := testConfig()
 			cfg.Trading.BuyWindowSize = 1
@@ -24,7 +24,7 @@ func TestUnchangedQuotePricesSkipOnlyWithoutPendingMakerRetry(t *testing.T) {
 				t.Fatalf("initial batches = %d, want 1", len(executor.batches))
 			}
 			market.QuoteVersion++ // Only sizes/sequence changed; bid/ask remain equal.
-			if got, want := spm.ShouldSkipUnchangedGrid(100), rejection == ""; got != want {
+			if got, want := spm.ShouldSkipUnchangedGrid(100), true; got != want {
 				t.Fatalf("ShouldSkipUnchangedGrid = %v, want %v", got, want)
 			}
 		})

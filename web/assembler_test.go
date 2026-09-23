@@ -39,14 +39,10 @@ func TestSafeAppViewOmitsSecrets(t *testing.T) {
 	}
 	cfg.Telegram = config.TelegramConfig{Enabled: true, BotToken: "TELEGRAM_SECRET", ChatID: "PRIVATE_CHAT_ID"}
 	cfg.Dashboard.PushIntervalMS = 400
-	cfg.Execution.MakerGuardTicks = 2
-	cfg.Execution.QuoteStaleMS = 1500
-	cfg.Execution.CatchUpMode = "passive"
 
 	view := safeAppView(cfg)
 	if view.FeeRate != 0.0002 || view.Exchange != "binance" || view.MaxMarginUsage != 62.5 ||
-		view.DashboardPushIntervalMS != 400 || view.MakerGuardTicks != 2 ||
-		view.QuoteStaleMS != 1500 || view.CatchUpMode != "passive" {
+		view.DashboardPushIntervalMS != 400 {
 		t.Fatalf("view = %+v", view)
 	}
 	raw, err := json.Marshal(view)
@@ -81,8 +77,7 @@ func TestSnapshotJSONIncludesMakerExecutionAndQuote(t *testing.T) {
 	snapshot := Snapshot{
 		Price: PriceView{BestBid: 100, BestAsk: 100.1, QuoteAgeMs: 250},
 		Position: position.PositionSnapshot{MakerExecution: position.MakerExecutionSnapshot{
-			Attempts: 10, Accepted: 9, GuardSkips: 1, PostOnlyRejects: 2,
-			CatchUpOrders: 3, CatchUpAbandoned: 1, ActiveCatchUp: 1,
+			Attempts: 10, Accepted: 9, PostOnlyRejects: 2,
 		}},
 	}
 	raw, err := json.Marshal(snapshot)
@@ -93,7 +88,7 @@ func TestSnapshotJSONIncludesMakerExecutionAndQuote(t *testing.T) {
 	for _, field := range []string{
 		`"bestBid":100`, `"bestAsk":100.1`, `"quoteAgeMs":250`,
 		`"makerExecution"`, `"attempts":10`, `"accepted":9`,
-		`"guardSkips":1`, `"postOnlyRejects":2`, `"activeCatchUp":1`,
+		`"postOnlyRejects":2`,
 	} {
 		if !strings.Contains(body, field) {
 			t.Fatalf("snapshot JSON missing %s: %s", field, body)

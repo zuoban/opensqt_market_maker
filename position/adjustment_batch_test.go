@@ -143,63 +143,6 @@ func TestAdjustmentYieldsAfterOneBatchWithoutReservingTail(t *testing.T) {
 	}
 }
 
-func TestAdjustmentBatchNearTouchBoundaries(t *testing.T) {
-	for _, tc := range []struct {
-		near []bool
-		want int
-	}{
-		{[]bool{true, false, false}, 1}, {[]bool{false, false, true, false}, 2},
-		{[]bool{false, false, false, false, false, false}, 5},
-	} {
-		b := adjustmentBatch{limit: 5}
-		accepted := 0
-		for _, near := range tc.near {
-			if b.accept(&OrderRequest{NearTouch: near}) {
-				accepted++
-			}
-		}
-		if accepted != tc.want || !b.deferred {
-			t.Fatalf("near=%v got=%d deferred=%v", tc.near, accepted, b.deferred)
-		}
-	}
-}
-
-func TestAdjustmentBatchReplansNearTouchWithFreshQuote(t *testing.T) {
-	e := &offlineBatchExecutor{}
-	spm := batchTestManager(&limitedOfflineExecutor{e})
-	market := freshMarket(100.2, 99.00, 99.10, 1)
-	spm.SetMarketSnapshotProvider(func() exchange.MarketSnapshot { return market })
-	if err := spm.AdjustOrders(100.2); err != nil {
-		t.Fatal(err)
-	}
-	if len(e.requests) != 1 || len(e.requests[0]) != 1 || !e.requests[0][0].NearTouch {
-		t.Fatal("near-touch order did not get its own adjustment")
-	}
-	// 成交价不变，仅盘口下移；下一轮必须重新计算 Maker 边界和近盘口标记。
-	market = freshMarket(100.2, 98.00, 98.10, 2)
-	if err := spm.AdjustOrders(100.2); err != nil {
-		t.Fatal(err)
-	}
-	if len(e.requests) != 2 || len(e.requests[1]) != 1 {
-		t.Fatal("new near-touch boundary was not respected")
-	}
-	req := e.requests[1][0]
-	if req.QuoteVersion != 2 || req.Price != 98 || !req.NearTouch || !req.PostOnly {
-		t.Fatalf("continuation used stale planning: %+v", req)
-	}
-	if err := spm.AdjustOrders(100.2); err != nil {
-		t.Fatal(err)
-	}
-	if len(e.requests) != 3 || len(e.requests[2]) != 5 {
-		t.Fatal("deep continuation did not fill one batch")
-	}
-	for _, req := range e.requests[2] {
-		if req.QuoteVersion != 2 || req.NearTouch || req.Price >= 98.1 {
-			t.Fatalf("invalid deep request: %+v", req)
-		}
-	}
-}
-
 func TestBatchYieldRetainsUnknownAndDoesNotBypassRejectionCooldown(t *testing.T) {
 	for _, unknown := range []bool{true, false} {
 		t.Run(fmt.Sprint(unknown), func(t *testing.T) {

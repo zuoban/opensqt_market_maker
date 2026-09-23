@@ -120,8 +120,7 @@ func visualFixtureSnapshot() map[string]interface{} {
 			"filledHourly":     filledHourly,
 			"filledOrderCount": int64(48),
 			"makerExecution": map[string]interface{}{
-				"attempts": 126, "accepted": 121, "guardSkips": 3, "postOnlyRejects": 2,
-				"catchUpOrders": 7, "catchUpAbandoned": 1, "activeCatchUp": 1,
+				"attempts": 126, "accepted": 121, "postOnlyRejects": 2,
 			},
 		},
 		"margin": map[string]interface{}{

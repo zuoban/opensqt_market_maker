@@ -97,7 +97,7 @@ func fmtTelemetryCase(native, failed bool) string {
 
 func TestTelemetryLocalRejectionDoesNotStartSubmission(t *testing.T) {
 	for _, native := range []bool{false, true} {
-		for _, guard := range []string{"health", "maker", "lease", "limiter"} {
+		for _, guard := range []string{"health", "lease", "limiter"} {
 			t.Run(fmtTelemetryCase(native, false)+"/"+guard, func(t *testing.T) {
 				ex := &batchRecordingExchange{}
 				oe := NewExchangeOrderExecutor(ex, "ETHUSDT", 0, 0)
@@ -111,10 +111,6 @@ func TestTelemetryLocalRejectionDoesNotStartSubmission(t *testing.T) {
 				switch guard {
 				case "health":
 					oe.SetSubmissionHealthGuard(func() error { return errors.New("unhealthy") })
-				case "maker":
-					oe.SetMakerGuard(func() exchange.MarketSnapshot {
-						return exchange.MarketSnapshot{Symbol: "ETHUSDT", BestBid: 100, BestAsk: 100.1, Ready: true, QuoteReceivedAt: time.Now(), QuoteVersion: 1, StreamEpoch: 1}
-					}, .01, 2, time.Second)
 				case "lease":
 					req.AcquireSubmissionLease = func() (func(), bool) { return nil, false }
 				case "limiter":

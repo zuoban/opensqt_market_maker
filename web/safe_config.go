@@ -14,9 +14,6 @@ type SafeAppConfig struct {
 	SellWindowSize          int     `json:"sellWindowSize"`
 	FeeRate                 float64 `json:"feeRate"`
 	DashboardPushIntervalMS int     `json:"dashboardPushIntervalMs"`
-	MakerGuardTicks         int     `json:"makerGuardTicks"`
-	QuoteStaleMS            int     `json:"quoteStaleMs"`
-	CatchUpMode             string  `json:"catchUpMode"`
 }
 
 func safeAppView(cfg *config.Config) SafeAppConfig {
@@ -33,9 +30,6 @@ func safeAppView(cfg *config.Config) SafeAppConfig {
 		BuyWindowSize:           cfg.Trading.BuyWindowSize,
 		SellWindowSize:          cfg.Trading.SellWindowSize,
 		DashboardPushIntervalMS: cfg.Dashboard.PushIntervalMS,
-		MakerGuardTicks:         cfg.Execution.MakerGuardTicks,
-		QuoteStaleMS:            cfg.Execution.QuoteStaleMS,
-		CatchUpMode:             cfg.Execution.CatchUpMode,
 	}
 	view.FeeRate = cfg.Exchanges.Binance.FeeRate
 	return view

@@ -42,16 +42,16 @@ test("maker execution model reports quote health and strict-maker outcomes", () 
 	assert.equal(healthy.state, "healthy");
 	assert.equal(healthy.acceptanceRate, 95);
 	assert.equal(healthy.quoteReady, true);
-	assert.equal(healthy.activeCatchUp, 1);
-	assert.equal(healthy.makerGuardTicks, 2);
+	assert.equal("activeCatchUp" in healthy, false);
+	assert.equal("makerGuardTicks" in healthy, false);
 
 	const stale = buildMakerExecutionModel(
 		{ bestBid: 100, bestAsk: 100.1, quoteAgeMs: 1501 },
 		{ makerExecution: { attempts: 4, accepted: 4 } },
 		{ quoteStaleMs: 1500 }
 	);
-	assert.equal(stale.state, "warning");
-	assert.equal(stale.statusText, "盘口陈旧 · 暂停新单");
+	assert.equal(stale.state, "healthy");
+	assert.equal(stale.statusText, "提交健康");
 
 	const lowAcceptance = buildMakerExecutionModel(
 		{ bestBid: 100, bestAsk: 100.1, quoteAgeMs: 20 },

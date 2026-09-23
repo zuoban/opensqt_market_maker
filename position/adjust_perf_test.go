@@ -35,10 +35,10 @@ func TestShouldSkipUnchangedGridAfterAdjust(t *testing.T) {
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 	if !spm.ShouldSkipUnchangedGrid(100.05) {
-		t.Fatal("same-grid tick inside the buy safety pad should be skippable")
+		t.Fatal("same-grid tick should be skippable")
 	}
-	if spm.ShouldSkipUnchangedGrid(100.4) {
-		t.Fatal("same-grid tick that crosses the buy safety pad should not be skipped")
+	if !spm.ShouldSkipUnchangedGrid(100.4) {
+		t.Fatal("same-grid price changes do not move the fixed order targets")
 	}
 	if spm.ShouldSkipUnchangedGrid(100.6) {
 		t.Fatal("price that moves the nearest grid should not be skipped")
@@ -124,7 +124,7 @@ func TestRecycleIdleSlotsOutsideBuyWindow(t *testing.T) {
 	if !slotExists(spm, 85) {
 		t.Fatal("slot in placement cooldown was recycled")
 	}
-	if !slotExists(spm, 99) || !slotExists(spm, 100) {
+	if !slotExists(spm, 99) || !slotExists(spm, 98) {
 		t.Fatal("buy-window slots were recycled")
 	}
 }

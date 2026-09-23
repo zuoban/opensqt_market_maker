@@ -245,7 +245,7 @@ func TestMarginLockKeepsExistingBuysAndStillPlacesReduceOnlySells(t *testing.T) 
 	}
 }
 
-func TestAdjustOrdersRepricesCrossedSellAndSubmitsReduceOnlyFirst(t *testing.T) {
+func TestAdjustOrdersKeepsCrossedSellTargetAndSubmitsReduceOnlyFirst(t *testing.T) {
 	cfg := testConfig()
 	cfg.Trading.BuyWindowSize = 2
 	cfg.Trading.SellWindowSize = 1
@@ -268,8 +268,8 @@ func TestAdjustOrdersRepricesCrossedSellAndSubmitsReduceOnlyFirst(t *testing.T) 
 	if first.Side != "SELL" || !first.ReduceOnly || !first.PostOnly {
 		t.Fatalf("first submitted order = %+v, want PostOnly ReduceOnly SELL", first)
 	}
-	if first.Price != 110.1 {
-		t.Fatalf("crossed sell price = %.2f, want nearest fallback Maker price 110.10", first.Price)
+	if first.Price != 101 {
+		t.Fatalf("crossed sell price = %.2f, want original grid target 101.00", first.Price)
 	}
 	if executor.orders[1].Side != "BUY" {
 		t.Fatalf("second submitted side = %s, want BUY after reduce-only sells", executor.orders[1].Side)
@@ -481,17 +481,14 @@ func assertSellRequestInvariants(
 	if !order.PostOnly || !order.ReduceOnly {
 		t.Fatalf("SELL request = %+v, want PostOnly ReduceOnly", order)
 	}
-	if order.Price <= currentPrice {
-		t.Fatalf("SELL price = %.12f, want above current %.12f", order.Price, currentPrice)
-	}
 	slotPrice, side, valid := spm.parseClientOrderID(order.ClientOrderID)
 	if !valid || side != "SELL" {
 		t.Fatalf("ClientOrderID = %q, parsed price=%v side=%q valid=%v",
 			order.ClientOrderID, slotPrice, side, valid)
 	}
 	targetPrice := slotPrice + priceInterval
-	if order.Price+fillQtyTolerance < targetPrice {
-		t.Fatalf("SELL price = %.12f below slot %.12f target %.12f",
+	if math.Abs(order.Price-targetPrice) > fillQtyTolerance {
+		t.Fatalf("SELL price = %.12f differs from slot %.12f target %.12f",
 			order.Price, slotPrice, targetPrice)
 	}
 	priceTick, ok := priceTickIndexUp(order.Price, tickSize)
@@ -532,23 +529,23 @@ func TestValidateGridPriceInterval(t *testing.T) {
 	}
 }
 
-func TestAllocateMakerSafeSellPriceRejectsUnrepresentableGrid(t *testing.T) {
+func TestExactSellPriceRejectsUnrepresentableGrid(t *testing.T) {
 	spm := NewSuperPositionManager(testConfig(), stubExecutor{}, stubEx{}, 4, 2, 0.01)
 	spm.anchorPrice = 100
-	price, priceTick, ok := spm.allocateMakerSafeSellPrice(100.03, 100.02, 0.015, nil)
+	spm.config.Trading.PriceInterval = 0.015
+	price, priceTick, ok := spm.exactSellPrice(100.03, nil)
 	if ok || price != 0 || priceTick != 0 {
-		t.Fatalf("allocateMakerSafeSellPrice() = (%v, %v, %v), want fail-closed zero result",
+		t.Fatalf("exactSellPrice() = (%v, %v, %v), want fail-closed zero result",
 			price, priceTick, ok)
 	}
 }
 
-func TestCrossedSellUsesNearestLiveMakerTick(t *testing.T) {
+func TestCrossedSellPreservesOriginalGridTarget(t *testing.T) {
 	cfg := testConfig()
 	cfg.Trading.BuyWindowSize = 0
 	cfg.Trading.SellWindowSize = 1
 	cfg.Trading.PriceInterval = 0.1
 	cfg.Trading.MinOrderValue = 1
-	cfg.Execution.MakerGuardTicks = 2
 	executor := &recordingExecutor{}
 	spm := NewSuperPositionManager(cfg, executor, stubEx{}, 4, 2, 0.01)
 	spm.anchorPrice = 104.7
@@ -564,8 +561,8 @@ func TestCrossedSellUsesNearestLiveMakerTick(t *testing.T) {
 	if len(sells) != 1 {
 		t.Fatalf("recorded SELL requests = %d, want 1: %+v", len(sells), sells)
 	}
-	if sells[0].Price != 104.95 {
-		t.Fatalf("crossed SELL price = %.4f, want nearest Maker tick 104.9500", sells[0].Price)
+	if sells[0].Price != 104.8 {
+		t.Fatalf("crossed SELL price = %.4f, want original grid target 104.8000", sells[0].Price)
 	}
 	if !sells[0].PostOnly || !sells[0].ReduceOnly {
 		t.Fatalf("crossed SELL lost safety flags: %+v", sells[0])
@@ -598,14 +595,10 @@ func TestHighTickIndexGridPriceDoesNotSkipLevel(t *testing.T) {
 	spm.anchorPrice = anchorPrice
 	targetPrice := anchorPrice + priceInterval
 
-	price, priceTick, ok := spm.allocateMakerSafeSellPrice(
-		targetPrice,
-		anchorPrice,
-		priceInterval,
-		nil,
-	)
+	spm.config.Trading.PriceInterval = priceInterval
+	price, priceTick, ok := spm.exactSellPrice(targetPrice, nil)
 	if !ok {
-		t.Fatal("allocateMakerSafeSellPrice() rejected a representable high tick-index grid")
+		t.Fatal("exactSellPrice() rejected a representable high tick-index grid")
 	}
 	anchorTick, _ := priceTickIndexNearest(anchorPrice, tickSize)
 	wantTick := anchorTick + 10000
@@ -615,7 +608,7 @@ func TestHighTickIndexGridPriceDoesNotSkipLevel(t *testing.T) {
 	}
 }
 
-func TestAdjustOrdersAllocatesNearestDistinctMakerTicksForCrossedSellSlots(t *testing.T) {
+func TestAdjustOrdersPreservesDistinctGridTargetsForCrossedSellSlots(t *testing.T) {
 	tests := []struct {
 		name          string
 		anchorPrice   float64
@@ -628,7 +621,7 @@ func TestAdjustOrdersAllocatesNearestDistinctMakerTicksForCrossedSellSlots(t *te
 		wantTicks     []int64
 	}{
 		{
-			name:          "wide interval uses nearest ticks",
+			name:          "wide interval preserves targets",
 			anchorPrice:   100,
 			currentPrice:  103.81,
 			priceInterval: 0.5,
@@ -636,7 +629,7 @@ func TestAdjustOrdersAllocatesNearestDistinctMakerTicksForCrossedSellSlots(t *te
 			priceDecimals: 4,
 			slotPrices:    []float64{102, 102.5, 103},
 			quantity:      0.48,
-			wantTicks:     []int64{10386, 10387, 10388},
+			wantTicks:     []int64{10250, 10300, 10350},
 		},
 		{
 			name:          "non power of ten tick",
@@ -647,10 +640,10 @@ func TestAdjustOrdersAllocatesNearestDistinctMakerTicksForCrossedSellSlots(t *te
 			priceDecimals: 2,
 			slotPrices:    []float64{97, 98, 99},
 			quantity:      0.1,
-			wantTicks:     []int64{401, 402, 403},
+			wantTicks:     []int64{392, 396, 400},
 		},
 		{
-			name:          "SOL crossed exits use nearest ticks",
+			name:          "SOL crossed exits preserve targets",
 			anchorPrice:   104.38,
 			currentPrice:  104.42,
 			priceInterval: 0.02,
@@ -658,10 +651,10 @@ func TestAdjustOrdersAllocatesNearestDistinctMakerTicksForCrossedSellSlots(t *te
 			priceDecimals: 4,
 			slotPrices:    []float64{104.38, 104.40},
 			quantity:      0.10,
-			wantTicks:     []int64{10443, 10444},
+			wantTicks:     []int64{10440, 10442},
 		},
 		{
-			name:          "non-zero grid phase does not delay crossed exit",
+			name:          "non-zero grid phase preserves targets",
 			anchorPrice:   100.03,
 			currentPrice:  100.06,
 			priceInterval: 0.02,
@@ -669,7 +662,7 @@ func TestAdjustOrdersAllocatesNearestDistinctMakerTicksForCrossedSellSlots(t *te
 			priceDecimals: 4,
 			slotPrices:    []float64{100.03, 100.05},
 			quantity:      0.10,
-			wantTicks:     []int64{10007, 10008},
+			wantTicks:     []int64{10005, 10007},
 		},
 	}
 
@@ -784,7 +777,7 @@ func TestAdjustOrdersDoesNotReusePlacedLockedSellTick(t *testing.T) {
 		}
 		seenTicks[priceTick] = struct{}{}
 	}
-	for _, wantTick := range []int64{10387, 10388} {
+	for _, wantTick := range []int64{10300, 10350} {
 		if _, exists := seenTicks[wantTick]; !exists {
 			t.Fatalf("allocated ticks = %v, missing %d", seenTicks, wantTick)
 		}
@@ -836,11 +829,8 @@ func TestAdjustOrdersRefreshesSellPriceOccupancyAfterCandidateScan(t *testing.T)
 		t.Fatalf("AdjustOrders() error = %v", err)
 	}
 	sells := recordedSellOrders(executor.orders)
-	if len(sells) != 1 {
-		t.Fatalf("recorded SELL requests = %d, want 1: %+v", len(sells), sells)
-	}
-	if sells[0].Price != 101.01 {
-		t.Fatalf("new SELL price = %v, want 101.01 above concurrently occupied 101", sells[0].Price)
+	if len(sells) != 0 {
+		t.Fatalf("occupied grid target must wait, got %+v", sells)
 	}
 	if remote.OrderID != 92 || remote.OrderPrice != 101 ||
 		remote.OrderStatus != OrderStatusConfirmed || remote.SlotStatus != SlotStatusLocked {
@@ -889,7 +879,7 @@ func TestAdjustOrdersTreatsPendingAndCancelRequestedSellPricesAsOccupied(t *test
 			occupied.ClientOID = spm.generateClientOrderID(occupied.Price, "SELL")
 			occupied.OrderSide = "SELL"
 			occupied.OrderStatus = tt.orderStatus
-			occupied.OrderPrice = 103.86
+			occupied.OrderPrice = 103.5
 			occupied.OrderQuantity = occupied.PositionQty
 			occupied.SlotStatus = tt.slotStatus
 			occupiedClientOID := occupied.ClientOID
@@ -899,18 +889,12 @@ func TestAdjustOrdersTreatsPendingAndCancelRequestedSellPricesAsOccupied(t *test
 				t.Fatalf("AdjustOrders() error = %v", err)
 			}
 			sells := recordedSellOrders(executor.orders)
-			if len(sells) != 1 {
-				t.Fatalf("recorded SELL requests = %d, want 1: %+v", len(sells), sells)
-			}
-			_, priceTick := assertSellRequestInvariants(
-				t, spm, sells[0], currentPrice, priceInterval, tickSize,
-			)
-			if priceTick != 10387 {
-				t.Fatalf("new SELL tick = %d, want 10387 above legacy off-grid price 10386", priceTick)
+			if len(sells) != 0 {
+				t.Fatalf("uncertain target must stay reserved: %+v", sells)
 			}
 			if occupied.OrderID != tt.orderID || occupied.ClientOID != occupiedClientOID ||
 				occupied.OrderStatus != tt.orderStatus || occupied.SlotStatus != tt.slotStatus ||
-				occupied.OrderPrice != 103.86 {
+				occupied.OrderPrice != 103.5 {
 				t.Fatalf("occupied SELL reservation was mutated: %+v", occupied)
 			}
 		})
